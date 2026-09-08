@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic check for the Plugin Dashboard widget
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=5h
+RandomizedDelaySec=20m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
