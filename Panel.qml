@@ -25,12 +25,21 @@ Panel {
     property string actionStatus: ""
     property string busyId: ""
     property string lastActionKind: ""
+    property real actionStartSec: 0
     property var updateQueue: []
-    property string diffOpenId: ""
-    property string diffText: ""
+    property int updateQueueTotal: 0
+    property int updateQueueDone: 0
+    // One expandable panel per row, used for either a pre-update diff preview
+    // or the actual command output after an action -- never both at once, so
+    // there's exactly one place to look for "did anything happen."
+    property string detailOpenId: ""
+    property string detailMode: ""
+    property string detailText: ""
+    property bool detailOk: true
     property bool addAppFormOpen: false
     property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install"})
     property real now: Date.now() / 1000
+    property real elapsedNow: Date.now() / 1000
 
     function actionVerb(kind) {
         switch (kind) {
@@ -53,34 +62,41 @@ Panel {
         if (root.busyId !== "") return
         root.busyId = id
         root.lastActionKind = kind
+        root.actionStartSec = Date.now() / 1000
         actionStatus = actionVerb(kind) + id + "…"
         actionProc.command = ["python3", helper, kind, id]
         actionProc.running = true
     }
 
     function runUpdateAll() {
-        if (root.busyId !== "") return
+        if (root.busyId !== "" || root.updateQueue.length > 0) return
         var ids = []
         for (var i = 0; i < root.items.length; i++) if (Model.canUpdate(root.items[i])) ids.push(root.items[i].id)
         if (ids.length === 0) return
         root.updateQueue = ids
+        root.updateQueueTotal = ids.length
+        root.updateQueueDone = 0
         advanceUpdateQueue()
     }
 
     function advanceUpdateQueue() {
-        if (root.updateQueue.length === 0) return
+        if (root.updateQueue.length === 0) { root.updateQueueTotal = 0; root.updateQueueDone = 0; return }
         var next = root.updateQueue[0]
         root.updateQueue = root.updateQueue.slice(1)
+        root.updateQueueDone += 1
         runAction("update", next)
     }
 
-    function toggleDiff(id) {
-        if (root.diffOpenId === id) { root.diffOpenId = ""; return }
-        root.diffOpenId = id
-        root.diffText = "Loading…"
+    function showDiff(id) {
+        if (root.detailOpenId === id && root.detailMode === "diff") { root.detailOpenId = ""; return }
+        root.detailOpenId = id
+        root.detailMode = "diff"
+        root.detailText = "Loading…"
         diffProc.command = ["python3", root.helper, "diff", id]
         diffProc.running = true
     }
+
+    function closeDetail() { root.detailOpenId = "" }
 
     function submitAddApp() {
         if (root.busyId !== "") return
@@ -105,6 +121,9 @@ Panel {
     }
 
     Timer { interval: 1000; running: root.opened; repeat: true; onTriggered: root.now = Date.now() / 1000 }
+    // Ticks the busy row's "…Ns" elapsed counter so a long update (Flea's
+    // cargo build, say) visibly keeps moving instead of sitting on static text.
+    Timer { interval: 500; running: root.busyId !== ""; repeat: true; onTriggered: root.elapsedNow = Date.now() / 1000 }
     // A slow background refresh while closed too, so the badge count on the
     // bar chip itself stays roughly current without anyone opening the panel.
     Timer { interval: 900000; running: true; repeat: true; triggeredOnStart: true; onTriggered: if (!root.opened) checkProc.running = true }
@@ -130,9 +149,21 @@ Panel {
                 var targetId = root.busyId
                 try {
                     var r = JSON.parse(text)
-                    root.actionStatus = r.ok ? "Done." : (r.message || "Failed.")
-                    if (r.ok && kind === "add-app") root.addAppFormOpen = false
-                    if (r.ok && (kind === "remove" || kind === "remove-app") && root.diffOpenId === targetId) root.diffOpenId = ""
+                    root.actionStatus = r.ok ? "Done." : "Failed."
+                    if (kind === "add-app") {
+                        if (r.ok) root.addAppFormOpen = false
+                    } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
+                        // The row is about to disappear from the list -- nothing left to show a panel on.
+                        if (root.detailOpenId === targetId) root.detailOpenId = ""
+                    } else {
+                        // This is the actual answer to "did anything happen": the
+                        // command's real output, shown until closed or overwritten
+                        // by the next action -- not just a terse Done./Failed.
+                        root.detailOpenId = targetId
+                        root.detailMode = "output"
+                        root.detailOk = !!r.ok
+                        root.detailText = r.message || (r.ok ? "(no output)" : "(no error message)")
+                    }
                 } catch (e) {
                     root.actionStatus = "Action did not report a result."
                 }
@@ -140,6 +171,7 @@ Panel {
                 root.lastActionKind = ""
                 statusFile.reload()
                 if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
+                else { root.updateQueueTotal = 0; root.updateQueueDone = 0 }
             }
         }
         onExited: function(code) {
@@ -148,6 +180,7 @@ Panel {
                 root.lastActionKind = ""
                 if (!root.actionStatus) root.actionStatus = "Action failed."
                 if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
+                else { root.updateQueueTotal = 0; root.updateQueueDone = 0 }
             }
         }
     }
@@ -159,9 +192,10 @@ Panel {
             onStreamFinished: {
                 try {
                     var r = JSON.parse(text)
-                    root.diffText = r.ok ? (r.diff || "(no textual diff)") : ("Could not load diff: " + (r.message || ""))
+                    root.detailOk = !!r.ok
+                    root.detailText = r.ok ? (r.diff || "(no textual diff)") : ("Could not load diff: " + (r.message || ""))
                 } catch (e) {
-                    root.diffText = "Could not load diff."
+                    root.detailText = "Could not load diff."
                 }
             }
         }
@@ -240,7 +274,7 @@ Panel {
         required property var modelData
         width: parent ? parent.width : 0
         readonly property bool busy: root.busyId === row.modelData.id
-        readonly property bool diffShown: root.diffOpenId === row.modelData.id
+        readonly property bool detailShown: root.detailOpenId === row.modelData.id
         readonly property bool isSelf: row.modelData.id === root.moduleName
         property bool confirmingRemove: false
         height: content.implicitHeight + 16
@@ -250,7 +284,7 @@ Panel {
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
         Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirmingRemove = false }
-        onDiffShownChanged: if (!diffShown) confirmingRemove = false
+        onDetailShownChanged: if (!detailShown) confirmingRemove = false
 
         Column {
             id: content
@@ -269,7 +303,7 @@ Panel {
                 Label {
                     width: parent.width - 190 - 10
                     wrapMode: Text.WordWrap
-                    text: row.busy ? root.actionStatus : Model.stateLabel(row.modelData)
+                    text: row.busy ? (root.actionStatus + "  ·  " + Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s") : Model.stateLabel(row.modelData)
                     color: Model.canUpdate(row.modelData) ? "#5aed95" : (row.modelData.updateState === "dirty" || row.modelData.updateState === "diverged") ? "#f0ba82" : "#91a5b0"
                 }
             }
@@ -285,12 +319,12 @@ Panel {
                     onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
                 }
                 SmallButton {
-                    text: row.diffShown ? "Hide diff" : "Diff"
+                    text: row.detailShown && root.detailMode === "diff" ? "Hide diff" : "Diff"
                     accent: "#5a8fed"
                     visible: Model.canShowDiff(row.modelData)
                     enabled: true
                     anchors.verticalCenter: parent.verticalCenter
-                    onClicked: root.toggleDiff(row.modelData.id)
+                    onClicked: root.showDiff(row.modelData.id)
                 }
                 SmallButton {
                     text: row.busy ? "…" : "Update"
@@ -319,27 +353,42 @@ Panel {
             }
 
             Rectangle {
-                visible: row.diffShown
+                visible: row.detailShown
                 width: parent.width
-                height: visible ? Math.min(220, diffTextItem.implicitHeight + 16) : 0
+                height: visible ? 220 : 0
                 radius: 8
                 color: "#0b141d"
                 border.color: "#263844"
                 clip: true
-                Flickable {
-                    anchors.fill: parent
-                    anchors.margins: 8
-                    contentWidth: width
-                    contentHeight: diffTextItem.implicitHeight
-                    clip: true
-                    Text {
-                        id: diffTextItem
+                Column {
+                    width: parent.width - 16
+                    x: 8; y: 8
+                    spacing: 4
+                    Row {
                         width: parent.width
-                        text: row.diffShown ? root.diffText : ""
-                        color: "#c7d6dd"
-                        font.family: "monospace"
-                        font.pixelSize: 10
-                        wrapMode: Text.NoWrap
+                        Label {
+                            width: parent.width - 60
+                            text: root.detailMode === "diff" ? "Diff vs upstream" : (root.detailOk ? "Output" : "Output — failed")
+                            color: root.detailMode === "output" && !root.detailOk ? "#e0654a" : "#91a5b0"
+                            font.pixelSize: 10
+                        }
+                        SmallButton { text: "Close"; accent: "#5c7280"; onClicked: root.closeDetail() }
+                    }
+                    Flickable {
+                        width: parent.width
+                        height: 188
+                        contentWidth: width
+                        contentHeight: detailTextItem.implicitHeight
+                        clip: true
+                        Text {
+                            id: detailTextItem
+                            width: parent.width
+                            text: row.detailShown ? root.detailText : ""
+                            color: "#c7d6dd"
+                            font.family: "monospace"
+                            font.pixelSize: 10
+                            wrapMode: Text.NoWrap
+                        }
                     }
                 }
             }
@@ -361,7 +410,7 @@ Panel {
             anchors.centerIn: parent
             spacing: 4
             Text {
-                text: ""
+                text: ""
                 color: root.barForeground
                 font.family: Style.font.family
                 font.pixelSize: Style.font.icon
@@ -420,9 +469,9 @@ Panel {
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 8
                         SmallButton {
-                            text: root.busyId !== "" ? "…" : "Update all (" + root.updatable + ")"
-                            visible: root.updatable > 1
-                            enabled: root.busyId === "" && !checkProc.running
+                            text: root.updateQueueTotal > 0 ? ("Updating " + root.updateQueueDone + "/" + root.updateQueueTotal + "…") : "Update all (" + root.updatable + ")"
+                            visible: root.updatable > 1 || root.updateQueueTotal > 0
+                            enabled: root.updateQueueTotal === 0 && root.busyId === "" && !checkProc.running
                             anchors.verticalCenter: parent.verticalCenter
                             onClicked: root.runUpdateAll()
                         }
