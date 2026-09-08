@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "martythedev-tech.dashboard",
+  "name": "Plugin Dashboard",
+  "version": "1.0.0",
+  "author": "martythedev-tech",
+  "license": "MIT",
+  "description": "Lists every third-party and custom Omarchy plugin, plus tracked local apps (Flea, Howdy), with enable/disable and a real update check against each one's actual upstream (git, AUR).",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Dashboard",
+    "description": "Badge shows how many of your plugins/apps have an update available. Click to open, enable/disable, and update.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

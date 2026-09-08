@@ -1,0 +1,6 @@
+[Unit]
+Description=Check plugin/app updates for the Plugin Dashboard widget
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.config/omarchy/plugins/martythedev-tech.dashboard/dashboard.py check
