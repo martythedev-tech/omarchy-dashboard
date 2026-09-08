@@ -1,9 +1,17 @@
 .pragma library
 
 // True only for the one state Panel.qml's Update button ever fires on --
-// "dirty", "no-repo" and "unreachable" all need a person, not a click.
+// "dirty", "diverged", "no-repo" and "unreachable" all need a person, not a
+// click, because each would fail (or silently do the wrong thing) if
+// `omarchy plugin update`'s fast-forward-only merge ran anyway.
 function canUpdate(item) {
     return !!item && item.updateState === 'behind'
+}
+
+// True for anything a diff preview is meaningful for: 'behind' shows what
+// the Update button would apply, 'diverged' shows what's making it refuse.
+function canShowDiff(item) {
+    return !!item && (item.updateState === 'behind' || item.updateState === 'diverged')
 }
 
 function badgeCount(items) {
@@ -19,8 +27,9 @@ function stateLabel(item) {
     switch (item.updateState) {
         case 'behind': return item.behind + (item.behind === 1 ? ' commit behind' : ' commits behind')
         case 'dirty': return 'Local changes -- update manually'
+        case 'diverged': return 'Local commits ahead -- update manually'
         case 'no-repo': return 'No update source'
-        case 'unreachable': return 'Could not reach source'
+        case 'unreachable': return 'Could not reach source' + (item.reason ? ': ' + item.reason.split('\n')[0] : '')
         case 'up-to-date': return 'Up to date'
         default: return ''
     }

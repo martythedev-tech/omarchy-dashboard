@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "martythedev-tech.dashboard",
   "name": "Plugin Dashboard",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "martythedev-tech",
   "license": "MIT",
-  "description": "Lists every third-party and custom Omarchy plugin, plus tracked local apps (Flea, Howdy), with enable/disable and a real update check against each one's actual upstream (git, AUR).",
+  "description": "Lists every third-party and custom Omarchy plugin -- including itself -- plus tracked local apps, with enable/disable, diff preview, update-all, and a real update check against each one's actual upstream (git, AUR).",
   "kinds": ["bar-widget"],
   "entryPoints": {
     "barWidget": "Panel.qml"

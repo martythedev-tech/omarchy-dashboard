@@ -2,9 +2,9 @@
 """Dashboard: every third-party/own Omarchy plugin plus tracked local apps,
 checked against their real upstream. No bespoke update logic of its own --
 every action shells out to the command that already owns it (`omarchy plugin
-enable/disable/update` for plugins, each app's own rebuild.sh for apps) and
-this script's only job is deciding when an Update button should show and
-reporting what that command did.
+enable/disable/update/remove` for plugins, each app's own rebuild.sh for
+apps) and this script's only job is deciding when an Update button should
+show and reporting what that command did.
 """
 import argparse
 import json
@@ -20,7 +20,8 @@ STATUS_PATH = STATE / 'status.json'
 APPS_PATH = STATE / 'apps.json'
 
 # Seeded into APPS_PATH the first time it's missing; from then on the file on
-# disk is what's read; edit it there to add or change tracked apps.
+# disk is what's read; edit it there (or via the "+ Add app" form) to add or
+# change tracked apps.
 DEFAULT_APPS = [
     {'id': 'flea', 'name': 'Flea', 'repoDir': str(Path.home() / 'Projects/flea'), 'pkgName': 'flea',
      'branch': 'master', 'remote': 'origin', 'updateCmd': ['./rebuild.sh', '--install']},
@@ -50,19 +51,26 @@ def load_apps():
     return DEFAULT_APPS
 
 
-def ensure_apps_file():
-    if APPS_PATH.exists():
-        return
+def save_apps(apps):
     STATE.mkdir(parents=True, exist_ok=True)
     tmp = APPS_PATH.with_suffix('.tmp')
-    tmp.write_text(json.dumps(DEFAULT_APPS, indent=2) + '\n')
+    tmp.write_text(json.dumps(apps, indent=2) + '\n')
     tmp.replace(APPS_PATH)
 
 
+def ensure_apps_file():
+    if APPS_PATH.exists():
+        return
+    save_apps(DEFAULT_APPS)
+
+
 def discover_plugins():
-    """Every plugin `omarchy plugin list` reports as not first-party, minus
-    this dashboard's own id -- the exact "third-party and your own, not
-    Omarchy's built-ins" boundary Omarchy itself already computes."""
+    """Every plugin `omarchy plugin list` reports as not first-party -- the
+    exact "not Omarchy's own" boundary Omarchy itself already draws. This now
+    includes the dashboard's own entry, so it can check and update itself
+    too; the CLI layer (cmd_disable/cmd_remove) separately refuses to touch
+    SELF_ID for the two actions that would pull the shell out from under its
+    own running widget."""
     rc, out, _ = run(['omarchy', 'plugin', 'list', '--json'])
     if rc != 0 or not out.strip():
         return []
@@ -72,7 +80,7 @@ def discover_plugins():
         return []
     if not isinstance(data, list):
         return []
-    return [p for p in data if not p.get('firstParty') and p.get('id') != SELF_ID]
+    return [p for p in data if not p.get('firstParty')]
 
 
 def manifest_version(plugin_id):
@@ -94,27 +102,37 @@ def pkg_version(pkg_name):
 def plugin_update_state(plugin_dir):
     """Mirrors omarchy-plugin-update's own check exactly (fetch origin's
     HEAD, compare against ours) so "update available" here always agrees
-    with what `omarchy plugin update` would actually do."""
+    with what `omarchy plugin update` would actually do -- including its
+    fast-forward-only merge, which is why a clean tree with local commits
+    that aren't upstream is reported as 'diverged' rather than 'behind': the
+    Update button only ever fires on 'behind', and offering it here would
+    just hand the user a merge failure `omarchy plugin update` can't recover
+    from on its own.
+    """
     plugin_dir = Path(plugin_dir)
     if not (plugin_dir / '.git').is_dir():
-        return 'no-repo', 0
-    rc, _, _ = run(['git', '-C', str(plugin_dir), 'fetch', '--quiet', 'origin', 'HEAD'], timeout=20)
+        return 'no-repo', 0, ''
+    rc, _, err = run(['git', '-C', str(plugin_dir), 'fetch', '--quiet', 'origin', 'HEAD'], timeout=20)
     if rc != 0:
-        return 'unreachable', 0
+        return 'unreachable', 0, err.strip()[-500:]
     rc1, head, _ = run(['git', '-C', str(plugin_dir), 'rev-parse', 'HEAD'])
     rc2, fetch_head, _ = run(['git', '-C', str(plugin_dir), 'rev-parse', 'FETCH_HEAD'])
     if rc1 != 0 or rc2 != 0:
-        return 'unreachable', 0
+        return 'unreachable', 0, 'could not resolve HEAD/FETCH_HEAD'
     if head.strip() == fetch_head.strip():
-        return 'up-to-date', 0
+        return 'up-to-date', 0, ''
     rc3, count, _ = run(['git', '-C', str(plugin_dir), 'rev-list', '--count', 'HEAD..FETCH_HEAD'])
     behind = int(count.strip()) if rc3 == 0 and count.strip().isdigit() else 0
     if behind == 0:
-        return 'up-to-date', 0
+        return 'up-to-date', 0, ''
     rc4, dirty, _ = run(['git', '-C', str(plugin_dir), 'status', '--porcelain'])
     if dirty.strip():
-        return 'dirty', behind
-    return 'behind', behind
+        return 'dirty', behind, ''
+    rc5, ahead_count, _ = run(['git', '-C', str(plugin_dir), 'rev-list', '--count', 'FETCH_HEAD..HEAD'])
+    ahead = int(ahead_count.strip()) if rc5 == 0 and ahead_count.strip().isdigit() else 0
+    if ahead > 0:
+        return 'diverged', behind, ''
+    return 'behind', behind, ''
 
 
 def app_update_state(repo_dir, branch, remote):
@@ -124,52 +142,78 @@ def app_update_state(repo_dir, branch, remote):
     aarch64-local that's meant to diverge from the AUR-tracking branch."""
     repo_dir = Path(repo_dir)
     if not (repo_dir / '.git').is_dir():
-        return 'no-repo', 0
-    rc, _, _ = run(['git', '-C', str(repo_dir), 'fetch', '--quiet', remote], timeout=20)
+        return 'no-repo', 0, ''
+    rc, _, err = run(['git', '-C', str(repo_dir), 'fetch', '--quiet', remote], timeout=20)
     if rc != 0:
-        return 'unreachable', 0
+        return 'unreachable', 0, err.strip()[-500:]
     remote_ref = f'{remote}/{branch}'
     rc1, _, _ = run(['git', '-C', str(repo_dir), 'rev-parse', '--verify', branch])
     rc2, _, _ = run(['git', '-C', str(repo_dir), 'rev-parse', '--verify', remote_ref])
     if rc1 != 0 or rc2 != 0:
-        return 'unreachable', 0
+        return 'unreachable', 0, f'could not resolve {branch}/{remote_ref}'
     rc3, _, _ = run(['git', '-C', str(repo_dir), 'merge-base', '--is-ancestor', remote_ref, branch])
     if rc3 == 0:
-        return 'up-to-date', 0
+        return 'up-to-date', 0, ''
     rc4, count, _ = run(['git', '-C', str(repo_dir), 'rev-list', '--count', f'{branch}..{remote_ref}'])
     behind = int(count.strip()) if rc4 == 0 and count.strip().isdigit() else 0
-    return ('behind', behind) if behind > 0 else ('up-to-date', 0)
+    return ('behind', behind, '') if behind > 0 else ('up-to-date', 0, '')
 
 
 def check_plugin(p):
     pid = p['id']
-    state, behind = plugin_update_state(PLUGINS_DIR / pid)
+    state, behind, reason = plugin_update_state(PLUGINS_DIR / pid)
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
         'version': manifest_version(pid), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
-        'updateState': state, 'behind': behind,
+        'updateState': state, 'behind': behind, 'reason': reason,
     }
 
 
 def check_app(a):
     branch = a.get('branch', 'master')
     remote = a.get('remote', 'origin')
-    state, behind = app_update_state(a['repoDir'], branch, remote)
+    state, behind, reason = app_update_state(a['repoDir'], branch, remote)
     return {
         'id': a['id'], 'kind': 'app', 'name': a.get('name', a['id']),
         'version': pkg_version(a.get('pkgName', a['id'])),
-        'updateState': state, 'behind': behind,
+        'updateState': state, 'behind': behind, 'reason': reason,
     }
 
 
+def _previously_behind_ids():
+    try:
+        data = json.loads(STATUS_PATH.read_text())
+        return {i['id'] for i in data.get('items', []) if i.get('updateState') == 'behind'}
+    except (OSError, ValueError):
+        return set()
+
+
+def notify_new_updates(items, old_behind_ids):
+    """A toast only for items that just *became* one-click-updatable since
+    the last check -- not a repeat every cycle for something that's been
+    sitting there, and not for 'dirty'/'diverged', which need a person
+    regardless of how many checks go by."""
+    newly = [i for i in items if i['updateState'] == 'behind' and i['id'] not in old_behind_ids]
+    if not newly:
+        return
+    names = ', '.join(i['name'] for i in newly[:5])
+    if len(newly) > 5:
+        names += f' and {len(newly) - 5} more'
+    title = 'Update available' if len(newly) == 1 else f'{len(newly)} updates available'
+    run(['notify-send', '--app-name=Plugin Dashboard', '--icon=system-software-update',
+         title, names], timeout=5)
+
+
 def check_all():
+    old_behind_ids = _previously_behind_ids()
     items = [check_plugin(p) for p in discover_plugins()] + [check_app(a) for a in load_apps()]
     status = {
         'ts': time.time(),
         'items': items,
         'updatable': sum(1 for i in items if i['updateState'] == 'behind'),
     }
+    notify_new_updates(items, old_behind_ids)
     STATE.mkdir(parents=True, exist_ok=True)
     tmp = STATUS_PATH.with_suffix('.tmp')
     tmp.write_text(json.dumps(status, indent=2))
@@ -188,6 +232,10 @@ def cmd_enable(args):
 
 
 def cmd_disable(args):
+    if args.id == SELF_ID:
+        print(json.dumps({'ok': False, 'message': 'Refusing to disable the Dashboard from within itself -- '
+                                                    'use `omarchy plugin disable` from a terminal instead.'}))
+        return
     rc, out, err = run(['omarchy', 'plugin', 'disable', args.id])
     print(json.dumps({'ok': rc == 0, 'message': (out or err).strip()}))
 
@@ -207,18 +255,96 @@ def cmd_update(args):
     check_all()
 
 
+def cmd_remove(args):
+    if args.id == SELF_ID:
+        print(json.dumps({'ok': False, 'message': 'Refusing to remove the Dashboard from within itself -- '
+                                                    'use `omarchy plugin remove` from a terminal instead.'}))
+        return
+    rc, out, err = run(['omarchy', 'plugin', 'remove', args.id, '--yes'], timeout=60)
+    print(json.dumps({'ok': rc == 0, 'message': (out or err).strip()}))
+    check_all()
+
+
+def cmd_diff(args):
+    """Preview what an Update would actually apply, without applying it --
+    the widget only ever offers this for 'behind'/'diverged' items, so
+    FETCH_HEAD (plugins) or remote/branch (apps) is already fresh from the
+    check that put them in that state."""
+    ensure_apps_file()
+    apps = {a['id']: a for a in load_apps()}
+    if args.id in apps:
+        a = apps[args.id]
+        branch = a.get('branch', 'master')
+        remote_ref = f"{a.get('remote', 'origin')}/{branch}"
+        rc, out, err = run(['git', '-C', a['repoDir'], 'diff', branch, remote_ref], timeout=20)
+    else:
+        rc, out, err = run(['git', '-C', str(PLUGINS_DIR / args.id), 'diff', 'HEAD', 'FETCH_HEAD'], timeout=20)
+    if rc != 0:
+        print(json.dumps({'ok': False, 'message': (err or 'Could not compute diff.').strip()[-2000:]}))
+        return
+    print(json.dumps({'ok': True, 'diff': out[-20000:] or '(no textual diff)'}))
+
+
+def cmd_add_app(args):
+    try:
+        fields = json.loads(args.json)
+    except ValueError:
+        print(json.dumps({'ok': False, 'message': 'Invalid app data.'}))
+        return
+    app_id = str(fields.get('id') or '').strip()
+    name = str(fields.get('name') or '').strip()
+    repo_dir = str(fields.get('repoDir') or '').strip()
+    if not app_id or not name or not repo_dir:
+        print(json.dumps({'ok': False, 'message': 'Name, id, and repo dir are all required.'}))
+        return
+    if not (Path(repo_dir).expanduser() / '.git').is_dir():
+        print(json.dumps({'ok': False, 'message': repo_dir + ' is not a git repository.'}))
+        return
+    update_cmd = fields.get('updateCmd') or ['./rebuild.sh', '--install']
+    if isinstance(update_cmd, str):
+        update_cmd = update_cmd.split()
+    entry = {
+        'id': app_id, 'name': name, 'repoDir': repo_dir,
+        'pkgName': str(fields.get('pkgName') or app_id),
+        'branch': str(fields.get('branch') or 'master'),
+        'remote': str(fields.get('remote') or 'origin'),
+        'updateCmd': update_cmd,
+    }
+    ensure_apps_file()
+    apps = [a for a in load_apps() if a.get('id') != app_id]
+    apps.append(entry)
+    save_apps(apps)
+    print(json.dumps({'ok': True, 'message': 'Added ' + name + '.'}))
+    check_all()
+
+
+def cmd_remove_app(args):
+    ensure_apps_file()
+    apps = load_apps()
+    remaining = [a for a in apps if a.get('id') != args.id]
+    if len(remaining) == len(apps):
+        print(json.dumps({'ok': False, 'message': 'No tracked app with that id.'}))
+        return
+    save_apps(remaining)
+    print(json.dumps({'ok': True, 'message': 'Stopped tracking ' + args.id + '.'}))
+    check_all()
+
+
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('check')
-    p_enable = sub.add_parser('enable')
-    p_enable.add_argument('id')
-    p_disable = sub.add_parser('disable')
-    p_disable.add_argument('id')
-    p_update = sub.add_parser('update')
-    p_update.add_argument('id')
+    for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app'):
+        p = sub.add_parser(name)
+        p.add_argument('id')
+    p_add_app = sub.add_parser('add-app')
+    p_add_app.add_argument('json')
     args = parser.parse_args()
-    {'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update}[args.command](args)
+    handlers = {
+        'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
+        'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
+    }
+    handlers[args.command](args)
 
 
 if __name__ == '__main__':
