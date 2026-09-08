@@ -24,18 +24,72 @@ Panel {
     readonly property int updatable: Model.badgeCount(items)
     property string actionStatus: ""
     property string busyId: ""
+    property string lastActionKind: ""
+    property var updateQueue: []
+    property string diffOpenId: ""
+    property string diffText: ""
+    property bool addAppFormOpen: false
+    property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install"})
     property real now: Date.now() / 1000
+
+    function actionVerb(kind) {
+        switch (kind) {
+            case "update": return "Updating "
+            case "enable": return "Enabling "
+            case "disable": return "Disabling "
+            case "remove": return "Removing "
+            case "remove-app": return "Removing "
+            default: return "Working on "
+        }
+    }
 
     function runCheck() {
         if (checkProc.running) return
         actionStatus = "Checking sources…"
         checkProc.running = true
     }
+
     function runAction(kind, id) {
         if (root.busyId !== "") return
         root.busyId = id
-        actionStatus = (kind === "update" ? "Updating " : kind === "enable" ? "Enabling " : "Disabling ") + id + "…"
+        root.lastActionKind = kind
+        actionStatus = actionVerb(kind) + id + "…"
         actionProc.command = ["python3", helper, kind, id]
+        actionProc.running = true
+    }
+
+    function runUpdateAll() {
+        if (root.busyId !== "") return
+        var ids = []
+        for (var i = 0; i < root.items.length; i++) if (Model.canUpdate(root.items[i])) ids.push(root.items[i].id)
+        if (ids.length === 0) return
+        root.updateQueue = ids
+        advanceUpdateQueue()
+    }
+
+    function advanceUpdateQueue() {
+        if (root.updateQueue.length === 0) return
+        var next = root.updateQueue[0]
+        root.updateQueue = root.updateQueue.slice(1)
+        runAction("update", next)
+    }
+
+    function toggleDiff(id) {
+        if (root.diffOpenId === id) { root.diffOpenId = ""; return }
+        root.diffOpenId = id
+        root.diffText = "Loading…"
+        diffProc.command = ["python3", root.helper, "diff", id]
+        diffProc.running = true
+    }
+
+    function submitAddApp() {
+        if (root.busyId !== "") return
+        var f = root.addAppFields
+        if (!f.name || !f.id || !f.repoDir) { root.actionStatus = "Name, id, and repo dir are required."; return }
+        root.busyId = "__add_app__"
+        root.lastActionKind = "add-app"
+        root.actionStatus = "Adding " + f.name + "…"
+        actionProc.command = ["python3", root.helper, "add-app", JSON.stringify(f)]
         actionProc.running = true
     }
 
@@ -72,17 +126,45 @@ Panel {
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
+                var kind = root.lastActionKind
+                var targetId = root.busyId
                 try {
                     var r = JSON.parse(text)
                     root.actionStatus = r.ok ? "Done." : (r.message || "Failed.")
+                    if (r.ok && kind === "add-app") root.addAppFormOpen = false
+                    if (r.ok && (kind === "remove" || kind === "remove-app") && root.diffOpenId === targetId) root.diffOpenId = ""
                 } catch (e) {
                     root.actionStatus = "Action did not report a result."
                 }
                 root.busyId = ""
+                root.lastActionKind = ""
                 statusFile.reload()
+                if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
             }
         }
-        onExited: function(code) { if (code !== 0 && root.busyId !== "") { root.busyId = ""; if (!root.actionStatus) root.actionStatus = "Action failed." } }
+        onExited: function(code) {
+            if (code !== 0 && root.busyId !== "") {
+                root.busyId = ""
+                root.lastActionKind = ""
+                if (!root.actionStatus) root.actionStatus = "Action failed."
+                if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
+            }
+        }
+    }
+
+    Process {
+        id: diffProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                try {
+                    var r = JSON.parse(text)
+                    root.diffText = r.ok ? (r.diff || "(no textual diff)") : ("Could not load diff: " + (r.message || ""))
+                } catch (e) {
+                    root.diffText = "Could not load diff."
+                }
+            }
+        }
     }
 
     component Label: Text {
@@ -127,49 +209,139 @@ Panel {
         }
         MouseArea { anchors.fill: parent; cursorShape: tg.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: if (tg.enabled) tg.toggled() }
     }
+    component FieldInput: Rectangle {
+        id: field
+        property alias text: input.text
+        property string placeholder: ""
+        width: parent ? parent.width : 200
+        height: 30
+        radius: 6
+        color: "#111e28"
+        border.color: input.activeFocus ? "#5a8fed" : "#263844"
+        TextInput {
+            id: input
+            anchors.fill: parent
+            anchors.margins: 8
+            verticalAlignment: TextInput.AlignVCenter
+            color: "#eff7fa"
+            font.pixelSize: 11
+            clip: true
+        }
+        Text {
+            anchors.left: input.left; anchors.verticalCenter: parent.verticalCenter
+            text: field.placeholder
+            visible: input.text.length === 0 && !input.activeFocus
+            color: "#5c7280"
+            font.pixelSize: 11
+        }
+    }
     component Row_: Rectangle {
         id: row
         required property var modelData
         width: parent ? parent.width : 0
-        height: 46
+        readonly property bool busy: root.busyId === row.modelData.id
+        readonly property bool diffShown: root.diffOpenId === row.modelData.id
+        readonly property bool isSelf: row.modelData.id === root.moduleName
+        property bool confirmingRemove: false
+        height: content.implicitHeight + 16
         radius: 10
         color: rowMouse.containsMouse ? "#1d303b" : "#111e28"
         border.color: "#263844"
-        readonly property bool busy: root.busyId === row.modelData.id
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+        Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirmingRemove = false }
+        onDiffShownChanged: if (!diffShown) confirmingRemove = false
 
-        Row {
-            anchors.left: parent.left; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
-            spacing: 10
-            Column {
-                width: 220
-                Heading { text: row.modelData.name; font.pixelSize: 12; elide: Text.ElideRight; width: 220 }
-                Label { text: (row.modelData.version ? "v" + row.modelData.version : "no version") + (row.modelData.kind === "app" ? "  ·  app" : ""); font.pixelSize: 10 }
-            }
-            Label {
-                width: 190; wrapMode: Text.WordWrap
-                text: row.busy ? root.actionStatus : Model.stateLabel(row.modelData)
-                color: Model.canUpdate(row.modelData) ? "#5aed95" : row.modelData.updateState === "dirty" ? "#f0ba82" : "#91a5b0"
-            }
-        }
+        Column {
+            id: content
+            width: parent.width - 24
+            x: 12; y: 8
+            spacing: 6
 
-        Row {
-            anchors.right: parent.right; anchors.rightMargin: 12; anchors.verticalCenter: parent.verticalCenter
-            spacing: 10
-            Toggle {
-                visible: row.modelData.kind === "plugin" && row.modelData.canDisable !== false
-                checked: !!row.modelData.enabled
-                enabled: !row.busy && root.busyId === ""
-                anchors.verticalCenter: parent.verticalCenter
-                onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
+            Row {
+                width: parent.width
+                spacing: 10
+                Column {
+                    width: 190
+                    Heading { text: row.modelData.name; font.pixelSize: 12; elide: Text.ElideRight; width: 190 }
+                    Label { text: (row.modelData.version ? "v" + row.modelData.version : "no version") + (row.modelData.kind === "app" ? "  ·  app" : "") + (row.isSelf ? "  ·  this widget" : ""); font.pixelSize: 10 }
+                }
+                Label {
+                    width: parent.width - 190 - 10
+                    wrapMode: Text.WordWrap
+                    text: row.busy ? root.actionStatus : Model.stateLabel(row.modelData)
+                    color: Model.canUpdate(row.modelData) ? "#5aed95" : (row.modelData.updateState === "dirty" || row.modelData.updateState === "diverged") ? "#f0ba82" : "#91a5b0"
+                }
             }
-            SmallButton {
-                text: row.busy ? "…" : "Update"
-                visible: Model.canUpdate(row.modelData)
-                enabled: !row.busy && root.busyId === ""
-                anchors.verticalCenter: parent.verticalCenter
-                onClicked: root.runAction("update", row.modelData.id)
+
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Toggle {
+                    visible: row.modelData.kind === "plugin" && row.modelData.canDisable !== false && !row.isSelf
+                    checked: !!row.modelData.enabled
+                    enabled: !row.busy && root.busyId === ""
+                    anchors.verticalCenter: parent.verticalCenter
+                    onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
+                }
+                SmallButton {
+                    text: row.diffShown ? "Hide diff" : "Diff"
+                    accent: "#5a8fed"
+                    visible: Model.canShowDiff(row.modelData)
+                    enabled: true
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: root.toggleDiff(row.modelData.id)
+                }
+                SmallButton {
+                    text: row.busy ? "…" : "Update"
+                    visible: Model.canUpdate(row.modelData)
+                    enabled: !row.busy && root.busyId === ""
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: root.runAction("update", row.modelData.id)
+                }
+                SmallButton {
+                    text: row.confirmingRemove ? "Confirm?" : "Remove"
+                    accent: "#e0654a"
+                    visible: !row.isSelf
+                    enabled: !row.busy && root.busyId === ""
+                    anchors.verticalCenter: parent.verticalCenter
+                    onClicked: {
+                        if (row.confirmingRemove) {
+                            confirmResetTimer.stop()
+                            row.confirmingRemove = false
+                            root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
+                        } else {
+                            row.confirmingRemove = true
+                            confirmResetTimer.restart()
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                visible: row.diffShown
+                width: parent.width
+                height: visible ? Math.min(220, diffTextItem.implicitHeight + 16) : 0
+                radius: 8
+                color: "#0b141d"
+                border.color: "#263844"
+                clip: true
+                Flickable {
+                    anchors.fill: parent
+                    anchors.margins: 8
+                    contentWidth: width
+                    contentHeight: diffTextItem.implicitHeight
+                    clip: true
+                    Text {
+                        id: diffTextItem
+                        width: parent.width
+                        text: row.diffShown ? root.diffText : ""
+                        color: "#c7d6dd"
+                        font.family: "monospace"
+                        font.pixelSize: 10
+                        wrapMode: Text.NoWrap
+                    }
+                }
             }
         }
     }
@@ -239,16 +411,27 @@ Panel {
                 Row {
                     width: parent.width
                     Column {
-                        width: parent.width - 90
+                        width: parent.width - 190
                         spacing: 3
                         Heading { text: "PLUGIN DASHBOARD"; font.pixelSize: 16; font.letterSpacing: 2 }
                         Label { text: "Everything that isn't Omarchy's own."; font.pixelSize: 10 }
                     }
-                    SmallButton {
-                        text: checkProc.running ? "…" : "Refresh"
-                        enabled: !checkProc.running
+                    Row {
                         anchors.verticalCenter: parent.verticalCenter
-                        onClicked: root.runCheck()
+                        spacing: 8
+                        SmallButton {
+                            text: root.busyId !== "" ? "…" : "Update all (" + root.updatable + ")"
+                            visible: root.updatable > 1
+                            enabled: root.busyId === "" && !checkProc.running
+                            anchors.verticalCenter: parent.verticalCenter
+                            onClicked: root.runUpdateAll()
+                        }
+                        SmallButton {
+                            text: checkProc.running ? "…" : "Refresh"
+                            enabled: !checkProc.running
+                            anchors.verticalCenter: parent.verticalCenter
+                            onClicked: root.runCheck()
+                        }
                     }
                 }
 
@@ -265,12 +448,36 @@ Panel {
 
                 Column {
                     width: parent.width
-                    visible: root.grouped.apps.length > 0
+                    visible: root.grouped.apps.length > 0 || root.addAppFormOpen
                     spacing: 8
                     Label { text: "APPS"; font.pixelSize: 10; font.letterSpacing: 1.5 }
                     Repeater {
                         model: root.grouped.apps
                         Row_ {}
+                    }
+
+                    SmallButton {
+                        text: root.addAppFormOpen ? "Cancel" : "+ Add app"
+                        accent: root.addAppFormOpen ? "#e0654a" : "#5aed95"
+                        onClicked: root.addAppFormOpen = !root.addAppFormOpen
+                    }
+
+                    Column {
+                        width: parent.width
+                        visible: root.addAppFormOpen
+                        spacing: 6
+                        FieldInput { placeholder: "Display name"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {name: text}) }
+                        FieldInput { placeholder: "id (lowercase, no spaces)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {id: text}) }
+                        FieldInput { placeholder: "Repo dir, e.g. /home/you/Projects/myapp"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {repoDir: text}) }
+                        FieldInput { placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
+                        Row {
+                            width: parent.width
+                            spacing: 6
+                            FieldInput { width: (parent.width - 6) / 2; placeholder: "Branch (default master)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {branch: text}) }
+                            FieldInput { width: (parent.width - 6) / 2; placeholder: "Remote (default origin)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {remote: text}) }
+                        }
+                        FieldInput { text: "./rebuild.sh --install"; placeholder: "Update command"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
+                        SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
                     }
                 }
 
