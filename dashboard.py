@@ -5,6 +5,19 @@ every action shells out to the command that already owns it (`omarchy plugin
 enable/disable/update/remove` for plugins, each app's own rebuild.sh for
 apps) and this script's only job is deciding when an Update button should
 show and reporting what that command did.
+
+One exception: a plugin whose own run.sh implements `--ensure` (2026-09-12,
+Omastorm) pins a native binary separately from its git content, fetched and
+swapped in by that same command. `omarchy plugin update` finishing (and the
+shell hot-reload it triggers) does not reliably re-run it -- confirmed live:
+a real update landed the new git content while the old engine binary and its
+daemon sat untouched for minutes with nothing in its own bootstrap log, no
+error anywhere, and the Dashboard still reported "up to date" throughout,
+because its update_state check only ever looks at git HEAD. cmd_update runs
+that same command itself, synchronously, right after a successful git
+update, so what gets reported here reflects whether the plugin actually
+finished coming up -- still the plugin's own command, just called directly
+instead of trusted to happen on its own.
 """
 import argparse
 import json
@@ -89,6 +102,27 @@ def manifest_version(plugin_id):
         return json.loads(path.read_text()).get('version', '')
     except (OSError, ValueError):
         return ''
+
+
+def has_ensure_bootstrap(plugin_dir):
+    """Whether this plugin owns a run.sh implementing `--ensure` -- the convention a
+    plugin uses to fetch/swap a native binary it pins separately from its git content
+    (Omastorm's engine daemon is the first). Generic on purpose: covers any future
+    plugin that adopts the same pattern, not just the one that surfaced it."""
+    run_sh = Path(plugin_dir) / 'run.sh'
+    try:
+        return run_sh.is_file() and '--ensure' in run_sh.read_text()
+    except OSError:
+        return False
+
+
+def run_ensure_bootstrap(plugin_dir):
+    """Runs the plugin's own bootstrap synchronously and waits for it, rather than
+    trusting the shell's post-update hot-reload to have triggered it on its own --
+    confirmed it does not always. Safe to call even when nothing needed fetching:
+    run.sh --ensure is the plugin's own idempotent readiness check, so a build that's
+    already current just confirms that and returns quickly."""
+    return run(['bash', 'run.sh', '--ensure'], cwd=str(plugin_dir), timeout=60)
 
 
 def pkg_version(pkg_name):
@@ -248,6 +282,15 @@ def cmd_update(args):
         rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900)
     else:
         rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180)
+        plugin_dir = PLUGINS_DIR / args.id
+        if rc == 0 and has_ensure_bootstrap(plugin_dir):
+            erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
+            if erc != 0:
+                rc = erc
+                err = (err + '\n' if err.strip() else '') + \
+                    'Update landed but the plugin did not come up cleanly:\n' + (eerr or eout)
+            elif eout.strip():
+                out = (out + '\n' if out.strip() else '') + eout
     # Long build logs (Flea's cargo test output, say) aren't useful in full to
     # the UI -- the tail carries the actual result or error.
     message = (out or err).strip()[-4000:]
