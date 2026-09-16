@@ -299,8 +299,13 @@ Panel {
         // no room to draw "8/9" legibly at bar-icon size -- and draws a
         // thinner stroke proportionate to the smaller ring.
         property bool showLabel: true
-        property real strokeWidth: showLabel ? 3.5 : 2.2
-        implicitWidth: 36; implicitHeight: 36
+        property real strokeWidth: showLabel ? 3 : 2.2
+        // 44px, not 36: a worst-case label like "10/10" is 5 characters, and
+        // 36px left only ~25px of clear space inside a 3.5px stroke at that
+        // size -- the label and the arc visibly collided (confirmed live,
+        // 2026-09-16 screenshot). 44px plus the narrower stroke above leaves
+        // ~35px clear, comfortable for a 9px label.
+        implicitWidth: showLabel ? 44 : 36; implicitHeight: showLabel ? 44 : 36
         Canvas {
             id: canvas
             anchors.fill: parent
@@ -339,7 +344,7 @@ Panel {
             text: ring.total > 0 ? ring.done + "/" + ring.total : "--"
             color: root.ink
             font.family: Style.font.family
-            font.pixelSize: Style.font.caption
+            font.pixelSize: 9
             font.bold: true
             textFormat: Text.PlainText
         }
@@ -495,6 +500,7 @@ Panel {
             // opened, rather than a static icon that means the same thing
             // whether everything's current or half the list needs attention.
             HealthRing {
+                id: barRing
                 anchors.verticalCenter: parent.verticalCenter
                 implicitWidth: Style.bar.iconCanvas
                 implicitHeight: Style.bar.iconCanvas
@@ -503,6 +509,21 @@ Panel {
                 fillColor: root.barForeground
                 done: root.health.done
                 total: root.health.total
+                // A one-click update genuinely waiting (the same condition that
+                // shows the red count badge) gets a slow breathing pulse on top
+                // of the badge's own color cue -- an idle "everything's current"
+                // ring stays perfectly still. `pulse` drives opacity only while
+                // updatable > 0; the ternary means a mid-breath stop never
+                // freezes the icon dim, since the binding ignores the stale
+                // `pulse` value the instant updatable goes back to 0.
+                property real pulse: 1.0
+                opacity: root.updatable > 0 ? pulse : 1.0
+                SequentialAnimation {
+                    running: root.updatable > 0
+                    loops: Animation.Infinite
+                    NumberAnimation { target: barRing; property: "pulse"; from: 1.0; to: 0.45; duration: 700; easing.type: Easing.InOutQuad }
+                    NumberAnimation { target: barRing; property: "pulse"; from: 0.45; to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
+                }
             }
             Rectangle {
                 visible: root.updatable > 0
