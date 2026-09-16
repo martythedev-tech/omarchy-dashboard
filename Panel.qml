@@ -635,7 +635,27 @@ Panel {
                             width: parent.width
                             visible: root.grouped.plugins.length > 0
                             spacing: 8
-                            Label { text: "PLUGINS"; font.pixelSize: Style.font.caption; font.letterSpacing: 1.5 }
+                            Item {
+                                width: parent.width
+                                height: pluginsLabel.implicitHeight
+                                Label {
+                                    id: pluginsLabel
+                                    text: "PLUGINS"; font.pixelSize: Style.font.caption; font.letterSpacing: 1.5
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                // omarchyplugins.com is Omarchy's own community plugin directory
+                                // (documented in its shell-plugins manual) -- this panel only ever
+                                // manages what's already installed, so a link out is the entire
+                                // "discovery" story rather than reimplementing a browse/search UI
+                                // against a site with no API.
+                                SmallButton {
+                                    text: "Browse plugins ↗"
+                                    accent: Color.muted
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    onClicked: Qt.openUrlExternally("https://omarchyplugins.com")
+                                }
+                            }
                             Repeater {
                                 model: root.grouped.plugins
                                 Row_ {}
