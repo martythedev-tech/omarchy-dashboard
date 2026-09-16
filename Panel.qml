@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -40,6 +41,15 @@ Panel {
     property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install"})
     property real now: Date.now() / 1000
     property real elapsedNow: Date.now() / 1000
+
+    // Every color in this file reads through here rather than a fixed hex
+    // palette, so the panel actually follows the user's chosen Omarchy theme
+    // (colors.toml/shell.toml) instead of a hardcoded dark-slate look that
+    // clashes with a light or differently-accented theme -- the same
+    // approach nixfred.cpu-pulse (the plugin whose shape this file follows)
+    // already uses throughout.
+    readonly property color ink: Color.popups.text
+    readonly property var health: Model.healthFraction(root.items)
 
     function actionVerb(kind) {
         switch (kind) {
@@ -202,24 +212,27 @@ Panel {
     }
 
     component Label: Text {
-        color: "#91a5b0"; font.pixelSize: 11; textFormat: Text.PlainText
+        color: Util.alpha(root.ink, 0.62); font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; textFormat: Text.PlainText
     }
     component Heading: Text {
-        color: "#eff7fa"; font.pixelSize: 14; font.bold: true; textFormat: Text.PlainText
+        color: root.ink; font.family: Style.font.family; font.pixelSize: Style.font.title; font.bold: true; textFormat: Text.PlainText
     }
     component SmallButton: Rectangle {
         id: btn
         property string text: ""
         property bool enabled: true
-        property color accent: "#5aed95"
+        property color accent: Color.accent
         signal clicked()
         implicitWidth: caption.implicitWidth + 20
-        implicitHeight: 26
+        implicitHeight: Style.spacing.controlHeight - 2
         radius: 7
-        color: !btn.enabled ? "#1b262d" : area.containsMouse ? Qt.alpha(accent, 0.28) : Qt.alpha(accent, 0.16)
-        border.color: !btn.enabled ? "#2a3b47" : accent
+        color: !btn.enabled ? Style.normalFill : area.containsMouse ? Util.alpha(accent, 0.28) : Util.alpha(accent, 0.16)
+        border.color: !btn.enabled ? Style.normalBorderColor : accent
         opacity: btn.enabled ? 1 : 0.5
-        Text { id: caption; anchors.centerIn: parent; text: btn.text; color: "#eff7fa"; font.pixelSize: 11; font.bold: true; textFormat: Text.PlainText }
+        Text {
+            id: caption; anchors.centerIn: parent; text: btn.text; color: root.ink
+            font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; font.bold: true; textFormat: Text.PlainText
+        }
         MouseArea {
             id: area; anchors.fill: parent; hoverEnabled: true
             cursorShape: btn.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
@@ -233,10 +246,10 @@ Panel {
         signal toggled()
         implicitWidth: 38; implicitHeight: 20
         radius: height / 2
-        color: !tg.enabled ? "#28343d" : tg.checked ? "#3fae76" : "#2a3b47"
+        color: !tg.enabled ? Style.normalFill : tg.checked ? Color.accent : Util.alpha(root.ink, 0.16)
         opacity: tg.enabled ? 1 : 0.5
         Rectangle {
-            width: 16; height: 16; radius: 8; color: "#eff7fa"
+            width: 16; height: 16; radius: 8; color: Color.background
             anchors.verticalCenter: parent.verticalCenter
             x: tg.checked ? parent.width - width - 2 : 2
             Behavior on x { NumberAnimation { duration: 120 } }
@@ -250,23 +263,75 @@ Panel {
         width: parent ? parent.width : 200
         height: 30
         radius: 6
-        color: "#111e28"
-        border.color: input.activeFocus ? "#5a8fed" : "#263844"
+        color: Style.normalFill
+        border.color: input.activeFocus ? Color.accent : Style.normalBorderColor
         TextInput {
             id: input
             anchors.fill: parent
             anchors.margins: 8
             verticalAlignment: TextInput.AlignVCenter
-            color: "#eff7fa"
-            font.pixelSize: 11
+            color: root.ink
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
             clip: true
         }
         Text {
             anchors.left: input.left; anchors.verticalCenter: parent.verticalCenter
             text: field.placeholder
             visible: input.text.length === 0 && !input.activeFocus
-            color: "#5c7280"
-            font.pixelSize: 11
+            color: Util.alpha(root.ink, 0.4)
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+        }
+    }
+    // The header's update-health ring: an arc over Style.normalBorderColor's
+    // track, filled with Color.accent for the done fraction. Small deliberate
+    // centerpiece rather than a plain "8/9" line -- the one bit of genuinely
+    // "at a glance" visual state this panel has, echoing cpu-pulse's own
+    // radial CpuChip without trying to be that literal animated die.
+    component HealthRing: Item {
+        id: ring
+        property int done: 0
+        property int total: 0
+        property color trackColor: Style.normalBorderColor
+        property color fillColor: Color.accent
+        implicitWidth: 36; implicitHeight: 36
+        Canvas {
+            id: canvas
+            anchors.fill: parent
+            property real frac: ring.total > 0 ? ring.done / ring.total : 0
+            property color track: ring.trackColor
+            property color fill: ring.fillColor
+            onFracChanged: requestPaint()
+            onTrackChanged: requestPaint()
+            onFillChanged: requestPaint()
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                var cx = width / 2, cy = height / 2, r = Math.min(width, height) / 2 - 3
+                var start = -Math.PI / 2
+                ctx.lineWidth = 3.5
+                ctx.lineCap = "round"
+                ctx.strokeStyle = track
+                ctx.beginPath()
+                ctx.arc(cx, cy, r, 0, Math.PI * 2)
+                ctx.stroke()
+                if (frac > 0) {
+                    ctx.strokeStyle = fill
+                    ctx.beginPath()
+                    ctx.arc(cx, cy, r, start, start + Math.PI * 2 * Math.min(1, frac))
+                    ctx.stroke()
+                }
+            }
+        }
+        Text {
+            anchors.centerIn: parent
+            text: ring.total > 0 ? ring.done + "/" + ring.total : "--"
+            color: root.ink
+            font.family: Style.font.family
+            font.pixelSize: Style.font.caption
+            font.bold: true
+            textFormat: Text.PlainText
         }
     }
     component Row_: Rectangle {
@@ -279,8 +344,8 @@ Panel {
         property bool confirmingRemove: false
         height: content.implicitHeight + 16
         radius: 10
-        color: rowMouse.containsMouse ? "#1d303b" : "#111e28"
-        border.color: "#263844"
+        color: rowMouse.containsMouse ? Style.hoverFill : Style.normalFill
+        border.color: Style.normalBorderColor
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
         Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirmingRemove = false }
@@ -297,14 +362,20 @@ Panel {
                 spacing: 10
                 Column {
                     width: 190
-                    Heading { text: row.modelData.name; font.pixelSize: 12; elide: Text.ElideRight; width: 190 }
-                    Label { text: (row.modelData.version ? "v" + row.modelData.version : "no version") + (row.modelData.kind === "app" ? "  ·  app" : "") + (row.isSelf ? "  ·  this widget" : ""); font.pixelSize: 10 }
+                    Heading { text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: 190 }
+                    Label { text: (row.modelData.version ? "v" + row.modelData.version : "no version") + (row.modelData.kind === "app" ? "  ·  app" : "") + (row.isSelf ? "  ·  this widget" : ""); font.pixelSize: Style.font.caption }
                 }
                 Label {
                     width: parent.width - 190 - 10
                     wrapMode: Text.WordWrap
                     text: row.busy ? (root.actionStatus + "  ·  " + Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s") : Model.stateLabel(row.modelData)
-                    color: Model.canUpdate(row.modelData) ? "#5aed95" : (row.modelData.updateState === "dirty" || row.modelData.updateState === "diverged") ? "#f0ba82" : "#91a5b0"
+                    // Positive (accent): update ready. Needs-attention (urgent, dimmed a touch so it
+                    // reads as "look at this" rather than "something is broken"): dirty, diverged, or a
+                    // git operation left mid-flight -- the exact state a Dashboard-triggered rebuild.sh
+                    // can leave a repo in (Flea, 2026-09-16). Anything else: dim/neutral.
+                    color: Model.canUpdate(row.modelData) ? Color.accent
+                         : ["dirty", "diverged", "in-progress"].indexOf(row.modelData.updateState) >= 0 ? Util.alpha(Color.urgent, 0.85)
+                         : Util.alpha(root.ink, 0.62)
                 }
             }
 
@@ -320,7 +391,7 @@ Panel {
                 }
                 SmallButton {
                     text: row.detailShown && root.detailMode === "diff" ? "Hide diff" : "Diff"
-                    accent: "#5a8fed"
+                    accent: Color.muted
                     visible: Model.canShowDiff(row.modelData)
                     enabled: true
                     anchors.verticalCenter: parent.verticalCenter
@@ -335,7 +406,7 @@ Panel {
                 }
                 SmallButton {
                     text: row.confirmingRemove ? "Confirm?" : "Remove"
-                    accent: "#e0654a"
+                    accent: Color.urgent
                     visible: !row.isSelf
                     enabled: !row.busy && root.busyId === ""
                     anchors.verticalCenter: parent.verticalCenter
@@ -357,8 +428,8 @@ Panel {
                 width: parent.width
                 height: visible ? 220 : 0
                 radius: 8
-                color: "#0b141d"
-                border.color: "#263844"
+                color: Style.normalFill
+                border.color: Style.normalBorderColor
                 clip: true
                 Column {
                     width: parent.width - 16
@@ -369,10 +440,10 @@ Panel {
                         Label {
                             width: parent.width - 60
                             text: root.detailMode === "diff" ? "Diff vs upstream" : (root.detailOk ? "Output" : "Output — failed")
-                            color: root.detailMode === "output" && !root.detailOk ? "#e0654a" : "#91a5b0"
-                            font.pixelSize: 10
+                            color: root.detailMode === "output" && !root.detailOk ? Color.urgent : Util.alpha(root.ink, 0.62)
+                            font.pixelSize: Style.font.caption
                         }
-                        SmallButton { text: "Close"; accent: "#5c7280"; onClicked: root.closeDetail() }
+                        SmallButton { text: "Close"; accent: Color.muted; onClicked: root.closeDetail() }
                     }
                     Flickable {
                         width: parent.width
@@ -384,9 +455,9 @@ Panel {
                             id: detailTextItem
                             width: parent.width
                             text: row.detailShown ? root.detailText : ""
-                            color: "#c7d6dd"
-                            font.family: "monospace"
-                            font.pixelSize: 10
+                            color: Util.alpha(root.ink, 0.85)
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.caption
                             wrapMode: Text.NoWrap
                         }
                     }
@@ -422,12 +493,13 @@ Panel {
                 width: Math.max(14, badgeText.implicitWidth + 8)
                 height: 14
                 radius: 7
-                color: "#e0654a"
+                color: Color.urgent
                 Text {
                     id: badgeText
                     anchors.centerIn: parent
                     text: String(root.updatable)
-                    color: "#0b141d"
+                    color: Color.background
+                    font.family: Style.font.family
                     font.pixelSize: 9
                     font.bold: true
                 }
@@ -450,7 +522,11 @@ Panel {
             anchors.fill: parent
             focus: true
             Keys.onEscapePressed: root.close()
-            Rectangle { anchors.fill: parent; anchors.margins: -10; radius: 14; color: "#0b141d" }
+            // No background rectangle here: KeyboardPanel's own `card` already
+            // paints the themed surface (Color.popups.background, Style.cornerRadius,
+            // a themed border) behind this content -- a second hardcoded one drawn
+            // on top of it was redundant and, being hardcoded, the one thing in this
+            // file that could never have followed the theme anyway.
 
             Column {
                 id: mainColumn
@@ -459,11 +535,17 @@ Panel {
 
                 Row {
                     width: parent.width
+                    spacing: 10
+                    HealthRing {
+                        anchors.verticalCenter: parent.verticalCenter
+                        done: root.health.done
+                        total: root.health.total
+                    }
                     Column {
-                        width: parent.width - 190
+                        width: parent.width - 190 - 46
                         spacing: 3
-                        Heading { text: "PLUGIN DASHBOARD"; font.pixelSize: 16; font.letterSpacing: 2 }
-                        Label { text: "Everything that isn't Omarchy's own."; font.pixelSize: 10 }
+                        Heading { text: "PLUGIN DASHBOARD"; font.pixelSize: Style.font.heading; font.letterSpacing: 2 }
+                        Label { text: "Everything that isn't Omarchy's own."; font.pixelSize: Style.font.caption }
                     }
                     Row {
                         anchors.verticalCenter: parent.verticalCenter
@@ -484,64 +566,87 @@ Panel {
                     }
                 }
 
-                Column {
+                // Scrollable so a growing plugin/app list is capped instead of
+                // pushing the APPS section (and the footer) off the bottom of
+                // the screen -- KeyboardPanel clamps the popup's own height to
+                // the screen, but content inside it isn't clipped on its own.
+                Flickable {
+                    id: listScroll
                     width: parent.width
-                    visible: root.grouped.plugins.length > 0
-                    spacing: 8
-                    Label { text: "PLUGINS"; font.pixelSize: 10; font.letterSpacing: 1.5 }
-                    Repeater {
-                        model: root.grouped.plugins
-                        Row_ {}
-                    }
-                }
+                    height: Math.min(listColumn.implicitHeight, Style.space(420))
+                    contentWidth: width
+                    contentHeight: listColumn.implicitHeight
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    interactive: contentHeight > height
 
-                Column {
-                    width: parent.width
-                    visible: root.grouped.apps.length > 0 || root.addAppFormOpen
-                    spacing: 8
-                    Label { text: "APPS"; font.pixelSize: 10; font.letterSpacing: 1.5 }
-                    Repeater {
-                        model: root.grouped.apps
-                        Row_ {}
-                    }
-
-                    SmallButton {
-                        text: root.addAppFormOpen ? "Cancel" : "+ Add app"
-                        accent: root.addAppFormOpen ? "#e0654a" : "#5aed95"
-                        onClicked: root.addAppFormOpen = !root.addAppFormOpen
-                    }
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
                     Column {
+                        id: listColumn
                         width: parent.width
-                        visible: root.addAppFormOpen
-                        spacing: 6
-                        FieldInput { placeholder: "Display name"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {name: text}) }
-                        FieldInput { placeholder: "id (lowercase, no spaces)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {id: text}) }
-                        FieldInput { placeholder: "Repo dir, e.g. /home/you/Projects/myapp"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {repoDir: text}) }
-                        FieldInput { placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
-                        Row {
+                        spacing: 14
+
+                        Column {
                             width: parent.width
-                            spacing: 6
-                            FieldInput { width: (parent.width - 6) / 2; placeholder: "Branch (default master)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {branch: text}) }
-                            FieldInput { width: (parent.width - 6) / 2; placeholder: "Remote (default origin)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {remote: text}) }
+                            visible: root.grouped.plugins.length > 0
+                            spacing: 8
+                            Label { text: "PLUGINS"; font.pixelSize: Style.font.caption; font.letterSpacing: 1.5 }
+                            Repeater {
+                                model: root.grouped.plugins
+                                Row_ {}
+                            }
                         }
-                        FieldInput { text: "./rebuild.sh --install"; placeholder: "Update command"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
-                        SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
+
+                        Column {
+                            width: parent.width
+                            visible: root.grouped.apps.length > 0 || root.addAppFormOpen
+                            spacing: 8
+                            Label { text: "APPS"; font.pixelSize: Style.font.caption; font.letterSpacing: 1.5 }
+                            Repeater {
+                                model: root.grouped.apps
+                                Row_ {}
+                            }
+
+                            SmallButton {
+                                text: root.addAppFormOpen ? "Cancel" : "+ Add app"
+                                accent: root.addAppFormOpen ? Color.urgent : Color.accent
+                                onClicked: root.addAppFormOpen = !root.addAppFormOpen
+                            }
+
+                            Column {
+                                width: parent.width
+                                visible: root.addAppFormOpen
+                                spacing: 6
+                                FieldInput { placeholder: "Display name"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {name: text}) }
+                                FieldInput { placeholder: "id (lowercase, no spaces)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {id: text}) }
+                                FieldInput { placeholder: "Repo dir, e.g. /home/you/Projects/myapp"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {repoDir: text}) }
+                                FieldInput { placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
+                                Row {
+                                    width: parent.width
+                                    spacing: 6
+                                    FieldInput { width: (parent.width - 6) / 2; placeholder: "Branch (default master)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {branch: text}) }
+                                    FieldInput { width: (parent.width - 6) / 2; placeholder: "Remote (default origin)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {remote: text}) }
+                                }
+                                FieldInput { text: "./rebuild.sh --install"; placeholder: "Update command"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
+                                SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
+                            }
+                        }
+
+                        Label {
+                            width: parent.width
+                            visible: root.items.length === 0
+                            text: checkProc.running ? "Checking…" : "No third-party plugins or tracked apps found."
+                            font.pixelSize: Style.font.bodySmall
+                        }
                     }
                 }
 
-                Label {
-                    width: parent.width
-                    visible: root.items.length === 0
-                    text: checkProc.running ? "Checking…" : "No third-party plugins or tracked apps found."
-                    font.pixelSize: 11
-                }
-
-                Rectangle { width: parent.width; height: 1; color: "#25343f" }
+                Rectangle { width: parent.width; height: 1; color: Style.normalBorderColor }
                 Label {
                     width: parent.width
                     wrapMode: Text.WordWrap
-                    font.pixelSize: 10
+                    font.pixelSize: Style.font.caption
                     text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
                           (checkProc.running ? "Checking sources…" :
                            "Last checked " + Model.relativeAge(root.status.ts, root.now) + "  ·  Esc closes")

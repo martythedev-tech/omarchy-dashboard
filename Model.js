@@ -24,15 +24,35 @@ function badgeCount(items) {
 // tests/js/test_model.cjs can pin every wording without a running shell.
 function stateLabel(item) {
     if (!item) return ''
+    var why = item.reason ? ' (' + item.reason.split('\n')[0] + ')' : ''
     switch (item.updateState) {
         case 'behind': return item.behind + (item.behind === 1 ? ' commit behind' : ' commits behind')
-        case 'dirty': return 'Local changes -- update manually'
-        case 'diverged': return 'Local commits ahead -- update manually'
+        case 'dirty': return 'Local changes' + why + ' -- update manually'
+        case 'diverged': return 'Local commits ahead' + why + ' -- update manually'
+        // A git operation (rebase/merge/cherry-pick/bisect) left mid-flight --
+        // the exact state a Dashboard-triggered rebuild.sh can leave a repo in
+        // when it hits a conflict. Update/Diff must both refuse this the same
+        // way they refuse 'dirty'/'diverged': see canUpdate/canShowDiff below.
+        case 'in-progress': return 'Git operation in progress' + why + ' -- resolve manually'
         case 'no-repo': return 'No update source'
         case 'unreachable': return 'Could not reach source' + (item.reason ? ': ' + item.reason.split('\n')[0] : '')
         case 'up-to-date': return 'Up to date'
         default: return ''
     }
+}
+
+// The header ring's numerator/denominator: every item with a real update
+// source (kept simple, so an app/plugin with no git checkout at all doesn't
+// drag down or inflate a number meant to answer "is anything worth looking
+// at"), and how many of those are confirmed current as of the last check.
+function healthFraction(items) {
+    var total = 0, done = 0
+    for (var i = 0; i < (items || []).length; i++) {
+        if (items[i].updateState === 'no-repo') continue
+        total++
+        if (items[i].updateState === 'up-to-date') done++
+    }
+    return { done: done, total: total }
 }
 
 // Plugins first (alphabetical), then apps (alphabetical) -- a stable split
