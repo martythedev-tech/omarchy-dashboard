@@ -303,6 +303,7 @@ def cmd_check(_args):
 def cmd_enable(args):
     rc, out, err = run(['omarchy', 'plugin', 'enable', args.id])
     print(json.dumps({'ok': rc == 0, 'message': (out or err).strip()}))
+    check_all()
 
 
 def cmd_disable(args):
@@ -312,6 +313,7 @@ def cmd_disable(args):
         return
     rc, out, err = run(['omarchy', 'plugin', 'disable', args.id])
     print(json.dumps({'ok': rc == 0, 'message': (out or err).strip()}))
+    check_all()
 
 
 def cmd_update(args):
