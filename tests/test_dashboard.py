@@ -344,20 +344,40 @@ class CmdUpdateDispatchTests(unittest.TestCase):
         run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', dash.SELF_ID, '--yes'], timeout=180)
 
 
+class CmdEnableTests(unittest.TestCase):
+    def test_enables_a_plugin_and_refreshes_status(self):
+        # Regression: enable/disable used to be the only mutating commands that
+        # never called check_all(), so a toggle in the panel could flip the
+        # plugin's actual state while status.json (what the Toggle's `checked`
+        # binding reads) kept showing the pre-toggle value until the next
+        # periodic check or a manual Refresh -- confirmed live, 2026-09-16
+        # (Touchpad Glance disabled correctly but the panel still showed it on).
+        with patch.object(dash, 'run', return_value=(0, 'Enabled.', '')) as run_mock, \
+             patch.object(dash, 'check_all') as check_mock, patch('builtins.print'):
+            args = type('A', (), {'id': 'sslvpn'})()
+            dash.cmd_enable(args)
+        run_mock.assert_called_once_with(['omarchy', 'plugin', 'enable', 'sslvpn'])
+        check_mock.assert_called_once()
+
+
 class CmdDisableTests(unittest.TestCase):
     def test_refuses_to_disable_self(self):
-        with patch.object(dash, 'run') as run_mock, patch('builtins.print') as print_mock:
+        with patch.object(dash, 'run') as run_mock, patch.object(dash, 'check_all') as check_mock, \
+             patch('builtins.print') as print_mock:
             args = type('A', (), {'id': dash.SELF_ID})()
             dash.cmd_disable(args)
         run_mock.assert_not_called()
+        check_mock.assert_not_called()
         payload = json.loads(print_mock.call_args.args[0])
         self.assertFalse(payload['ok'])
 
-    def test_disables_other_plugins_normally(self):
-        with patch.object(dash, 'run', return_value=(0, 'Disabled.', '')) as run_mock, patch('builtins.print'):
+    def test_disables_other_plugins_normally_and_refreshes_status(self):
+        with patch.object(dash, 'run', return_value=(0, 'Disabled.', '')) as run_mock, \
+             patch.object(dash, 'check_all') as check_mock, patch('builtins.print'):
             args = type('A', (), {'id': 'sslvpn'})()
             dash.cmd_disable(args)
         run_mock.assert_called_once_with(['omarchy', 'plugin', 'disable', 'sslvpn'])
+        check_mock.assert_called_once()
 
 
 class CmdRemoveTests(unittest.TestCase):
