@@ -8,10 +8,12 @@ assert.equal(ctx.canUpdate({updateState: 'behind'}), true);
 assert.equal(ctx.canUpdate({updateState: 'dirty'}), false);
 assert.equal(ctx.canUpdate({updateState: 'diverged'}), false);
 assert.equal(ctx.canUpdate({updateState: 'no-repo'}), false);
+assert.equal(ctx.canUpdate({updateState: 'in-progress'}), false);
 assert.equal(ctx.canUpdate(null), false);
 assert.equal(ctx.canShowDiff({updateState: 'behind'}), true);
 assert.equal(ctx.canShowDiff({updateState: 'diverged'}), true);
 assert.equal(ctx.canShowDiff({updateState: 'dirty'}), false);
+assert.equal(ctx.canShowDiff({updateState: 'in-progress'}), false);
 assert.equal(ctx.canShowDiff({updateState: 'up-to-date'}), false);
 assert.equal(ctx.canShowDiff(null), false);
 assert.equal(ctx.badgeCount([{updateState: 'behind'}, {updateState: 'up-to-date'}, {updateState: 'behind'}]), 2);
@@ -22,12 +24,26 @@ assert.equal(ctx.badgeCount(undefined), 0);
 assert.equal(ctx.stateLabel({updateState: 'behind', behind: 1}), '1 commit behind');
 assert.equal(ctx.stateLabel({updateState: 'behind', behind: 4}), '4 commits behind');
 assert.equal(ctx.stateLabel({updateState: 'dirty'}), 'Local changes -- update manually');
+assert.equal(ctx.stateLabel({updateState: 'dirty', reason: '2 file(s) changed locally'}), 'Local changes (2 file(s) changed locally) -- update manually');
 assert.equal(ctx.stateLabel({updateState: 'diverged'}), 'Local commits ahead -- update manually');
+assert.equal(ctx.stateLabel({updateState: 'diverged', reason: '1 local commit(s) not upstream'}), 'Local commits ahead (1 local commit(s) not upstream) -- update manually');
+assert.equal(ctx.stateLabel({updateState: 'in-progress', reason: 'rebase onto cc65416'}), 'Git operation in progress (rebase onto cc65416) -- resolve manually');
+assert.equal(ctx.stateLabel({updateState: 'in-progress'}), 'Git operation in progress -- resolve manually');
 assert.equal(ctx.stateLabel({updateState: 'no-repo'}), 'No update source');
 assert.equal(ctx.stateLabel({updateState: 'unreachable'}), 'Could not reach source');
 assert.equal(ctx.stateLabel({updateState: 'unreachable', reason: 'no network\nmore detail'}), 'Could not reach source: no network');
 assert.equal(ctx.stateLabel({updateState: 'up-to-date'}), 'Up to date');
 assert.equal(ctx.stateLabel(null), '');
+
+// healthFraction: the header ring's numerator/denominator
+var h1 = ctx.healthFraction([{updateState: 'up-to-date'}, {updateState: 'behind'}, {updateState: 'no-repo'}]);
+assert.equal(h1.done, 1);
+assert.equal(h1.total, 2);
+var h0 = ctx.healthFraction([]);
+assert.equal(h0.done, 0);
+assert.equal(h0.total, 0);
+var hAllRepoless = ctx.healthFraction([{updateState: 'no-repo'}]);
+assert.equal(hAllRepoless.total, 0);
 
 // groupByKind: plugins vs apps, each alphabetical, independent of input order
 var grouped = ctx.groupByKind([

@@ -133,6 +133,33 @@ def pkg_version(pkg_name):
     return parts[1] if len(parts) > 1 else ''
 
 
+def repo_operation_in_progress(repo_dir):
+    """Name of a git operation left mid-flight (rebase/merge/cherry-pick/
+    bisect), or '' if the tree is otherwise idle. Checked before comparing
+    against upstream at all: an ahead/behind count computed while one of
+    these is running names a state that's about to change again once it's
+    resolved, and offering Update mid-rebase would hand `updateCmd` a
+    checkout it can't even `git checkout` out of -- confirmed live,
+    2026-09-16 (Flea's aarch64-local was found mid-rebase, left behind by an
+    earlier `rebuild.sh --install` run through this same Dashboard, and
+    neither plugin_update_state nor app_update_state had ever checked for
+    it)."""
+    git_dir = Path(repo_dir) / '.git'
+    if (git_dir / 'rebase-merge').is_dir() or (git_dir / 'rebase-apply').is_dir():
+        try:
+            onto = (git_dir / 'rebase-merge' / 'onto').read_text().strip()[:7]
+        except OSError:
+            onto = ''
+        return 'rebase onto ' + onto if onto else 'rebase'
+    if (git_dir / 'MERGE_HEAD').is_file():
+        return 'merge'
+    if (git_dir / 'CHERRY_PICK_HEAD').is_file():
+        return 'cherry-pick'
+    if (git_dir / 'BISECT_LOG').is_file():
+        return 'bisect'
+    return ''
+
+
 def plugin_update_state(plugin_dir):
     """Mirrors omarchy-plugin-update's own check exactly (fetch origin's
     HEAD, compare against ours) so "update available" here always agrees
@@ -146,6 +173,9 @@ def plugin_update_state(plugin_dir):
     plugin_dir = Path(plugin_dir)
     if not (plugin_dir / '.git').is_dir():
         return 'no-repo', 0, ''
+    op = repo_operation_in_progress(plugin_dir)
+    if op:
+        return 'in-progress', 0, op
     rc, _, err = run(['git', '-C', str(plugin_dir), 'fetch', '--quiet', 'origin', 'HEAD'], timeout=20)
     if rc != 0:
         return 'unreachable', 0, err.strip()[-500:]
@@ -161,11 +191,12 @@ def plugin_update_state(plugin_dir):
         return 'up-to-date', 0, ''
     rc4, dirty, _ = run(['git', '-C', str(plugin_dir), 'status', '--porcelain'])
     if dirty.strip():
-        return 'dirty', behind, ''
+        lines = dirty.strip().split('\n')
+        return 'dirty', behind, f'{len(lines)} file(s) changed locally'
     rc5, ahead_count, _ = run(['git', '-C', str(plugin_dir), 'rev-list', '--count', 'FETCH_HEAD..HEAD'])
     ahead = int(ahead_count.strip()) if rc5 == 0 and ahead_count.strip().isdigit() else 0
     if ahead > 0:
-        return 'diverged', behind, ''
+        return 'diverged', behind, f'{ahead} local commit(s) not upstream'
     return 'behind', behind, ''
 
 
@@ -177,6 +208,9 @@ def app_update_state(repo_dir, branch, remote):
     repo_dir = Path(repo_dir)
     if not (repo_dir / '.git').is_dir():
         return 'no-repo', 0, ''
+    op = repo_operation_in_progress(repo_dir)
+    if op:
+        return 'in-progress', 0, op
     rc, _, err = run(['git', '-C', str(repo_dir), 'fetch', '--quiet', remote], timeout=20)
     if rc != 0:
         return 'unreachable', 0, err.strip()[-500:]
@@ -190,7 +224,13 @@ def app_update_state(repo_dir, branch, remote):
         return 'up-to-date', 0, ''
     rc4, count, _ = run(['git', '-C', str(repo_dir), 'rev-list', '--count', f'{branch}..{remote_ref}'])
     behind = int(count.strip()) if rc4 == 0 and count.strip().isdigit() else 0
-    return ('behind', behind, '') if behind > 0 else ('up-to-date', 0, '')
+    if behind == 0:
+        return 'up-to-date', 0, ''
+    rc5, dirty, _ = run(['git', '-C', str(repo_dir), 'status', '--porcelain'])
+    if dirty.strip():
+        lines = dirty.strip().split('\n')
+        return 'dirty', behind, f'{len(lines)} file(s) changed locally'
+    return 'behind', behind, ''
 
 
 def check_plugin(p):

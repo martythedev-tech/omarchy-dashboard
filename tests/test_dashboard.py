@@ -71,7 +71,20 @@ class PluginUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'status', '--porcelain'): (0, ' M some/file.qml\n', ''),
             }
             with patch.object(dash, 'run', fake_run(table)):
-                self.assertEqual(dash.plugin_update_state(d), ('dirty', 3, ''))
+                self.assertEqual(dash.plugin_update_state(d), ('dirty', 3, '1 file(s) changed locally'))
+
+    def test_mid_rebase_is_in_progress_and_never_fetches(self):
+        # The dirty/diverged checks below all run a git status; this one must
+        # short-circuit before ever calling `run` at all, since fetching or
+        # counting commits mid-rebase names a state that's about to change
+        # again the moment the rebase is resolved. fake_run({}) raises on any
+        # call, so this also proves fetch is never attempted.
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            (git_dir / 'rebase-merge').mkdir(parents=True)
+            (git_dir / 'rebase-merge' / 'onto').write_text('cc65416abc123\n')
+            with patch.object(dash, 'run', fake_run({})):
+                self.assertEqual(dash.plugin_update_state(d), ('in-progress', 0, 'rebase onto cc65416'))
 
     def test_diverged_when_clean_but_locally_ahead(self):
         # Clean working tree, but HEAD carries a commit FETCH_HEAD doesn't --
@@ -89,7 +102,48 @@ class PluginUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '1\n', ''),
             }
             with patch.object(dash, 'run', fake_run(table)):
-                self.assertEqual(dash.plugin_update_state(d), ('diverged', 2, ''))
+                self.assertEqual(dash.plugin_update_state(d), ('diverged', 2, '1 local commit(s) not upstream'))
+
+
+class RepoOperationInProgressTests(unittest.TestCase):
+    def test_no_operation_is_empty_string(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.git').mkdir()
+            self.assertEqual(dash.repo_operation_in_progress(d), '')
+
+    def test_rebase_merge_names_the_onto_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            (git_dir / 'rebase-merge').mkdir(parents=True)
+            (git_dir / 'rebase-merge' / 'onto').write_text('cc65416abc123\n')
+            self.assertEqual(dash.repo_operation_in_progress(d), 'rebase onto cc65416')
+
+    def test_rebase_apply_without_onto_file_still_names_rebase(self):
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            (git_dir / 'rebase-apply').mkdir(parents=True)
+            self.assertEqual(dash.repo_operation_in_progress(d), 'rebase')
+
+    def test_merge_head_names_merge(self):
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            git_dir.mkdir()
+            (git_dir / 'MERGE_HEAD').write_text('abc\n')
+            self.assertEqual(dash.repo_operation_in_progress(d), 'merge')
+
+    def test_cherry_pick_head_names_cherry_pick(self):
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            git_dir.mkdir()
+            (git_dir / 'CHERRY_PICK_HEAD').write_text('abc\n')
+            self.assertEqual(dash.repo_operation_in_progress(d), 'cherry-pick')
+
+    def test_bisect_log_names_bisect(self):
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            git_dir.mkdir()
+            (git_dir / 'BISECT_LOG').write_text('git bisect start abc def\n')
+            self.assertEqual(dash.repo_operation_in_progress(d), 'bisect')
 
 
 class AppUpdateStateTests(unittest.TestCase):
@@ -115,9 +169,38 @@ class AppUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-parse', '--verify', 'origin/master'): (0, 'def\n', ''),
                 ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'master'): (1, '', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'master..origin/master'): (0, '1\n', ''),
+                ('git', '-C', d, 'status', '--porcelain'): (0, '', ''),
             }
             with patch.object(dash, 'run', fake_run(table)):
                 self.assertEqual(dash.app_update_state(d, 'master', 'origin'), ('behind', 1, ''))
+
+    def test_behind_but_dirty_refuses_plain_behind(self):
+        # rebuild.sh's own rebase step needs a clean tree to `git checkout
+        # master`; a dirty one offering a plain "behind" Update button would
+        # hand it a checkout that can fail (or silently carry local changes
+        # along) instead.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.git').mkdir()
+            table = {
+                ('git', '-C', d, 'fetch'): (0, '', ''),
+                ('git', '-C', d, 'rev-parse', '--verify', 'master'): (0, 'abc\n', ''),
+                ('git', '-C', d, 'rev-parse', '--verify', 'origin/master'): (0, 'def\n', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'master'): (1, '', ''),
+                ('git', '-C', d, 'rev-list', '--count', 'master..origin/master'): (0, '1\n', ''),
+                ('git', '-C', d, 'status', '--porcelain'): (0, ' M PKGBUILD\n', ''),
+            }
+            with patch.object(dash, 'run', fake_run(table)):
+                self.assertEqual(dash.app_update_state(d, 'master', 'origin'), ('dirty', 1, '1 file(s) changed locally'))
+
+    def test_mid_rebase_is_in_progress_and_never_fetches(self):
+        # The exact shape found live 2026-09-16: Flea's aarch64-local left
+        # mid-rebase by an earlier `rebuild.sh --install` run, with no prior
+        # check anywhere in this file for it.
+        with tempfile.TemporaryDirectory() as d:
+            git_dir = Path(d) / '.git'
+            (git_dir / 'rebase-merge').mkdir(parents=True)
+            with patch.object(dash, 'run', fake_run({})):
+                self.assertEqual(dash.app_update_state(d, 'master', 'origin'), ('in-progress', 0, 'rebase'))
 
     def test_local_branch_ahead_of_aur_is_not_reported_as_behind(self):
         # This is the exact Flea shape: aarch64-local (what's checked out) is
