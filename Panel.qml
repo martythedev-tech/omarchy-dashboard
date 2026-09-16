@@ -295,6 +295,11 @@ Panel {
         property int total: 0
         property color trackColor: Style.normalBorderColor
         property color fillColor: Color.accent
+        // Compact mode (the bar chip's icon) drops the center label -- there's
+        // no room to draw "8/9" legibly at bar-icon size -- and draws a
+        // thinner stroke proportionate to the smaller ring.
+        property bool showLabel: true
+        property real strokeWidth: showLabel ? 3.5 : 2.2
         implicitWidth: 36; implicitHeight: 36
         Canvas {
             id: canvas
@@ -302,15 +307,19 @@ Panel {
             property real frac: ring.total > 0 ? ring.done / ring.total : 0
             property color track: ring.trackColor
             property color fill: ring.fillColor
+            property real stroke: ring.strokeWidth
             onFracChanged: requestPaint()
             onTrackChanged: requestPaint()
             onFillChanged: requestPaint()
+            onStrokeChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.reset()
-                var cx = width / 2, cy = height / 2, r = Math.min(width, height) / 2 - 3
+                var cx = width / 2, cy = height / 2, r = Math.min(width, height) / 2 - stroke
                 var start = -Math.PI / 2
-                ctx.lineWidth = 3.5
+                ctx.lineWidth = stroke
                 ctx.lineCap = "round"
                 ctx.strokeStyle = track
                 ctx.beginPath()
@@ -325,6 +334,7 @@ Panel {
             }
         }
         Text {
+            visible: ring.showLabel
             anchors.centerIn: parent
             text: ring.total > 0 ? ring.done + "/" + ring.total : "--"
             color: root.ink
@@ -480,12 +490,19 @@ Panel {
             id: chipRow
             anchors.centerIn: parent
             spacing: 4
-            Text {
-                text: ""
-                color: root.barForeground
-                font.family: Style.font.family
-                font.pixelSize: Style.font.icon
+            // The bar's own version of the popup header's health ring, so the
+            // chip itself answers "is anything worth a look" before it's even
+            // opened, rather than a static icon that means the same thing
+            // whether everything's current or half the list needs attention.
+            HealthRing {
                 anchors.verticalCenter: parent.verticalCenter
+                implicitWidth: Style.bar.iconCanvas
+                implicitHeight: Style.bar.iconCanvas
+                showLabel: false
+                trackColor: Util.alpha(root.barForeground, 0.35)
+                fillColor: root.barForeground
+                done: root.health.done
+                total: root.health.total
             }
             Rectangle {
                 visible: root.updatable > 0
@@ -533,21 +550,29 @@ Panel {
                 width: parent.width
                 spacing: 14
 
-                Row {
+                // An Item with the title Column explicitly anchored *between* the
+                // ring and the button row (rather than a plain Row laying all three
+                // out sequentially by nominal width) so the title's real width
+                // always matches the space actually left over -- a plain Row here
+                // let "PLUGIN DASHBOARD" overflow its guessed width and draw
+                // straight through the Refresh button once the button row's own
+                // width changed (adding the ring shrank the guess without ever
+                // measuring the button row it was meant to leave room for).
+                Item {
+                    id: header
                     width: parent.width
-                    spacing: 10
+                    height: Math.max(ring.implicitHeight, titleCol.implicitHeight, headerButtons.implicitHeight)
+
                     HealthRing {
+                        id: ring
+                        anchors.left: parent.left
                         anchors.verticalCenter: parent.verticalCenter
                         done: root.health.done
                         total: root.health.total
                     }
-                    Column {
-                        width: parent.width - 190 - 46
-                        spacing: 3
-                        Heading { text: "PLUGIN DASHBOARD"; font.pixelSize: Style.font.heading; font.letterSpacing: 2 }
-                        Label { text: "Everything that isn't Omarchy's own."; font.pixelSize: Style.font.caption }
-                    }
                     Row {
+                        id: headerButtons
+                        anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 8
                         SmallButton {
@@ -562,6 +587,25 @@ Panel {
                             enabled: !checkProc.running
                             anchors.verticalCenter: parent.verticalCenter
                             onClicked: root.runCheck()
+                        }
+                    }
+                    Column {
+                        id: titleCol
+                        anchors.left: ring.right
+                        anchors.leftMargin: 10
+                        anchors.right: headerButtons.left
+                        anchors.rightMargin: 10
+                        anchors.verticalCenter: parent.verticalCenter
+                        spacing: 3
+                        Heading {
+                            width: parent.width
+                            text: "PLUGIN DASHBOARD"; font.pixelSize: Style.font.heading; font.letterSpacing: 2
+                            elide: Text.ElideRight
+                        }
+                        Label {
+                            width: parent.width
+                            text: "Everything that isn't Omarchy's own."; font.pixelSize: Style.font.caption
+                            elide: Text.ElideRight
                         }
                     }
                 }
