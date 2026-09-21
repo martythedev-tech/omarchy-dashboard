@@ -156,6 +156,7 @@ class AppUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-parse', '--verify', 'master'): (0, 'abc\n', ''),
                 ('git', '-C', d, 'rev-parse', '--verify', 'origin/master'): (0, 'abc\n', ''),
                 ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'master'): (0, '', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'HEAD'): (0, '', ''),
             }
             with patch.object(dash, 'run', fake_run(table)):
                 self.assertEqual(dash.app_update_state(d, 'master', 'origin'), ('up-to-date', 0, ''))
@@ -213,10 +214,45 @@ class AppUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-parse', '--verify', 'master'): (0, 'abc\n', ''),
                 ('git', '-C', d, 'rev-parse', '--verify', 'origin/master'): (0, 'abc\n', ''),
                 ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'master'): (0, '', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'HEAD'): (0, '', ''),
             }
             with patch.object(dash, 'run', fake_run(table)):
                 # Note: checked against 'master', never 'aarch64-local'.
                 self.assertEqual(dash.app_update_state(d, 'master', 'origin'), ('up-to-date', 0, ''))
+
+    def test_master_has_it_but_the_checked_out_branch_does_not_is_behind(self):
+        # Flea after a merge that was started and aborted: `master` was moved (so it
+        # contains origin/master) but aarch64-local, which is what gets built, never took
+        # it. Comparing master alone called that up to date.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.git').mkdir()
+            table = {
+                ('git', '-C', d, 'fetch'): (0, '', ''),
+                ('git', '-C', d, 'rev-parse', '--verify', 'master'): (0, 'abc\n', ''),
+                ('git', '-C', d, 'rev-parse', '--verify', 'origin/master'): (0, 'abc\n', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'master'): (0, '', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'HEAD'): (1, '', ''),
+                ('git', '-C', d, 'rev-list', '--count', 'HEAD..origin/master'): (0, '2\n', ''),
+                ('git', '-C', d, 'status', '--porcelain'): (0, '', ''),
+            }
+            with patch.object(dash, 'run', fake_run(table)):
+                self.assertEqual(dash.app_update_state(d, 'master', 'origin'), ('behind', 2, ''))
+
+    def test_that_same_case_with_local_edits_is_dirty_not_behind(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.git').mkdir()
+            table = {
+                ('git', '-C', d, 'fetch'): (0, '', ''),
+                ('git', '-C', d, 'rev-parse', '--verify', 'master'): (0, 'abc\n', ''),
+                ('git', '-C', d, 'rev-parse', '--verify', 'origin/master'): (0, 'abc\n', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'master'): (0, '', ''),
+                ('git', '-C', d, 'merge-base', '--is-ancestor', 'origin/master', 'HEAD'): (1, '', ''),
+                ('git', '-C', d, 'rev-list', '--count', 'HEAD..origin/master'): (0, '1\n', ''),
+                ('git', '-C', d, 'status', '--porcelain'): (0, ' M rebuild.sh\n', ''),
+            }
+            with patch.object(dash, 'run', fake_run(table)):
+                self.assertEqual(dash.app_update_state(d, 'master', 'origin'),
+                                 ('dirty', 1, '1 file(s) changed locally'))
 
     def test_app_fetch_failure_is_unreachable_with_reason(self):
         with tempfile.TemporaryDirectory() as d:
@@ -332,6 +368,20 @@ class CmdUpdateDispatchTests(unittest.TestCase):
             args = type('A', (), {'id': 'sslvpn'})()
             dash.cmd_update(args)
         run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', 'sslvpn', '--yes'], timeout=180)
+
+    def test_a_failed_update_reports_what_it_said_and_what_went_wrong(self):
+        # rebuild.sh explains a conflict on stdout and git's complaint arrives on stderr;
+        # `out or err` showed only the first whenever it had any text.
+        with patch.object(dash, 'ensure_apps_file'), \
+             patch.object(dash, 'load_apps', return_value=[
+                 {'id': 'flea', 'name': 'Flea', 'repoDir': '/x', 'updateCmd': ['./rebuild.sh']}]), \
+             patch.object(dash, 'run', return_value=(1, 'Merge conflict -- resolve by hand', 'CONFLICT in PKGBUILD')), \
+             patch.object(dash, 'check_all'), patch('builtins.print') as printed:
+            dash.cmd_update(type('A', (), {'id': 'flea'})())
+        result = json.loads(printed.call_args[0][0])
+        self.assertFalse(result['ok'])
+        self.assertIn('Merge conflict -- resolve by hand', result['message'])
+        self.assertIn('CONFLICT in PKGBUILD', result['message'])
 
     def test_self_id_is_a_normal_update_not_special_cased(self):
         # Self-update is intentional: only disable/remove refuse SELF_ID.
@@ -517,3 +567,197 @@ class AddAndRemoveAppTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+UNIT = """[Unit]
+Description=Recorder
+[Service]
+ExecStart=/usr/bin/python3 %h/.config/omarchy/plugins/nixfred.pulse/collectors/{name}_pulse.py daemon
+[Install]
+WantedBy=graphical-session.target
+"""
+
+
+class UnitFixture(unittest.TestCase):
+    """A plugin directory and a user-unit directory, both temporary, with `run` recording
+    what would have been asked of systemctl instead of asking it."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.plugin = root / 'plugins' / 'nixfred.pulse'
+        (self.plugin / 'collectors').mkdir(parents=True)
+        (self.plugin / 'manifest.json').write_text('{}')
+        self.units = root / 'units'
+        self.units.mkdir()
+        self.calls = []
+        self.systemctl_rc = 0
+
+        def fake(args, cwd=None, timeout=20):
+            self.calls.append(list(args))
+            return (self.systemctl_rc, '', 'boom' if self.systemctl_rc else '')
+        for target, value in (('run', fake), ('USER_UNIT_DIR', self.units), ('UNIT_SETTLE_SECONDS', 0)):
+            patcher = patch.object(dash, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def ship(self, name, text=None):
+        (self.plugin / 'collectors' / (name + '.service')).write_text(text if text is not None else UNIT.format(name=name))
+
+    def install(self, name, text=None):
+        (self.units / (name + '.service')).write_text(text if text is not None else UNIT.format(name=name))
+
+
+class ShippedUnitsTests(UnitFixture):
+    def test_finds_units_at_the_top_and_one_directory_down_and_skips_the_rest(self):
+        self.ship('cpu')
+        (self.plugin / 'top.timer').write_text('[Timer]')
+        for skipped in ('tests', 'docs', '.git'):
+            (self.plugin / skipped).mkdir()
+            (self.plugin / skipped / 'x.service').write_text('[Service]')
+        (self.plugin / 'a' / 'b').mkdir(parents=True)
+        (self.plugin / 'a' / 'b' / 'deep.service').write_text('[Service]')
+        self.assertEqual(sorted(dash.shipped_units(self.plugin)), ['cpu.service', 'top.timer'])
+
+    def test_a_missing_directory_ships_nothing(self):
+        self.assertEqual(dash.shipped_units(self.plugin / 'nope'), {})
+
+
+class InstallNewUnitsTests(UnitFixture):
+    def test_a_unit_added_by_the_update_is_installed_started_and_the_widget_reloaded(self):
+        self.ship('cpu'); self.install('cpu-pulse') ; self.ship('cpu-pulse')
+        before = dash.shipped_units(self.plugin)
+        self.ship('gpu')
+        old = (self.plugin / 'manifest.json').stat().st_mtime_ns - 10**9
+        import os
+        os.utime(self.plugin / 'manifest.json', ns=(old, old))
+        messages, ok = dash.install_new_units(self.plugin, before)
+        self.assertTrue(ok)
+        self.assertEqual((self.units / 'gpu.service').read_text(), UNIT.format(name='gpu'))
+        self.assertIn(['systemctl', '--user', 'daemon-reload'], self.calls)
+        self.assertIn(['systemctl', '--user', 'enable', '--now', 'gpu.service'], self.calls)
+        self.assertTrue(any('Installed and started gpu.service' in m for m in messages), messages)
+        self.assertGreater((self.plugin / 'manifest.json').stat().st_mtime_ns, old, 'the widget was made to reload')
+
+    def test_nothing_new_does_nothing(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse')
+        messages, ok = dash.install_new_units(self.plugin, dash.shipped_units(self.plugin))
+        self.assertEqual((messages, ok, self.calls), ([], True, []))
+
+    def test_a_plugin_whose_services_were_never_installed_is_left_alone(self):
+        self.ship('cpu-pulse')
+        before = dash.shipped_units(self.plugin)
+        self.ship('gpu')
+        messages, ok = dash.install_new_units(self.plugin, before)
+        self.assertEqual((messages, ok, self.calls), ([], True, []))
+        self.assertFalse((self.units / 'gpu.service').exists())
+
+    def test_a_unit_that_was_already_shipped_and_removed_on_purpose_stays_removed(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse'); self.ship('gpu')   # gpu shipped, never installed
+        before = dash.shipped_units(self.plugin)
+        (self.plugin / 'manifest.json').write_text('{"v":2}')                 # an update that adds no unit
+        messages, ok = dash.install_new_units(self.plugin, before)
+        self.assertEqual((messages, ok, self.calls), ([], True, []))
+        self.assertFalse((self.units / 'gpu.service').exists())
+
+    def test_a_unit_that_does_not_run_this_plugins_code_is_not_installed(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse')
+        before = dash.shipped_units(self.plugin)
+        self.ship('evil', '[Service]\nExecStart=/usr/bin/somewhere-else\n')
+        messages, ok = dash.install_new_units(self.plugin, before)
+        self.assertTrue(ok)
+        self.assertFalse((self.units / 'evil.service').exists())
+        self.assertEqual(self.calls, [])
+        self.assertTrue(any('does not run this plugin' in m for m in messages), messages)
+
+    def test_an_existing_unit_file_is_never_overwritten(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse')
+        before = dash.shipped_units(self.plugin)
+        self.ship('gpu'); self.install('gpu', 'MINE')
+        dash.install_new_units(self.plugin, before)
+        self.assertEqual((self.units / 'gpu.service').read_text(), 'MINE')
+
+    def test_a_changed_unit_is_reported_and_not_replaced(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse', 'EDITED BY THE USER')
+        before = dash.shipped_units(self.plugin)
+        self.ship('cpu-pulse', UNIT.format(name='cpu-pulse') + '# new\n')
+        messages, ok = dash.install_new_units(self.plugin, before)
+        self.assertTrue(ok)
+        self.assertEqual((self.units / 'cpu-pulse.service').read_text(), 'EDITED BY THE USER')
+        self.assertTrue(any('cpu-pulse.service changed in this update' in m for m in messages), messages)
+        self.assertEqual(self.calls, [])
+
+    def test_a_unit_that_changed_but_was_never_installed_is_not_mentioned(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse'); self.ship('gpu')
+        before = dash.shipped_units(self.plugin)
+        self.ship('gpu', UNIT.format(name='gpu') + '# new\n')
+        self.assertEqual(dash.install_new_units(self.plugin, before), ([], True))
+
+    def test_a_service_that_will_not_start_is_a_failure_with_the_reason(self):
+        self.ship('cpu-pulse'); self.install('cpu-pulse')
+        before = dash.shipped_units(self.plugin)
+        self.ship('gpu')
+        self.systemctl_rc = 1
+        messages, ok = dash.install_new_units(self.plugin, before)
+        self.assertFalse(ok)
+        self.assertTrue(any('could not start it' in m and 'boom' in m for m in messages), messages)
+
+
+class CmdUpdateUnitsTests(UnitFixture):
+    def setUp(self):
+        super().setUp()
+        for target, value in (('ensure_apps_file', lambda: None), ('load_apps', lambda: []),
+                              ('check_all', lambda: None), ('PLUGINS_DIR', self.plugin.parent)):
+            patcher = patch.object(dash, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.printed = []
+        printer = patch('builtins.print', lambda *a, **k: self.printed.append(a[0] if a else ''))
+        printer.start()
+        self.addCleanup(printer.stop)
+        self.ship('cpu-pulse'); self.install('cpu-pulse')
+        self.update_rc = 0
+
+        original = dash.run
+
+        def run_with_update(args, cwd=None, timeout=20):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                self.calls.append(list(args))
+                if self.update_rc == 0:
+                    self.ship('gpu')                       # what the update brings
+                return (self.update_rc, 'Updated.', '' if self.update_rc == 0 else 'merge failed')
+            return original(args, cwd=cwd, timeout=timeout)
+        patcher = patch.object(dash, 'run', run_with_update)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def update(self):
+        dash.cmd_update(type('A', (), {'id': 'nixfred.pulse'})())
+        return json.loads(self.printed[-1])
+
+    def test_a_unit_the_update_brought_is_installed_and_reported(self):
+        result = self.update()
+        self.assertTrue(result['ok'], result)
+        self.assertIn('Installed and started gpu.service', result['message'])
+        self.assertTrue((self.units / 'gpu.service').exists())
+
+    def test_the_before_snapshot_is_taken_before_the_update_runs(self):
+        # If it were taken after, the new unit would look as if it had always been there.
+        self.assertTrue(self.update()['ok'])
+        self.assertLess(self.calls.index(['omarchy', 'plugin', 'update', 'nixfred.pulse', '--yes']),
+                        self.calls.index(['systemctl', '--user', 'enable', '--now', 'gpu.service']))
+        self.assertTrue((self.units / 'gpu.service').exists())
+
+    def test_a_failed_update_installs_nothing(self):
+        self.update_rc = 1
+        result = self.update()
+        self.assertFalse(result['ok'])
+        self.assertFalse((self.units / 'gpu.service').exists())
+        self.assertNotIn(['systemctl', '--user', 'daemon-reload'], self.calls)
+
+    def test_a_service_that_will_not_start_makes_the_update_report_failure(self):
+        self.systemctl_rc = 1
+        result = self.update()
+        self.assertFalse(result['ok'])
+        self.assertIn('did not come up', result['message'])
