@@ -18,8 +18,18 @@ that same command itself, synchronously, right after a successful git
 update, so what gets reported here reflects whether the plugin actually
 finished coming up -- still the plugin's own command, just called directly
 instead of trusted to happen on its own.
+
+The second exception (2026-09-21, Pulse 1.3.0 -> 1.3.2): an update can ship a NEW
+systemd user unit (Pulse added a GPU recorder, `gpu-pulse.service`). The units are
+installed by the plugin's own install.py, which `omarchy plugin update` never runs, so
+the new recorder did not exist, the widget read it as offline, and Pulse ranks an
+offline recorder as the worst thing on the machine: the bar showed "GPU · OFFLINE" in
+place of its live readings while the dashboard said "up to date". cmd_update now
+compares the units the plugin ships before and after the update and installs the ones
+that are new (see install_new_units for the guards).
 """
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -31,6 +41,15 @@ PLUGINS_DIR = Path.home() / '.config/omarchy/plugins'
 STATE = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'omarchy/plugins' / SELF_ID
 STATUS_PATH = STATE / 'status.json'
 APPS_PATH = STATE / 'apps.json'
+USER_UNIT_DIR = Path.home() / '.config/systemd/user'
+# Where a plugin's units are looked for: its top level and one directory down (Pulse keeps
+# them in collectors/), never in the places a plugin keeps other people's files.
+UNIT_SUFFIXES = ('.service', '.timer')
+UNIT_SKIP_DIRS = {'.git', 'tests', 'docs', 'node_modules', '__pycache__'}
+# How long to let a freshly started recorder write its first reading before the widget is
+# reloaded to find it (the widget's file watch is set up at load, and a file that did not
+# exist then is never noticed).
+UNIT_SETTLE_SECONDS = 8
 
 # Seeded into APPS_PATH the first time it's missing; from then on the file on
 # disk is what's read; edit it there (or via the "+ Add app" form) to add or
@@ -123,6 +142,104 @@ def run_ensure_bootstrap(plugin_dir):
     run.sh --ensure is the plugin's own idempotent readiness check, so a build that's
     already current just confirms that and returns quickly."""
     return run(['bash', 'run.sh', '--ensure'], cwd=str(plugin_dir), timeout=60)
+
+
+def shipped_units(plugin_dir):
+    """{unit name: (path, sha256)} for every systemd unit the plugin ships, so what an
+    update adds or changes can be told from what was already there."""
+    plugin_dir = Path(plugin_dir)
+    found = {}
+    try:
+        candidates = list(plugin_dir.iterdir())
+        for child in list(candidates):
+            if child.is_dir() and child.name not in UNIT_SKIP_DIRS and not child.name.startswith('.'):
+                candidates.extend(child.iterdir())
+        for path in candidates:
+            if path.is_file() and path.suffix in UNIT_SUFFIXES and path.name not in found:
+                found[path.name] = (path, hashlib.sha256(path.read_bytes()).hexdigest())
+    except OSError:
+        pass
+    return found
+
+
+def install_new_units(plugin_dir, before):
+    """Installs the systemd user units an update ADDED, which `omarchy plugin update`
+    does not do (the plugin's install.py does, and nothing runs that). Returns
+    (messages, ok). Deliberately narrow, because starting a background service is not a
+    small thing to do unasked:
+
+      * only a unit that was not shipped before the update. A unit the user removed on
+        purpose stays removed, because it was not new;
+      * only if the plugin already has another unit installed, i.e. it was set up with
+        services in the first place. A plugin whose services were never installed is
+        left alone;
+      * only a unit that mentions the plugin's own directory, i.e. it runs that plugin's
+        code, not something else;
+      * never overwrites a unit file that already exists.
+
+    A shipped unit that CHANGED is reported, not replaced: the installed copy may carry
+    the user's own edits.
+    """
+    plugin_dir = Path(plugin_dir)
+    after = shipped_units(plugin_dir)
+    new = sorted(name for name in after if name not in before)
+    changed = sorted(name for name in after if name in before and after[name][1] != before[name][1]
+                     and (USER_UNIT_DIR / name).exists())
+    messages = []
+    for name in changed:
+        messages.append(f'{name} changed in this update; the installed copy was left as it is '
+                        f'(run the plugin\'s install.py to refresh it).')
+    if not new:
+        return messages, True
+    if not any((USER_UNIT_DIR / name).exists() for name in after if name not in new):
+        return messages, True
+    ok = True
+    started = []
+    for name in new:
+        target = USER_UNIT_DIR / name
+        if target.exists():
+            continue
+        try:
+            text = after[name][0].read_text()
+        except (OSError, UnicodeDecodeError) as e:
+            messages.append(f'Could not read the new unit {name}: {e}')
+            ok = False
+            continue
+        if plugin_dir.name not in text:
+            messages.append(f'{name} is new in this update but does not run this plugin\'s own code; '
+                            f'not installed.')
+            continue
+        try:
+            USER_UNIT_DIR.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+            target.chmod(0o644)
+        except OSError as e:
+            messages.append(f'Could not install {name}: {e}')
+            ok = False
+            continue
+        rc, out, err = run(['systemctl', '--user', 'daemon-reload'], timeout=30)
+        if rc == 0:
+            rc, out, err = run(['systemctl', '--user', 'enable', '--now', name], timeout=60)
+        if rc != 0:
+            messages.append(f'Installed {name} but could not start it: {(err or out).strip()[-300:]}')
+            ok = False
+        else:
+            messages.append(f'Installed and started {name}, which is new in this update.')
+            started.append(name)
+    if started:
+        reload_plugin_widget(plugin_dir)
+    return messages, ok
+
+
+def reload_plugin_widget(plugin_dir):
+    """Makes the shell hot-reload just this plugin (it watches the plugin directory), after
+    a pause for the recorder just started to write its first reading. Omarchy has no
+    command for this; touching the manifest is what its own file watch reacts to."""
+    time.sleep(UNIT_SETTLE_SECONDS)
+    try:
+        os.utime(Path(plugin_dir) / 'manifest.json')
+    except OSError:
+        pass
 
 
 def pkg_version(pkg_name):
@@ -220,9 +337,16 @@ def app_update_state(repo_dir, branch, remote):
     if rc1 != 0 or rc2 != 0:
         return 'unreachable', 0, f'could not resolve {branch}/{remote_ref}'
     rc3, _, _ = run(['git', '-C', str(repo_dir), 'merge-base', '--is-ancestor', remote_ref, branch])
+    counted = branch
     if rc3 == 0:
-        return 'up-to-date', 0, ''
-    rc4, count, _ = run(['git', '-C', str(repo_dir), 'rev-list', '--count', f'{branch}..{remote_ref}'])
+        # `branch` has it, but the app is built from what is CHECKED OUT, which for Flea is
+        # aarch64-local, a different branch that has to merge `branch` in. An update that
+        # moved master and was then aborted leaves master current and the build stale.
+        rc_head, _, _ = run(['git', '-C', str(repo_dir), 'merge-base', '--is-ancestor', remote_ref, 'HEAD'])
+        if rc_head == 0:
+            return 'up-to-date', 0, ''
+        counted = 'HEAD'
+    rc4, count, _ = run(['git', '-C', str(repo_dir), 'rev-list', '--count', f'{counted}..{remote_ref}'])
     behind = int(count.strip()) if rc4 == 0 and count.strip().isdigit() else 0
     if behind == 0:
         return 'up-to-date', 0, ''
@@ -323,8 +447,9 @@ def cmd_update(args):
         a = apps[args.id]
         rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900)
     else:
-        rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180)
         plugin_dir = PLUGINS_DIR / args.id
+        units_before = shipped_units(plugin_dir)
+        rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180)
         if rc == 0 and has_ensure_bootstrap(plugin_dir):
             erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
             if erc != 0:
@@ -333,9 +458,24 @@ def cmd_update(args):
                     'Update landed but the plugin did not come up cleanly:\n' + (eerr or eout)
             elif eout.strip():
                 out = (out + '\n' if out.strip() else '') + eout
+        if rc == 0:
+            unit_messages, units_ok = install_new_units(plugin_dir, units_before)
+            if unit_messages:
+                text = '\n'.join(unit_messages)
+                if units_ok:
+                    out = (out + '\n' if out.strip() else '') + text
+                else:
+                    rc = 1
+                    err = (err + '\n' if err.strip() else '') + \
+                        'Update landed but a new background service did not come up:\n' + text
     # Long build logs (Flea's cargo test output, say) aren't useful in full to
     # the UI -- the tail carries the actual result or error.
-    message = (out or err).strip()[-4000:]
+    # A failure carries both streams: stdout has what the command said it was doing, stderr
+    # what went wrong, and `out or err` dropped the second whenever the first had any text.
+    if rc == 0:
+        message = (out or err).strip()[-4000:]
+    else:
+        message = '\n'.join(t for t in (out.strip(), err.strip()) if t)[-4000:]
     print(json.dumps({'ok': rc == 0, 'message': message}))
     check_all()
 

@@ -53,6 +53,16 @@ notification via `notify-send`.
   for a plugin without local edits this deletes its directory outright ("its
   git repo remains upstream" is Omarchy's own justification), so don't
   confirm one you haven't actually finished with.
+- **New background services**: an update can ship a systemd user unit the plugin's
+  own `install.py` would have installed (Pulse 1.3.2 added `gpu-pulse.service`), and
+  `omarchy plugin update` never runs `install.py`. After a successful update the
+  Dashboard compares the units the plugin ships before and after, and installs and
+  starts the ones that are new -- then reloads that plugin's widget so it notices. It is
+  deliberately narrow: only a unit that was not shipped before (a service you removed on
+  purpose stays removed), only if the plugin already has another unit installed, only a
+  unit that runs the plugin's own code, and never over an existing file. A shipped unit
+  that *changed* is reported, not replaced. Anything it could not start makes the update
+  report a failure instead of "up to date".
 - **Self-update**: the Dashboard's own row behaves like any other plugin's
   for Update and Diff. Its enable/disable switch and Remove button are
   hidden -- pulling either out from under its own running widget is asking
