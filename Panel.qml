@@ -38,6 +38,7 @@ Panel {
     property string detailText: ""
     property bool detailOk: true
     property bool addAppFormOpen: false
+    property bool disabledOpen: false
     property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install"})
     property real now: Date.now() / 1000
     property real elapsedNow: Date.now() / 1000
@@ -62,8 +63,9 @@ Panel {
         }
     }
 
-    function runCheck() {
+    function runCheck(force) {
         if (checkProc.running) return
+        checkProc.command = force ? ["python3", helper, "check", "--force"] : ["python3", helper, "check"]
         actionStatus = "Checking sources…"
         checkProc.running = true
     }
@@ -74,6 +76,12 @@ Panel {
         root.lastActionKind = kind
         root.actionStartSec = Date.now() / 1000
         actionStatus = actionVerb(kind) + id + "…"
+        if (kind === "update") {
+            root.detailOpenId = id
+            root.detailMode = "output"
+            root.detailOk = true
+            root.detailText = ""
+        }
         actionProc.command = ["python3", helper, kind, id]
         actionProc.running = true
     }
@@ -108,6 +116,21 @@ Panel {
 
     function closeDetail() { root.detailOpenId = "" }
 
+    function stripeColor(item) {
+        var k = Model.stripeKey(item)
+        if (k === "behind") return Color.accent
+        if (k === "attention") return Color.urgent
+        if (k === "off") return Util.alpha(root.ink, 0.28)
+        return Util.alpha(root.ink, 0.12)
+    }
+
+    function pillAccent(item) {
+        var k = Model.stripeKey(item)
+        if (k === "behind") return Color.accent
+        if (k === "attention") return Color.urgent
+        return Util.alpha(root.ink, 0.45)
+    }
+
     function submitAddApp() {
         if (root.busyId !== "") return
         var f = root.addAppFields
@@ -119,7 +142,10 @@ Panel {
         actionProc.running = true
     }
 
-    onOpenedChanged: if (opened) { statusFile.reload(); runCheck() }
+    onOpenedChanged: if (opened) {
+        statusFile.reload()
+        if (!Model.statusFresh(root.status.ts, Date.now() / 1000, 300)) root.runCheck()
+    }
 
     FileView {
         id: statusFile
@@ -130,17 +156,28 @@ Panel {
         onLoaded: { try { root.status = JSON.parse(text()) } catch (e) {} }
     }
 
+    FileView {
+        id: actionLog
+        path: root.stateDir + "/action.log"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            if (root.lastActionKind === "update" && root.busyId !== "") {
+                root.detailOpenId = root.busyId
+                root.detailMode = "output"
+                root.detailText = text()
+            }
+        }
+    }
+
     Timer { interval: 1000; running: root.opened; repeat: true; onTriggered: root.now = Date.now() / 1000 }
     // Ticks the busy row's "…Ns" elapsed counter so a long update (Flea's
     // cargo build, say) visibly keeps moving instead of sitting on static text.
     Timer { interval: 500; running: root.busyId !== ""; repeat: true; onTriggered: root.elapsedNow = Date.now() / 1000 }
-    // A slow background refresh while closed too, so the badge count on the
-    // bar chip itself stays roughly current without anyone opening the panel.
-    Timer { interval: 900000; running: true; repeat: true; triggeredOnStart: true; onTriggered: if (!root.opened) checkProc.running = true }
 
     Process {
         id: checkProc
-        command: ["python3", root.helper, "check"]
         stdout: StdioCollector {
             waitForEnd: true
             onStreamFinished: {
@@ -299,6 +336,7 @@ Panel {
         // no room to draw "8/9" legibly at bar-icon size -- and draws a
         // thinner stroke proportionate to the smaller ring.
         property bool showLabel: true
+        property string labelText: total > 0 ? done + "/" + total : "--"
         property real strokeWidth: showLabel ? 3 : 2.2
         // 44px, not 36: a worst-case label like "10/10" is 5 characters, and
         // 36px left only ~25px of clear space inside a 3.5px stroke at that
@@ -341,7 +379,7 @@ Panel {
         Text {
             visible: ring.showLabel
             anchors.centerIn: parent
-            text: ring.total > 0 ? ring.done + "/" + ring.total : "--"
+            text: ring.labelText
             color: root.ink
             font.family: Style.font.family
             font.pixelSize: 9
@@ -356,83 +394,116 @@ Panel {
         readonly property bool busy: root.busyId === row.modelData.id
         readonly property bool detailShown: root.detailOpenId === row.modelData.id
         readonly property bool isSelf: row.modelData.id === root.moduleName
+        readonly property color accentNow: root.pillAccent(row.modelData)
         property bool confirmingRemove: false
-        height: content.implicitHeight + 16
+        height: content.implicitHeight + 12
         radius: 10
         color: rowMouse.containsMouse ? Style.hoverFill : Style.normalFill
         border.color: Style.normalBorderColor
+        Behavior on color { ColorAnimation { duration: 80 } }
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
         Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirmingRemove = false }
         onDetailShownChanged: if (!detailShown) confirmingRemove = false
 
+        Rectangle {
+            width: 4
+            height: parent.height
+            radius: 2
+            color: root.stripeColor(row.modelData)
+        }
+
         Column {
             id: content
-            width: parent.width - 24
-            x: 12; y: 8
+            width: parent.width - 28
+            x: 16; y: 6
             spacing: 6
 
-            Row {
+            Item {
                 width: parent.width
-                spacing: 10
-                Column {
-                    width: 190
-                    Heading { text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: 190 }
-                    Label { text: (row.modelData.version ? "v" + row.modelData.version : "no version") + (row.modelData.kind === "app" ? "  ·  app" : "") + (row.isSelf ? "  ·  this widget" : ""); font.pixelSize: Style.font.caption }
-                }
-                Label {
-                    width: parent.width - 190 - 10
-                    wrapMode: Text.WordWrap
-                    text: row.busy ? (root.actionStatus + "  ·  " + Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s") : Model.stateLabel(row.modelData)
-                    // Positive (accent): update ready. Needs-attention (urgent, dimmed a touch so it
-                    // reads as "look at this" rather than "something is broken"): dirty, diverged, or a
-                    // git operation left mid-flight -- the exact state a Dashboard-triggered rebuild.sh
-                    // can leave a repo in (Flea, 2026-09-16). Anything else: dim/neutral.
-                    color: Model.canUpdate(row.modelData) ? Color.accent
-                         : ["dirty", "diverged", "in-progress"].indexOf(row.modelData.updateState) >= 0 ? Util.alpha(Color.urgent, 0.85)
-                         : Util.alpha(root.ink, 0.62)
-                }
-            }
+                height: Math.max(nameCol.implicitHeight, actionsRow.implicitHeight, pillBox.implicitHeight)
 
-            Row {
-                anchors.right: parent.right
-                spacing: 8
-                Toggle {
-                    visible: row.modelData.kind === "plugin" && row.modelData.canDisable !== false && !row.isSelf
-                    checked: !!row.modelData.enabled
-                    enabled: !row.busy && root.busyId === ""
+                Column {
+                    id: nameCol
+                    anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
+                    anchors.right: pillBox.left
+                    anchors.rightMargin: 8
+                    Heading { text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: parent.width }
+                    Label {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        text: row.busy
+                              ? (Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s")
+                              : ((row.modelData.version ? "v" + row.modelData.version : "no version")
+                                 + (row.modelData.kind === "app" ? " · app" : "")
+                                 + (row.isSelf ? " · this widget" : ""))
+                        font.pixelSize: Style.font.caption
+                    }
                 }
-                SmallButton {
-                    text: row.detailShown && root.detailMode === "diff" ? "Hide diff" : "Diff"
-                    accent: Color.muted
-                    visible: Model.canShowDiff(row.modelData)
-                    enabled: true
+                Rectangle {
+                    id: pillBox
+                    anchors.right: actionsRow.left
+                    anchors.rightMargin: 8
                     anchors.verticalCenter: parent.verticalCenter
-                    onClicked: root.showDiff(row.modelData.id)
+                    implicitWidth: pillText.implicitWidth + 12
+                    implicitHeight: 18
+                    radius: 9
+                    color: Util.alpha(row.accentNow, 0.18)
+                    border.color: row.accentNow
+                    Text {
+                        id: pillText
+                        anchors.centerIn: parent
+                        text: row.busy ? "WORKING" : Model.pillLabel(row.modelData)
+                        color: row.accentNow
+                        font.family: Style.font.family
+                        font.pixelSize: 9
+                        font.bold: true
+                        textFormat: Text.PlainText
+                    }
                 }
-                SmallButton {
-                    text: row.busy ? "…" : "Update"
-                    visible: Model.canUpdate(row.modelData)
-                    enabled: !row.busy && root.busyId === ""
+                Row {
+                    id: actionsRow
+                    anchors.right: parent.right
                     anchors.verticalCenter: parent.verticalCenter
-                    onClicked: root.runAction("update", row.modelData.id)
-                }
-                SmallButton {
-                    text: row.confirmingRemove ? "Confirm?" : "Remove"
-                    accent: Color.urgent
-                    visible: !row.isSelf
-                    enabled: !row.busy && root.busyId === ""
-                    anchors.verticalCenter: parent.verticalCenter
-                    onClicked: {
-                        if (row.confirmingRemove) {
-                            confirmResetTimer.stop()
-                            row.confirmingRemove = false
-                            root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
-                        } else {
-                            row.confirmingRemove = true
-                            confirmResetTimer.restart()
+                    spacing: 6
+                    Toggle {
+                        visible: row.modelData.kind === "plugin" && row.modelData.canDisable !== false && !row.isSelf
+                        checked: !!row.modelData.enabled
+                        enabled: !row.busy && root.busyId === ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
+                    }
+                    SmallButton {
+                        text: row.detailShown && root.detailMode === "diff" ? "Hide" : "Diff"
+                        accent: Color.muted
+                        visible: Model.canShowDiff(row.modelData)
+                        enabled: true
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: root.showDiff(row.modelData.id)
+                    }
+                    SmallButton {
+                        text: row.busy ? "…" : "Update"
+                        visible: Model.canUpdate(row.modelData)
+                        enabled: !row.busy && root.busyId === ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: root.runAction("update", row.modelData.id)
+                    }
+                    SmallButton {
+                        text: row.confirmingRemove ? "Confirm?" : "Remove"
+                        accent: Color.urgent
+                        visible: !row.isSelf
+                        enabled: !row.busy && root.busyId === ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: {
+                            if (row.confirmingRemove) {
+                                confirmResetTimer.stop()
+                                row.confirmingRemove = false
+                                root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
+                            } else {
+                                row.confirmingRemove = true
+                                confirmResetTimer.restart()
+                            }
                         }
                     }
                 }
@@ -469,11 +540,20 @@ Panel {
                         Text {
                             id: detailTextItem
                             width: parent.width
-                            text: row.detailShown ? root.detailText : ""
+                            text: !row.detailShown ? ""
+                                  : (root.detailMode === "diff"
+                                     ? Model.diffHtml(root.detailText, {
+                                           add: String(Color.accent),
+                                           del: String(Color.urgent),
+                                           meta: String(Util.alpha(root.ink, 0.45)),
+                                           text: String(root.ink)
+                                       })
+                                     : root.detailText)
                             color: Util.alpha(root.ink, 0.85)
                             font.family: Style.font.family
                             font.pixelSize: Style.font.caption
-                            wrapMode: Text.NoWrap
+                            wrapMode: Text.WrapAnywhere
+                            textFormat: root.detailMode === "diff" ? Text.RichText : Text.PlainText
                         }
                     }
                 }
@@ -504,18 +584,12 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 implicitWidth: Style.bar.iconCanvas
                 implicitHeight: Style.bar.iconCanvas
-                showLabel: false
+                showLabel: root.updatable > 0
+                labelText: String(root.updatable)
                 trackColor: Util.alpha(root.barForeground, 0.35)
                 fillColor: root.barForeground
                 done: root.health.done
                 total: root.health.total
-                // A one-click update genuinely waiting (the same condition that
-                // shows the red count badge) gets a slow breathing pulse on top
-                // of the badge's own color cue -- an idle "everything's current"
-                // ring stays perfectly still. `pulse` drives opacity only while
-                // updatable > 0; the ternary means a mid-breath stop never
-                // freezes the icon dim, since the binding ignores the stale
-                // `pulse` value the instant updatable goes back to 0.
                 property real pulse: 1.0
                 opacity: root.updatable > 0 ? pulse : 1.0
                 SequentialAnimation {
@@ -523,23 +597,6 @@ Panel {
                     loops: Animation.Infinite
                     NumberAnimation { target: barRing; property: "pulse"; from: 1.0; to: 0.45; duration: 700; easing.type: Easing.InOutQuad }
                     NumberAnimation { target: barRing; property: "pulse"; from: 0.45; to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
-                }
-            }
-            Rectangle {
-                visible: root.updatable > 0
-                anchors.verticalCenter: parent.verticalCenter
-                width: Math.max(14, badgeText.implicitWidth + 8)
-                height: 14
-                radius: 7
-                color: Color.urgent
-                Text {
-                    id: badgeText
-                    anchors.centerIn: parent
-                    text: String(root.updatable)
-                    color: Color.background
-                    font.family: Style.font.family
-                    font.pixelSize: 9
-                    font.bold: true
                 }
             }
         }
@@ -607,7 +664,7 @@ Panel {
                             text: checkProc.running ? "…" : "Refresh"
                             enabled: !checkProc.running
                             anchors.verticalCenter: parent.verticalCenter
-                            onClicked: root.runCheck()
+                            onClicked: root.runCheck(true)
                         }
                     }
                     Column {
@@ -620,12 +677,13 @@ Panel {
                         spacing: 3
                         Heading {
                             width: parent.width
-                            text: "PLUGIN DASHBOARD"; font.pixelSize: Style.font.heading; font.letterSpacing: 2
+                            text: "Plugins"; font.pixelSize: Style.font.heading
                             elide: Text.ElideRight
                         }
                         Label {
                             width: parent.width
-                            text: "Everything that isn't Omarchy's own."; font.pixelSize: Style.font.caption
+                            text: root.health.total > 0 ? (root.health.done + " of " + root.health.total + " current") : "Third-party plugins and apps"
+                            font.pixelSize: Style.font.caption
                             elide: Text.ElideRight
                         }
                     }
@@ -679,6 +737,38 @@ Panel {
                             }
                             Repeater {
                                 model: root.grouped.plugins
+                                Row_ {}
+                            }
+                        }
+
+                        Column {
+                            width: parent.width
+                            visible: root.grouped.disabled.length > 0
+                            spacing: 8
+                            Item {
+                                width: parent.width
+                                height: disabledLabel.implicitHeight + 4
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.disabledOpen = !root.disabledOpen
+                                }
+                                Label {
+                                    id: disabledLabel
+                                    text: "DISABLED  " + root.grouped.disabled.length
+                                    font.pixelSize: Style.font.caption
+                                    font.letterSpacing: 1.5
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Label {
+                                    text: root.disabledOpen ? "hide" : "show"
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    font.pixelSize: Style.font.caption
+                                }
+                            }
+                            Repeater {
+                                model: root.disabledOpen ? root.grouped.disabled : []
                                 Row_ {}
                             }
                         }

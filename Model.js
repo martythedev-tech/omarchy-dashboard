@@ -49,6 +49,8 @@ function healthFraction(items) {
     var total = 0, done = 0
     for (var i = 0; i < (items || []).length; i++) {
         if (items[i].updateState === 'no-repo') continue
+        // A plugin you turned off is not "unhealthy" — it is out of the ring.
+        if (items[i].kind !== 'app' && items[i].enabled === false) continue
         total++
         if (items[i].updateState === 'up-to-date') done++
     }
@@ -58,16 +60,71 @@ function healthFraction(items) {
 // Plugins first (alphabetical), then apps (alphabetical) -- a stable split
 // so the two sections in Panel.qml never need their own sort call.
 function groupByKind(items) {
-    var plugins = [], apps = []
+    var plugins = [], disabled = [], apps = []
     for (var i = 0; i < (items || []).length; i++) {
         var it = items[i]
         if (it.kind === 'app') apps.push(it)
+        else if (it.enabled === false) disabled.push(it)
         else plugins.push(it)
     }
     function byName(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0 }
     plugins.sort(byName)
+    disabled.sort(byName)
     apps.sort(byName)
-    return { plugins: plugins, apps: apps }
+    return { plugins: plugins, disabled: disabled, apps: apps }
+}
+
+function pillLabel(item) {
+    if (!item) return ''
+    if (item.enabled === false) return 'OFF'
+    switch (item.updateState) {
+        case 'behind': return 'BEHIND ' + item.behind
+        case 'up-to-date': return 'CURRENT'
+        case 'diverged': return 'DIVERGED'
+        case 'dirty': return 'DIRTY'
+        case 'in-progress': return 'GIT'
+        case 'no-repo': return 'NO SOURCE'
+        case 'unreachable': return 'OFFLINE'
+        default: return ''
+    }
+}
+
+function stripeKey(item) {
+    if (!item) return 'ok'
+    if (item.enabled === false) return 'off'
+    if (item.updateState === 'behind') return 'behind'
+    if (item.updateState === 'dirty' || item.updateState === 'diverged' || item.updateState === 'in-progress') return 'attention'
+    return 'ok'
+}
+
+function statusFresh(ts, nowSeconds, maxAge) {
+    if (!ts) return false
+    var age = (nowSeconds || (Date.now() / 1000)) - ts
+    return age >= 0 && age < (maxAge || 300)
+}
+
+function escapeHtml(s) {
+    return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function diffHtml(text, colors) {
+    colors = colors || {}
+    var add = colors.add || '#3dd68c'
+    var del = colors.del || '#e05d44'
+    var meta = colors.meta || '#888888'
+    var ink = colors.text || '#cccccc'
+    var lines = String(text || '').split('\n')
+    var out = []
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i]
+        var color = ink
+        if (line.indexOf('@@') === 0) color = meta
+        else if (line.charAt(0) === '+' && line.indexOf('+++') !== 0) color = add
+        else if (line.charAt(0) === '-' && line.indexOf('---') !== 0) color = del
+        else if (line.indexOf('diff ') === 0 || line.indexOf('index ') === 0) color = meta
+        out.push('<span style="color:' + color + '">' + escapeHtml(line) + '</span>')
+    }
+    return out.join('<br/>')
 }
 
 function relativeAge(ts, nowSeconds) {

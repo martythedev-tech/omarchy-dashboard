@@ -44,6 +44,15 @@ assert.equal(h0.done, 0);
 assert.equal(h0.total, 0);
 var hAllRepoless = ctx.healthFraction([{updateState: 'no-repo'}]);
 assert.equal(hAllRepoless.total, 0);
+// Disabled plugins do not drag the ring down — you turned them off on purpose.
+var hOff = ctx.healthFraction([
+    {updateState: 'up-to-date', enabled: true},
+    {updateState: 'behind', enabled: false},
+    {updateState: 'up-to-date', enabled: false},
+    {kind: 'app', updateState: 'up-to-date'},
+]);
+assert.equal(hOff.done, 2);
+assert.equal(hOff.total, 2);
 
 // groupByKind: plugins vs apps, each alphabetical, independent of input order
 var grouped = ctx.groupByKind([
@@ -59,6 +68,54 @@ assert.equal(grouped.plugins.map(function (i) { return i.name }).join(','), 'Mai
 assert.equal(grouped.apps.map(function (i) { return i.name }).join(','), 'Flea,Howdy');
 assert.equal(ctx.groupByKind([]).plugins.length, 0);
 assert.equal(ctx.groupByKind([]).apps.length, 0);
+var split = ctx.groupByKind([
+    {kind: 'plugin', name: 'VPN', enabled: true},
+    {kind: 'plugin', name: 'CPU Pulse', enabled: false},
+    {kind: 'plugin', name: 'Workspace Glance', enabled: false},
+    {kind: 'app', name: 'Flea'},
+]);
+assert.equal(split.plugins.map(function (i) { return i.name }).join(','), 'VPN');
+assert.equal(split.disabled.map(function (i) { return i.name }).join(','), 'CPU Pulse,Workspace Glance');
+assert.equal(split.apps.map(function (i) { return i.name }).join(','), 'Flea');
+assert.equal(ctx.groupByKind([]).disabled.length, 0);
+
+// pillLabel: short status for the row chip
+assert.equal(ctx.pillLabel({updateState: 'behind', behind: 6}), 'BEHIND 6');
+assert.equal(ctx.pillLabel({updateState: 'behind', behind: 1}), 'BEHIND 1');
+assert.equal(ctx.pillLabel({updateState: 'up-to-date'}), 'CURRENT');
+assert.equal(ctx.pillLabel({updateState: 'diverged'}), 'DIVERGED');
+assert.equal(ctx.pillLabel({updateState: 'dirty'}), 'DIRTY');
+assert.equal(ctx.pillLabel({updateState: 'in-progress'}), 'GIT');
+assert.equal(ctx.pillLabel({updateState: 'no-repo'}), 'NO SOURCE');
+assert.equal(ctx.pillLabel({updateState: 'unreachable'}), 'OFFLINE');
+assert.equal(ctx.pillLabel({updateState: 'up-to-date', enabled: false}), 'OFF');
+assert.equal(ctx.pillLabel(null), '');
+
+// stripeKey: left-edge color role, not a hex
+assert.equal(ctx.stripeKey({updateState: 'behind'}), 'behind');
+assert.equal(ctx.stripeKey({updateState: 'dirty'}), 'attention');
+assert.equal(ctx.stripeKey({updateState: 'diverged'}), 'attention');
+assert.equal(ctx.stripeKey({updateState: 'in-progress'}), 'attention');
+assert.equal(ctx.stripeKey({updateState: 'up-to-date'}), 'ok');
+assert.equal(ctx.stripeKey({updateState: 'up-to-date', enabled: false}), 'off');
+assert.equal(ctx.stripeKey(null), 'ok');
+
+// statusFresh: skip a network check when the last one is still young
+assert.equal(ctx.statusFresh(1000, 1100, 300), true);
+assert.equal(ctx.statusFresh(1000, 1400, 300), false);
+assert.equal(ctx.statusFresh(0, 1100, 300), false);
+assert.equal(ctx.statusFresh(undefined, 1100, 300), false);
+
+// diffHtml: color + / - / @@ lines; escape HTML in the payload
+var html = ctx.diffHtml('diff --git a b\n@@ -1 +1 @@\n-old <tag>\n+new & ok\n context', {
+    add: '#3dd68c', del: '#e05d44', meta: '#888888', text: '#cccccc'
+});
+assert.equal(html.indexOf('#3dd68c') >= 0, true);
+assert.equal(html.indexOf('#e05d44') >= 0, true);
+assert.equal(html.indexOf('#888888') >= 0, true);
+assert.equal(html.indexOf('&lt;tag&gt;') >= 0, true);
+assert.equal(html.indexOf('&amp; ok') >= 0, true);
+assert.equal(html.indexOf('<tag>') >= 0, false);
 
 // relativeAge
 var now = 1000000;
