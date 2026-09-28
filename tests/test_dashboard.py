@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +14,7 @@ def fake_run(table):
     """Returns a `run()` replacement driven by a {command_prefix_tuple: (rc, out, err)}
     table, matched by the longest prefix of the actual argv -- lets a test say
     "any git -C <dir> fetch" without hardcoding the temp dir path."""
-    def _run(args, cwd=None, timeout=20):
+    def _run(args, cwd=None, timeout=20, **_kwargs):
         best = None
         for prefix, result in table.items():
             if tuple(args[:len(prefix)]) == prefix and (best is None or len(prefix) > len(best)):
@@ -358,7 +359,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': 'howdy'})()
             dash.cmd_update(args)
-        run_mock.assert_called_once_with(['./rebuild.sh', '--install'], cwd='/home/x/Projects/howdy', timeout=900)
+        run_mock.assert_called_once_with(['./rebuild.sh', '--install'], cwd='/home/x/Projects/howdy', timeout=900, stream_log=dash.STATE / 'action.log')
 
     def test_unknown_id_falls_through_to_omarchy_plugin_update(self):
         with patch.object(dash, 'ensure_apps_file'), \
@@ -367,7 +368,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': 'sslvpn'})()
             dash.cmd_update(args)
-        run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', 'sslvpn', '--yes'], timeout=180)
+        run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', 'sslvpn', '--yes'], timeout=180, stream_log=dash.STATE / 'action.log')
 
     def test_a_failed_update_reports_what_it_said_and_what_went_wrong(self):
         # rebuild.sh explains a conflict on stdout and git's complaint arrives on stderr;
@@ -391,7 +392,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': dash.SELF_ID})()
             dash.cmd_update(args)
-        run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', dash.SELF_ID, '--yes'], timeout=180)
+        run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', dash.SELF_ID, '--yes'], timeout=180, stream_log=dash.STATE / 'action.log')
 
 
 class CmdEnableTests(unittest.TestCase):
@@ -721,7 +722,7 @@ class CmdUpdateUnitsTests(UnitFixture):
 
         original = dash.run
 
-        def run_with_update(args, cwd=None, timeout=20):
+        def run_with_update(args, cwd=None, timeout=20, **_kwargs):
             if args[:3] == ['omarchy', 'plugin', 'update']:
                 self.calls.append(list(args))
                 if self.update_rc == 0:
@@ -761,3 +762,53 @@ class CmdUpdateUnitsTests(UnitFixture):
         result = self.update()
         self.assertFalse(result['ok'])
         self.assertIn('did not come up', result['message'])
+
+
+class StatusFreshTests(unittest.TestCase):
+    def test_missing_ts_is_stale(self):
+        self.assertFalse(dash.status_is_fresh({}, now=1000))
+        self.assertFalse(dash.status_is_fresh({'ts': 0}, now=1000))
+        self.assertFalse(dash.status_is_fresh(None, now=1000))
+
+    def test_younger_than_max_age_is_fresh(self):
+        self.assertTrue(dash.status_is_fresh({'ts': 800}, now=1000, max_age=300))
+
+    def test_older_than_max_age_is_stale(self):
+        self.assertFalse(dash.status_is_fresh({'ts': 600}, now=1000, max_age=300))
+
+
+class CmdCheckCacheTests(unittest.TestCase):
+    def test_fresh_status_is_returned_without_fetching(self):
+        cached = {'ts': time.time(), 'items': [{'id': 'sslvpn', 'updateState': 'up-to-date'}], 'updatable': 0}
+        with tempfile.TemporaryDirectory() as d:
+            dash.STATE = Path(d)
+            dash.STATUS_PATH = Path(d) / 'status.json'
+            dash.STATUS_PATH.write_text(json.dumps(cached))
+            with patch.object(dash, 'check_all') as check_mock, patch('builtins.print') as print_mock:
+                dash.cmd_check(type('A', (), {'force': False})())
+        check_mock.assert_not_called()
+        payload = json.loads(print_mock.call_args.args[0])
+        self.assertEqual(payload['updatable'], 0)
+        self.assertEqual(payload['items'][0]['id'], 'sslvpn')
+
+    def test_force_always_fetches(self):
+        cached = {'ts': time.time(), 'items': [], 'updatable': 0}
+        with tempfile.TemporaryDirectory() as d:
+            dash.STATE = Path(d)
+            dash.STATUS_PATH = Path(d) / 'status.json'
+            dash.STATUS_PATH.write_text(json.dumps(cached))
+            with patch.object(dash, 'check_all', return_value={'ts': 1, 'items': [], 'updatable': 0}) as check_mock, \
+                 patch.object(dash, 'ensure_apps_file'), patch('builtins.print'):
+                dash.cmd_check(type('A', (), {'force': True})())
+        check_mock.assert_called_once()
+
+    def test_stale_status_fetches(self):
+        cached = {'ts': time.time() - 9999, 'items': [], 'updatable': 0}
+        with tempfile.TemporaryDirectory() as d:
+            dash.STATE = Path(d)
+            dash.STATUS_PATH = Path(d) / 'status.json'
+            dash.STATUS_PATH.write_text(json.dumps(cached))
+            with patch.object(dash, 'check_all', return_value={'ts': 1, 'items': [], 'updatable': 0}) as check_mock, \
+                 patch.object(dash, 'ensure_apps_file'), patch('builtins.print'):
+                dash.cmd_check(type('A', (), {'force': False})())
+        check_mock.assert_called_once()

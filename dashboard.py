@@ -42,6 +42,7 @@ STATE = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state
 STATUS_PATH = STATE / 'status.json'
 APPS_PATH = STATE / 'apps.json'
 USER_UNIT_DIR = Path.home() / '.config/systemd/user'
+CHECK_CACHE_SECONDS = 300
 # Where a plugin's units are looked for: its top level and one directory down (Pulse keeps
 # them in collectors/), never in the places a plugin keeps other people's files.
 UNIT_SUFFIXES = ('.service', '.timer')
@@ -62,14 +63,69 @@ DEFAULT_APPS = [
 ]
 
 
-def run(args, cwd=None, timeout=20):
+def run(args, cwd=None, timeout=20, stream_log=None):
     """(returncode, stdout, stderr); never raises -- a missing binary or a
-    timeout is just another kind of failure the caller already has to handle."""
+    timeout is just another kind of failure the caller already has to handle.
+
+    stream_log: if set to a path, merge stdout/stderr and append each line to
+    that file as it arrives so the panel can tail a long update (Flea's cargo
+    build) instead of sitting on '... 47s' until the process exits.
+    """
+    if stream_log:
+        return run_live(args, cwd=cwd, timeout=timeout, log_path=stream_log)
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout, cwd=cwd, check=False)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, '', str(e)
+
+
+def run_live(args, cwd=None, timeout=900, log_path=None):
+    log_path = Path(log_path or (STATE / 'action.log'))
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        p = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, cwd=cwd, bufsize=1,
+        )
+    except OSError as e:
+        return 1, '', str(e)
+    chunks = []
+    deadline = time.time() + timeout
+    try:
+        with log_path.open('w') as log:
+            while True:
+                if time.time() > deadline:
+                    p.kill()
+                    p.wait()
+                    return 1, ''.join(chunks), f'timed out after {timeout}s'
+                line = p.stdout.readline() if p.stdout else ''
+                if line == '' and p.poll() is not None:
+                    break
+                if line:
+                    chunks.append(line)
+                    log.write(line)
+                    log.flush()
+        return p.wait(), ''.join(chunks), ''
+    except Exception as e:
+        p.kill()
+        return 1, ''.join(chunks), str(e)
+
+
+def status_is_fresh(status, now=None, max_age=CHECK_CACHE_SECONDS):
+    if not status or not status.get('ts'):
+        return False
+    return ((now if now is not None else time.time()) - status['ts']) < max_age
+
+
+def load_status():
+    try:
+        data = json.loads(STATUS_PATH.read_text())
+        if isinstance(data, dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
 
 
 def load_apps():
@@ -419,8 +475,13 @@ def check_all():
     return status
 
 
-def cmd_check(_args):
+def cmd_check(args):
     ensure_apps_file()
+    if not getattr(args, 'force', False):
+        cached = load_status()
+        if status_is_fresh(cached):
+            print(json.dumps(cached))
+            return
     print(json.dumps(check_all()))
 
 
@@ -445,11 +506,11 @@ def cmd_update(args):
     apps = {a['id']: a for a in load_apps()}
     if args.id in apps:
         a = apps[args.id]
-        rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900)
+        rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900, stream_log=STATE / 'action.log')
     else:
         plugin_dir = PLUGINS_DIR / args.id
         units_before = shipped_units(plugin_dir)
-        rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180)
+        rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180, stream_log=STATE / 'action.log')
         if rc == 0 and has_ensure_bootstrap(plugin_dir):
             erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
             if erc != 0:
@@ -558,7 +619,7 @@ def cmd_remove_app(args):
 def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('check')
+    sub.add_parser('check').add_argument('--force', action='store_true')
     for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app'):
         p = sub.add_parser(name)
         p.add_argument('id')
