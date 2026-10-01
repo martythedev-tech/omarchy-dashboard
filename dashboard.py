@@ -898,10 +898,18 @@ def cmd_update(args):
     units_added = [] if app else sorted(
         name for name in shipped_units(repo_dir)
         if name not in units_installed_before and (USER_UNIT_DIR / name).exists())
+    after = repo_head(repo_dir)
+    # A plugin "update" that found nothing to pull changed nothing, and listing it under
+    # Recent ("rebuilt, no version change") only buries the real ones. An app's no-op still
+    # rebuilt and reinstalled, so it stays; so does any failure.
+    if not app and rc == 0 and before and before == after:
+        print(json.dumps({'ok': True, 'message': message}))
+        check_all()
+        return
     append_history({
         'ts': time.time(), 'id': args.id, 'name': app.get('name', args.id) if app else args.id,
         'kind': 'app' if app else 'plugin', 'action': 'update', 'ok': rc == 0,
-        'before': before, 'after': repo_head(repo_dir),
+        'before': before, 'after': after,
         'fromVersion': from_version, 'toVersion': item_version(args.id, app),
         'unitsInstalled': units_added,
         'message': '' if rc == 0 else (message.strip().splitlines() or [''])[-1][:200],

@@ -1599,3 +1599,27 @@ class AddAppUpdateCommandTests(RepoGuessFixture):
         r, saved = self.add()
         self.assertTrue(r['ok'])
         self.assertEqual(saved[0][-1]['updateCmd'], ['./rebuild.sh', '--install'])
+
+
+class NoOpUpdateHistoryTests(RealRepoFixture):
+    def test_a_plugin_update_that_pulled_nothing_is_not_recorded(self):
+        real = dash.run
+        def nothing_to_pull(args, **kw):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                return (0, 'x.plugin is up to date.', '')
+            return real(args, **kw)
+        with patch.object(dash, 'run', nothing_to_pull):
+            dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
+        self.assertTrue(self.printed[-1]['ok'])
+        self.assertEqual(dash.load_history(), [])
+
+    def test_a_failed_plugin_update_that_moved_nothing_is_still_recorded(self):
+        real = dash.run
+        def failing(args, **kw):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                return (1, '', 'fetch failed')
+            return real(args, **kw)
+        with patch.object(dash, 'run', failing):
+            dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
+        self.assertEqual(len(dash.load_history()), 1)
+        self.assertFalse(dash.load_history()[0]['ok'])
