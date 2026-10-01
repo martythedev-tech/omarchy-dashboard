@@ -95,6 +95,42 @@ fetch rather than the sum of them.
   for the exact kind of hot-reload-during-lock crash this plugin exists to
   avoid; use `omarchy plugin disable/remove` from a terminal for those two.
 
+## After an update: did it actually load?
+
+Once a plugin update (or rollback) has landed and the shell has reloaded it, the
+Dashboard reads the shell's own log for anything new about that plugin. A
+message that it failed to load (a QML error, a missing type) turns the update
+into a failure -- with the shell's words in the output, and Roll back offered,
+since the update did land. A new plain warning is shown but doesn't fail it.
+Messages the plugin was already logging before the update are not counted.
+
+## Notifications
+
+The "update available" notification has **Update** and **Open** buttons. Update
+updates the items it named that are still updatable and not held, then says how
+that went; Open opens the panel. The notification is waited on by a small
+transient user unit (`dashboard-notify-*`), which goes away once it is clicked,
+dismissed, or an hour has passed.
+
+## Keyboard and scripts
+
+The panel answers the shell's IPC:
+
+```bash
+omarchy-shell martythedev-tech.dashboard toggle   # open, close, show, hide too
+omarchy-shell martythedev-tech.dashboard check    # force a check now
+omarchy-shell martythedev-tech.dashboard count    # updates waiting, e.g. for a script
+```
+
+For a key, add to `~/.config/hypr/bindings.lua`:
+
+```lua
+o.bind("SUPER + ALT + U", "Plugin Dashboard", "omarchy-shell martythedev-tech.dashboard toggle")
+```
+
+Use the command, not `{ panel = "martythedev-tech.dashboard" }`: that form calls the
+shell's generic `shell toggle`, which did not open this bar widget's popup when tried.
+
 ## Tracked apps
 
 Use "+ Add app" in the panel: name, id, repo dir, and it validates the repo
