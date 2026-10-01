@@ -568,7 +568,8 @@ Panel {
                                  + (row.modelData.kind === "app" ? " · app" : "")
                                  + (row.isSelf ? " · this widget" : "")
                                  + (row.modelData.held ? " · held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "")
-                                 + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : ""))
+                                 + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : "")
+                                 + (!row.modelData.held && row.modelData.updateState === "behind" ? " · " + Model.stateLabel(row.modelData) : ""))
                         font.pixelSize: Style.font.caption
                     }
                 }
@@ -636,14 +637,10 @@ Panel {
                         anchors.verticalCenter: parent.verticalCenter
                         onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
                     }
-                    SmallButton {
-                        text: row.detailShown && root.detailMode === "diff" ? "Hide" : "Changes"
-                        accent: Color.muted
-                        visible: Model.canShowDiff(row.modelData)
-                        enabled: true
-                        anchors.verticalCenter: parent.verticalCenter
-                        onClicked: root.showDiff(row.modelData.id)
-                    }
+                    // At most one button here (Update, or Unhold): with every action inline, a
+                    // row that was both behind and recently updated grew Changes, Update, Roll
+                    // back and Remove and ran them over its own name and pill. The rest live in
+                    // the expanded row.
                     SmallButton {
                         text: row.busy ? "…" : "Update"
                         visible: Model.canUpdate(row.modelData)
@@ -658,27 +655,6 @@ Panel {
                         enabled: !row.busy && root.busyId === ""
                         anchors.verticalCenter: parent.verticalCenter
                         onClicked: root.runAction("unhold", row.modelData.id)
-                    }
-                    // Only for a plugin the Dashboard updated in the last week and that has
-                    // not moved since (rollback_candidate decides); confirm like Remove,
-                    // since it resets the checkout.
-                    SmallButton {
-                        text: row.confirming === "rollback" ? "Confirm?" : "Roll back"
-                        accent: Color.urgent
-                        visible: !!row.modelData.rollback && !row.modelData.held
-                        enabled: !row.busy && root.busyId === ""
-                        anchors.verticalCenter: parent.verticalCenter
-                        onClicked: row.confirmThen("rollback", function() { root.runAction("rollback", row.modelData.id) })
-                    }
-                    SmallButton {
-                        text: row.confirming === "remove" ? "Confirm?" : "Remove"
-                        accent: Color.urgent
-                        visible: !row.isSelf
-                        enabled: !row.busy && root.busyId === ""
-                        anchors.verticalCenter: parent.verticalCenter
-                        onClicked: row.confirmThen("remove", function() {
-                            root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
-                        })
                     }
                 }
             }
@@ -697,9 +673,26 @@ Panel {
                         Label { text: modelData[1]; width: parent.width - 72; wrapMode: Text.Wrap; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.8) }
                     }
                 }
-                Row {
+                // What the row itself no longer has room for, in one Flow so it wraps
+                // instead of running past the edge however many apply: review first,
+                // then the links, then the destructive ones last.
+                Flow {
+                    width: parent.width
                     spacing: 6
                     topPadding: 2
+                    SmallButton {
+                        text: row.detailShown && root.detailMode === "diff" ? "Hide changes" : "Changes"
+                        accent: Color.muted
+                        visible: Model.canShowDiff(row.modelData)
+                        onClicked: root.showDiff(row.modelData.id)
+                    }
+                    SmallButton {
+                        text: "Hold"
+                        accent: Color.muted
+                        visible: Model.canHold(row.modelData)
+                        enabled: root.busyId === ""
+                        onClicked: root.runAction("hold", row.modelData.id)
+                    }
                     SmallButton {
                         text: Model.shortUrl(row.info.webUrl).split("/").slice(0, 3).join("/") + " ↗"
                         visible: !!row.info.webUrl
@@ -717,6 +710,25 @@ Panel {
                         visible: !!row.info.path
                         accent: Color.muted
                         onClicked: Quickshell.execDetached(["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--dir=" + row.info.path])
+                    }
+                    // Only for a plugin the Dashboard updated in the last week and that has
+                    // not moved since (rollback_candidate decides); confirm like Remove,
+                    // since it resets the checkout.
+                    SmallButton {
+                        text: row.confirming === "rollback" ? "Confirm roll back?" : "Roll back to " + (row.modelData.rollback && row.modelData.rollback.toVersion ? "v" + row.modelData.rollback.toVersion : "previous")
+                        accent: Color.urgent
+                        visible: !!row.modelData.rollback && !row.modelData.held
+                        enabled: !row.busy && root.busyId === ""
+                        onClicked: row.confirmThen("rollback", function() { root.runAction("rollback", row.modelData.id) })
+                    }
+                    SmallButton {
+                        text: row.confirming === "remove" ? "Confirm remove?" : (row.modelData.kind === "app" ? "Stop tracking" : "Remove")
+                        accent: Color.urgent
+                        visible: !row.isSelf
+                        enabled: !row.busy && root.busyId === ""
+                        onClicked: row.confirmThen("remove", function() {
+                            root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
+                        })
                     }
                 }
             }
@@ -970,18 +982,6 @@ Panel {
                                     text: "PLUGINS"; font.pixelSize: Style.font.caption; font.letterSpacing: 1.5
                                     anchors.verticalCenter: parent.verticalCenter
                                 }
-                                // omarchyplugins.com is Omarchy's own community plugin directory
-                                // (documented in its shell-plugins manual) -- this panel only ever
-                                // manages what's already installed, so a link out is the entire
-                                // "discovery" story rather than reimplementing a browse/search UI
-                                // against a site with no API.
-                                SmallButton {
-                                    text: "Browse plugins ↗"
-                                    accent: Color.muted
-                                    anchors.right: parent.right
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    onClicked: Qt.openUrlExternally("https://omarchyplugins.com")
-                                }
                             }
                             Repeater {
                                 model: root.grouped.plugins
@@ -1157,13 +1157,44 @@ Panel {
                 }
 
                 Rectangle { width: parent.width; height: 1; color: Style.normalBorderColor }
-                Label {
+                Item {
                     width: parent.width
-                    wrapMode: Text.WordWrap
-                    font.pixelSize: Style.font.caption
-                    text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
-                          (checkProc.running ? "Checking sources…" :
-                           "Last checked " + Model.relativeAge(root.status.ts, root.now) + "  ·  Esc closes")
+                    height: Math.max(footerStatus.implicitHeight, browseLink.implicitHeight)
+                    Label {
+                        id: footerStatus
+                        anchors.left: parent.left
+                        anchors.right: browseLink.left
+                        anchors.rightMargin: 12
+                        anchors.top: parent.top
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Style.font.caption
+                        text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
+                              (checkProc.running ? "Checking sources…" :
+                               "Last checked " + Model.relativeAge(root.status.ts, root.now))
+                    }
+                    // omarchyplugins.com is Omarchy's own community plugin directory (documented
+                    // in its shell-plugins manual). This panel only manages what is installed, so
+                    // a link out is the whole "discovery" story -- a quiet one, in the footer,
+                    // rather than a button wedged into the PLUGINS heading.
+                    Text {
+                        id: browseLink
+                        anchors.right: parent.right
+                        anchors.top: parent.top
+                        text: "Browse plugins ↗"
+                        color: browseMouse.containsMouse ? Color.accent : Util.alpha(root.ink, 0.62)
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        font.underline: browseMouse.containsMouse
+                        textFormat: Text.PlainText
+                        MouseArea {
+                            id: browseMouse
+                            anchors.fill: parent
+                            anchors.margins: -4
+                            hoverEnabled: true
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: Qt.openUrlExternally("https://omarchyplugins.com")
+                        }
+                    }
                 }
             }
         }

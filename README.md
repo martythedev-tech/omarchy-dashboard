@@ -48,10 +48,13 @@ Rows sort by what needs you: a stuck git operation or local changes blocking an
 update first, then anything one click would update, then sources that could not
 be reached, then the rest (held items with the rest) -- alphabetical within each.
 
-Click a row's name to expand it: its full status, the branch it is on, when
-upstream last committed, a link to its source (the GitHub repo, or the AUR
-package page for an app), and **Open folder** / **Terminal** buttons for its
-checkout.
+A row itself carries only its state pill, its on/off switch and at most one
+button -- **Update** when there is one, **Unhold** when held. Click the row's
+name to expand it: its full status, the branch it is on, when upstream last
+committed, and every other action -- **Changes**, **Hold**, a link to its
+source (the GitHub repo, or the AUR package page for an app), **Open folder**,
+**Terminal**, then **Roll back** and **Remove** last. **Browse plugins ↗** (the
+omarchyplugins.com directory) is in the footer.
 
 **Update all** ends with a one-line summary ("2 updated, 1 failed (Flea).") and
 leaves the first failure's output open.
