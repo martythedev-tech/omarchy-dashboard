@@ -56,8 +56,22 @@ fetch rather than the sum of them.
 
 ## Extra actions
 
-- **Diff**: for anything `behind` or `diverged`, shows `git diff` against
-  the fetched upstream before you commit to an Update.
+- **Changes**: for anything `behind` or `diverged`, lists the commits the
+  update brings (and, for a plugin, the local ones upstream lacks), with a Diff
+  tab for the full `git diff` against the fetched upstream.
+- **Hold**: from the Changes view, keeps an update you don't want yet out of
+  the badge, Update all and notifications; the row shows HELD and an Unhold
+  button. Holds live in `holds.json` in the state directory.
+- **Roll back** (plugins): for a week after the Dashboard updates a plugin, and
+  as long as its checkout hasn't moved since, puts it back where the update
+  found it -- `git reset --hard` to the old commit (refused over local changes),
+  validate (the update is restored if the old version no longer validates), stop
+  and remove any service the update had started that the old version doesn't
+  ship, the plugin's own `run.sh --ensure`, and a plugin rescan. It then holds
+  the plugin, so the same update isn't offered straight back. Apps are rebuilt
+  from source, so they have no Roll back.
+- **Recent**: every update and rollback is recorded in `history.json` (last
+  50); the newest few are listed at the bottom of the panel.
 - **Update all**: appears once more than one item is updatable; updates them
   one at a time.
 - **Remove**: `omarchy plugin remove <id> --yes` for plugins, or just drops

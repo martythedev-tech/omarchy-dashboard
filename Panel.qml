@@ -39,6 +39,12 @@ Panel {
     property bool detailOk: true
     property bool addAppFormOpen: false
     property bool disabledOpen: false
+    property bool recentOpen: false
+    // The Changes panel's two views of the same update: the commit list (default, readable
+    // at any size) and the raw diff.
+    property string diffTab: "commits"
+    property var detailCommits: ({incoming: [], local: []})
+    readonly property var history: status.history || []
     property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install"})
     property real now: Date.now() / 1000
     property real elapsedNow: Date.now() / 1000
@@ -59,6 +65,9 @@ Panel {
             case "disable": return "Disabling "
             case "remove": return "Removing "
             case "remove-app": return "Removing "
+            case "rollback": return "Rolling back "
+            case "hold": return "Holding "
+            case "unhold": return "Unholding "
             default: return "Working on "
         }
     }
@@ -109,6 +118,8 @@ Panel {
         if (root.detailOpenId === id && root.detailMode === "diff") { root.detailOpenId = ""; return }
         root.detailOpenId = id
         root.detailMode = "diff"
+        root.diffTab = "commits"
+        root.detailCommits = ({incoming: [], local: []})
         root.detailText = "Loading…"
         diffProc.command = ["python3", root.helper, "diff", id]
         diffProc.running = true
@@ -202,6 +213,10 @@ Panel {
                     } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
                         // The row is about to disappear from the list -- nothing left to show a panel on.
                         if (root.detailOpenId === targetId) root.detailOpenId = ""
+                    } else if (r.ok && (kind === "hold" || kind === "unhold")) {
+                        // The pill says it; an output panel reading "Holding x" adds nothing.
+                        if (root.detailOpenId === targetId) root.detailOpenId = ""
+                        root.actionStatus = r.message
                     } else {
                         // This is the actual answer to "did anything happen": the
                         // command's real output, shown until closed or overwritten
@@ -241,6 +256,8 @@ Panel {
                     var r = JSON.parse(text)
                     root.detailOk = !!r.ok
                     root.detailText = r.ok ? (r.diff || "(no textual diff)") : ("Could not load diff: " + (r.message || ""))
+                    root.detailCommits = r.ok ? {incoming: r.incoming || [], local: r.local || []} : {incoming: [], local: []}
+                    if (!r.ok) root.diffTab = "diff"
                 } catch (e) {
                     root.detailText = "Could not load diff."
                 }
@@ -395,7 +412,8 @@ Panel {
         readonly property bool detailShown: root.detailOpenId === row.modelData.id
         readonly property bool isSelf: row.modelData.id === root.moduleName
         readonly property color accentNow: root.pillAccent(row.modelData)
-        property bool confirmingRemove: false
+        // Which destructive button is waiting for its second click ("remove"/"rollback"), if any.
+        property string confirming: ""
         height: content.implicitHeight + 12
         radius: 10
         color: rowMouse.containsMouse ? Style.hoverFill : Style.normalFill
@@ -403,8 +421,18 @@ Panel {
         Behavior on color { ColorAnimation { duration: 80 } }
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
-        Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirmingRemove = false }
-        onDetailShownChanged: if (!detailShown) confirmingRemove = false
+        Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirming = "" }
+        onDetailShownChanged: if (!detailShown) confirming = ""
+        function confirmThen(what, action) {
+            if (row.confirming === what) {
+                confirmResetTimer.stop()
+                row.confirming = ""
+                action()
+            } else {
+                row.confirming = what
+                confirmResetTimer.restart()
+            }
+        }
 
         Rectangle {
             width: 4
@@ -438,7 +466,8 @@ Panel {
                               : ((row.modelData.version ? "v" + row.modelData.version : "no version")
                                  + (row.modelData.kind === "app" ? " · app" : "")
                                  + (row.isSelf ? " · this widget" : "")
-                                 + (row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : ""))
+                                 + (row.modelData.held ? " · held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "")
+                                 + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : ""))
                         font.pixelSize: Style.font.caption
                     }
                 }
@@ -501,7 +530,7 @@ Panel {
                         onToggled: root.runAction(checked ? "disable" : "enable", row.modelData.id)
                     }
                     SmallButton {
-                        text: row.detailShown && root.detailMode === "diff" ? "Hide" : "Diff"
+                        text: row.detailShown && root.detailMode === "diff" ? "Hide" : "Changes"
                         accent: Color.muted
                         visible: Model.canShowDiff(row.modelData)
                         enabled: true
@@ -516,21 +545,33 @@ Panel {
                         onClicked: root.runAction("update", row.modelData.id)
                     }
                     SmallButton {
-                        text: row.confirmingRemove ? "Confirm?" : "Remove"
+                        text: "Unhold"
+                        accent: Color.muted
+                        visible: !!row.modelData.held
+                        enabled: !row.busy && root.busyId === ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: root.runAction("unhold", row.modelData.id)
+                    }
+                    // Only for a plugin the Dashboard updated in the last week and that has
+                    // not moved since (rollback_candidate decides); confirm like Remove,
+                    // since it resets the checkout.
+                    SmallButton {
+                        text: row.confirming === "rollback" ? "Confirm?" : "Roll back"
+                        accent: Color.urgent
+                        visible: !!row.modelData.rollback && !row.modelData.held
+                        enabled: !row.busy && root.busyId === ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: row.confirmThen("rollback", function() { root.runAction("rollback", row.modelData.id) })
+                    }
+                    SmallButton {
+                        text: row.confirming === "remove" ? "Confirm?" : "Remove"
                         accent: Color.urgent
                         visible: !row.isSelf
                         enabled: !row.busy && root.busyId === ""
                         anchors.verticalCenter: parent.verticalCenter
-                        onClicked: {
-                            if (row.confirmingRemove) {
-                                confirmResetTimer.stop()
-                                row.confirmingRemove = false
-                                root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
-                            } else {
-                                row.confirmingRemove = true
-                                confirmResetTimer.restart()
-                            }
-                        }
+                        onClicked: row.confirmThen("remove", function() {
+                            root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
+                        })
                     }
                 }
             }
@@ -547,15 +588,45 @@ Panel {
                     width: parent.width - 16
                     x: 8; y: 8
                     spacing: 4
-                    Row {
+                    Item {
                         width: parent.width
+                        height: detailButtons.implicitHeight
                         Label {
-                            width: parent.width - 60
-                            text: root.detailMode === "diff" ? "Diff vs upstream" : (root.detailOk ? "Output" : "Output — failed")
+                            anchors.left: parent.left
+                            anchors.right: detailButtons.left
+                            anchors.verticalCenter: parent.verticalCenter
+                            elide: Text.ElideRight
+                            text: root.detailMode === "diff" ? "Changes vs upstream" : (root.detailOk ? "Output" : "Output — failed")
                             color: root.detailMode === "output" && !root.detailOk ? Color.urgent : Util.alpha(root.ink, 0.62)
                             font.pixelSize: Style.font.caption
                         }
-                        SmallButton { text: "Close"; accent: Color.muted; onClicked: root.closeDetail() }
+                        Row {
+                            id: detailButtons
+                            anchors.right: parent.right
+                            spacing: 6
+                            SmallButton {
+                                text: "Commits"
+                                visible: root.detailMode === "diff"
+                                accent: root.diffTab === "commits" ? Color.accent : Color.muted
+                                onClicked: root.diffTab = "commits"
+                            }
+                            SmallButton {
+                                text: "Diff"
+                                visible: root.detailMode === "diff"
+                                accent: root.diffTab === "diff" ? Color.accent : Color.muted
+                                onClicked: root.diffTab = "diff"
+                            }
+                            // Decide after seeing what is coming: holding keeps this update out
+                            // of the badge, Update all and notifications until unheld.
+                            SmallButton {
+                                text: "Hold"
+                                visible: root.detailMode === "diff" && Model.canHold(row.modelData)
+                                accent: Color.muted
+                                enabled: root.busyId === ""
+                                onClicked: root.runAction("hold", row.modelData.id)
+                            }
+                            SmallButton { text: "Close"; accent: Color.muted; onClicked: root.closeDetail() }
+                        }
                     }
                     Flickable {
                         width: parent.width
@@ -567,7 +638,13 @@ Panel {
                             id: detailTextItem
                             width: parent.width
                             text: !row.detailShown ? ""
-                                  : (root.detailMode === "diff"
+                                  : (root.detailMode === "diff" && root.diffTab === "commits"
+                                     ? Model.commitsHtml(root.detailCommits, {
+                                           text: String(root.ink),
+                                           meta: String(Util.alpha(root.ink, 0.5)),
+                                           head: String(Color.accent)
+                                       }, root.now)
+                                     : root.detailMode === "diff"
                                      ? Model.diffHtml(root.detailText, {
                                            add: String(Color.accent),
                                            del: String(Color.urgent),
@@ -578,7 +655,7 @@ Panel {
                             color: Util.alpha(root.ink, 0.85)
                             font.family: Style.font.family
                             font.pixelSize: Style.font.caption
-                            wrapMode: Text.WrapAnywhere
+                            wrapMode: root.detailMode === "diff" && root.diffTab === "commits" ? Text.Wrap : Text.WrapAnywhere
                             textFormat: root.detailMode === "diff" ? Text.RichText : Text.PlainText
                         }
                     }
@@ -831,6 +908,55 @@ Panel {
                                 }
                                 FieldInput { text: "./rebuild.sh --install"; placeholder: "Update command"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
                                 SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
+                            }
+                        }
+
+                        Column {
+                            width: parent.width
+                            visible: root.history.length > 0
+                            spacing: 6
+                            Item {
+                                width: parent.width
+                                height: recentLabel.implicitHeight + 4
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.recentOpen = !root.recentOpen
+                                }
+                                Label {
+                                    id: recentLabel
+                                    text: "RECENT  " + root.history.length
+                                    font.pixelSize: Style.font.caption
+                                    font.letterSpacing: 1.5
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Label {
+                                    text: root.recentOpen ? "hide" : "show"
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    font.pixelSize: Style.font.caption
+                                }
+                            }
+                            Repeater {
+                                model: root.recentOpen ? root.history : []
+                                Row {
+                                    required property var modelData
+                                    width: parent ? parent.width : 0
+                                    spacing: 8
+                                    Text {
+                                        text: Model.historyMark(modelData)
+                                        color: modelData.ok ? (modelData.action === "rollback" ? Color.urgent : Color.accent) : Color.urgent
+                                        font.family: Style.font.family
+                                        font.pixelSize: Style.font.bodySmall
+                                        textFormat: Text.PlainText
+                                    }
+                                    Label {
+                                        width: parent.width - 20
+                                        elide: Text.ElideRight
+                                        text: Model.historyLine(modelData, root.now) + (!modelData.ok && modelData.message ? " — " + modelData.message : "")
+                                        font.pixelSize: Style.font.caption
+                                    }
+                                }
                             }
                         }
 

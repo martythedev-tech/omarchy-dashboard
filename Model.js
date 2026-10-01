@@ -8,8 +8,20 @@
 // 'not-installed' is the other one: an app whose repo is current but whose installed
 // package is older than what the repo builds. Its updateCmd (rebuild.sh --install)
 // builds and installs whether or not upstream moved, so the same button applies.
-function canUpdate(item) {
+//
+// A held item is neither: holding it is saying "not this update", so it leaves the badge
+// and Update all, and loses its own button until it is unheld.
+function isUpdatableState(item) {
     return !!item && (item.updateState === 'behind' || item.updateState === 'not-installed')
+}
+
+function canUpdate(item) {
+    return isUpdatableState(item) && !item.held
+}
+
+// Hold is offered where it means something: an update is waiting that you do not want yet.
+function canHold(item) {
+    return canUpdate(item)
 }
 
 // True for anything a diff preview is meaningful for: 'behind' shows what
@@ -56,6 +68,8 @@ function healthFraction(items) {
         if (items[i].updateState === 'no-repo') continue
         // A plugin you turned off is not "unhealthy" — it is out of the ring.
         if (items[i].kind !== 'app' && items[i].enabled === false) continue
+        // Same for one you are holding back on purpose.
+        if (items[i].held) continue
         total++
         if (items[i].updateState === 'up-to-date') done++
     }
@@ -82,6 +96,7 @@ function groupByKind(items) {
 function pillLabel(item) {
     if (!item) return ''
     if (item.enabled === false) return 'OFF'
+    if (item.held) return 'HELD'
     switch (item.updateState) {
         case 'behind': return 'BEHIND ' + item.behind
         case 'up-to-date': return 'CURRENT'
@@ -105,7 +120,7 @@ function localTag(item) {
 
 function stripeKey(item) {
     if (!item) return 'ok'
-    if (item.enabled === false) return 'off'
+    if (item.enabled === false || item.held) return 'off'
     if (item.updateState === 'behind' || item.updateState === 'not-installed') return 'behind'
     if (item.updateState === 'dirty' || item.updateState === 'diverged' || item.updateState === 'in-progress') return 'attention'
     return 'ok'
@@ -151,4 +166,46 @@ function relativeAge(ts, nowSeconds) {
     if (hours < 24) return hours + (hours === 1 ? ' hour ago' : ' hours ago')
     var days = Math.round(hours / 24)
     return days + (days === 1 ? ' day ago' : ' days ago')
+}
+
+// The "what's new" list: upstream's commits an update would bring, then (for a plugin
+// that has them) the local commits upstream lacks. Rich text for the detail panel.
+function commitsHtml(r, colors, nowSeconds) {
+    colors = colors || {}
+    var ink = colors.text || '#cccccc'
+    var meta = colors.meta || '#888888'
+    var head = colors.head || ink
+    var incoming = (r && r.incoming) || [], local = (r && r.local) || []
+    function section(title, list) {
+        var out = ['<span style="color:' + head + '"><b>' + escapeHtml(title) + '</b></span>']
+        for (var i = 0; i < list.length; i++) {
+            var c = list[i]
+            out.push('<span style="color:' + meta + '">' + escapeHtml(c.hash) + '</span>  '
+                     + '<span style="color:' + ink + '">' + escapeHtml(c.subject) + '</span>'
+                     + '<span style="color:' + meta + '">  · ' + escapeHtml(c.author) + ', '
+                     + relativeAge(c.ts, nowSeconds) + '</span>')
+        }
+        return out.join('<br/>')
+    }
+    var parts = []
+    if (incoming.length) parts.push(section('Upstream · ' + incoming.length + (incoming.length === 1 ? ' commit' : ' commits'), incoming))
+    if (local.length) parts.push(section('Only here · ' + local.length + (local.length === 1 ? ' commit' : ' commits'), local))
+    return parts.length ? parts.join('<br/><br/>') : '<span style="color:' + meta + '">(no commits to list)</span>'
+}
+
+// One line of the Recent section.
+function historyLine(e, nowSeconds) {
+    if (!e) return ''
+    var name = e.name || e.id
+    var versions = e.fromVersion && e.toVersion && e.fromVersion !== e.toVersion ? ' ' + e.fromVersion + ' → ' + e.toVersion : ''
+    var what
+    if (e.action === 'rollback') what = (e.ok ? 'rolled back' : 'rollback failed') + versions
+    else what = e.ok ? (versions ? 'updated' + versions : 'rebuilt, no version change') : 'update failed'
+    return name + ' ' + what + ' · ' + relativeAge(e.ts, nowSeconds)
+}
+
+function historyMark(e) {
+    if (!e) return ''
+    if (!e.ok) return '✗'
+    return e.action === 'rollback' ? '↩' : '✓'
 }
