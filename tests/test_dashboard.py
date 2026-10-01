@@ -385,6 +385,7 @@ class LocalCommitsAndInstalledVersionTests(unittest.TestCase):
             table = {
                 ('vercmp',): (0, vercmp_out + '\n', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'origin/master..HEAD'): (0, '21\n', ''),
+                ('git', '-C', d, 'show', 'origin/master:.SRCINFO'): (0, 'pkgbase = flea\n\tpkgver = 0.3.1\n\tpkgrel = 2\n', ''),
             }
             with patch.object(dash, 'app_update_state', return_value=(state, 0, '')), \
                  patch.object(dash, 'pkg_version', return_value=installed), \
@@ -409,6 +410,8 @@ class LocalCommitsAndInstalledVersionTests(unittest.TestCase):
     def test_behind_is_not_overridden(self):
         item = self._check_app('behind', '0.3.0-1', '\tpkgver = 0.3.1\n\tpkgrel = 2\n')
         self.assertEqual(item['updateState'], 'behind')
+        # and the incoming .SRCINFO says what it would install
+        self.assertEqual((item['upstreamVersion'], item['versionChange']), ('0.3.1-2', True))
 
     def test_no_ahead_count_when_upstream_was_never_compared(self):
         # fake_run raises on any git call, proving none is made.
@@ -1623,3 +1626,74 @@ class NoOpUpdateHistoryTests(RealRepoFixture):
             dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
         self.assertEqual(len(dash.load_history()), 1)
         self.assertFalse(dash.load_history()[0]['ok'])
+
+
+class VersionChangeTests(RealRepoFixture):
+    """RealRepoFixture's two commits move manifest.json 1.0.0 -> 1.1.0."""
+
+    def test_upstream_plugin_version_is_read_from_the_ref_without_touching_the_checkout(self):
+        git(self.plugin, 'reset', '-q', '--hard', self.old)
+        self.assertEqual(dash.upstream_version(self.plugin, self.new, 'plugin'), '1.1.0')
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+        self.assertEqual(dash.upstream_version(self.plugin, 'no-such-ref', 'plugin'), '')
+
+    def test_upstream_app_version_comes_from_srcinfo(self):
+        (self.plugin / '.SRCINFO').write_text('pkgbase = x\n\tpkgver = 2.0\n\tpkgrel = 3\n')
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'srcinfo')
+        self.assertEqual(dash.upstream_version(self.plugin, 'HEAD', 'app'), '2.0-3')
+
+    def test_version_change(self):
+        self.assertIs(dash.version_change('1.0.0', '1.1.0'), True)
+        self.assertIs(dash.version_change('1.1.0', '1.1.0'), False)
+        self.assertIsNone(dash.version_change('1.1.0', ''))
+        self.assertIsNone(dash.version_change('', '1.1.0'))
+
+    def behind_item(self, upstream_manifest):
+        # A third commit upstream that may or may not move the version.
+        git(self.plugin, 'reset', '-q', '--hard', self.new)
+        (self.plugin / 'README.md').write_text('docs\n')
+        if upstream_manifest:
+            (self.plugin / 'manifest.json').write_text(upstream_manifest)
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'three')
+        third = git(self.plugin, 'rev-parse', 'HEAD')
+        git(self.plugin, 'reset', '-q', '--hard', self.new)
+        (self.plugin / '.git' / 'FETCH_HEAD').write_text(third + "\t\tbranch 'master' of origin\n")
+        with patch.object(dash, 'plugin_update_state', return_value=('behind', 1, '')):
+            return dash.check_plugin({'id': 'x.plugin', 'enabled': True})
+
+    def test_a_docs_only_commit_is_behind_with_no_version_change(self):
+        item = self.behind_item(None)
+        self.assertEqual((item['version'], item['upstreamVersion'], item['versionChange']), ('1.1.0', '1.1.0', False))
+        self.assertFalse(dash.alerts(item))
+
+    def test_a_version_bump_alerts(self):
+        item = self.behind_item('{"version": "1.2.0"}')
+        self.assertEqual((item['upstreamVersion'], item['versionChange']), ('1.2.0', True))
+        self.assertTrue(dash.alerts(item))
+
+    def test_not_read_unless_behind(self):
+        with patch.object(dash, 'plugin_update_state', return_value=('up-to-date', 0, '')):
+            item = dash.check_plugin({'id': 'x.plugin', 'enabled': True})
+        self.assertEqual((item['upstreamVersion'], item['versionChange']), ('', None))
+
+
+class AlertsTests(unittest.TestCase):
+    def test_alerts(self):
+        self.assertTrue(dash.alerts({'updateState': 'behind', 'versionChange': True}))
+        self.assertTrue(dash.alerts({'updateState': 'behind', 'versionChange': None}), 'unknown still alerts')
+        self.assertTrue(dash.alerts({'updateState': 'not-installed'}))
+        self.assertFalse(dash.alerts({'updateState': 'behind', 'versionChange': False}))
+        self.assertFalse(dash.alerts({'updateState': 'behind', 'held': True}))
+        self.assertFalse(dash.alerts({'updateState': 'dirty'}))
+
+    def test_no_notification_for_a_same_version_commit(self):
+        with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
+            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False}], set())
+        run_mock.assert_not_called()
+
+    def test_a_bump_beside_a_same_version_commit_notifies_for_the_bump_only(self):
+        with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
+            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False},
+                                     {'id': 'b', 'name': 'B', 'updateState': 'behind', 'versionChange': True}], set())
+        args = run_mock.call_args.args[0]
+        self.assertEqual(args[args.index('await-notification') + 1:], ['Update available', 'B', 'b'])

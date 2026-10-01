@@ -56,6 +56,15 @@ source (the GitHub repo, or the AUR package page for an app), **Open folder**,
 **Terminal**, then **Roll back** and **Remove** last. **Browse plugins ↗** (the
 omarchyplugins.com directory) is in the footer.
 
+**Same-version commits are quiet.** For anything behind, the check reads the
+version the incoming commits would install (the plugin's `manifest.json`, or an
+app's `.SRCINFO`) without touching the checkout. A row says `→ v1.2.0` when that
+changes the version, or `same version` (with a muted pill) when it doesn't --
+a README or screenshot commit. Same-version updates stay in the panel with their
+Update button and in Update all, but stay out of the bar badge and never send a
+notification. If the incoming version can't be read, it alerts as before. The
+catch: a plugin that changes code without bumping its version is quiet too.
+
 **Update all** ends with a one-line summary ("2 updated, 1 failed (Flea).") and
 leaves the first failure's output open.
 

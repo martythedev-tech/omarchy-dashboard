@@ -213,4 +213,18 @@ assert.equal(ctx.queueSummary([{id: 'a', name: 'A', ok: true}, {id: 'b', name: '
 assert.equal(ctx.queueSummary([{id: 'a', name: 'A', ok: true}]), 'Update all: 1 updated.');
 assert.equal(ctx.queueSummary([]), '');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary all pass.');
+// version-change awareness: same-version commits stay updatable but leave the badge
+assert.equal(ctx.alerts({updateState: 'behind', versionChange: false}), false);
+assert.equal(ctx.alerts({updateState: 'behind', versionChange: true}), true);
+assert.equal(ctx.alerts({updateState: 'behind'}), true, 'unknown still alerts');
+assert.equal(ctx.alerts({updateState: 'behind', versionChange: true, held: true}), false);
+assert.equal(ctx.canUpdate({updateState: 'behind', versionChange: false}), true, 'still updatable from the panel');
+assert.equal(ctx.badgeCount([{updateState: 'behind', versionChange: false}, {updateState: 'behind', versionChange: true}]), 1);
+assert.equal(ctx.behindLabel({updateState: 'behind', behind: 1, versionChange: false}), 'same version');
+assert.equal(ctx.behindLabel({updateState: 'behind', behind: 3, versionChange: true, upstreamVersion: '1.2.0'}), '→ v1.2.0');
+assert.equal(ctx.behindLabel({updateState: 'behind', behind: 2}), '2 commits behind');
+assert.equal(ctx.behindLabel({updateState: 'up-to-date'}), '');
+assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: false}), 'ok');
+assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: true}), 'behind');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge all pass.');
