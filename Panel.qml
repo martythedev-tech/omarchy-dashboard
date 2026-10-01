@@ -40,6 +40,12 @@ Panel {
     property bool addAppFormOpen: false
     property bool disabledOpen: false
     property bool recentOpen: false
+    // The row whose facts (status, branch, source, folder) are expanded; one at a time.
+    property string infoOpenId: ""
+    readonly property string home: Quickshell.env("HOME") || ""
+    // Update all's per-item results, for the summary once the queue is done.
+    property var queueResults: []
+    property var addAppNotes: []
     // The Changes panel's two views of the same update: the commit list (default, readable
     // at any size) and the raw diff.
     property string diffTab: "commits"
@@ -103,11 +109,42 @@ Panel {
         root.updateQueue = ids
         root.updateQueueTotal = ids.length
         root.updateQueueDone = 0
+        root.queueResults = []
         advanceUpdateQueue()
     }
 
+    function itemName(id) {
+        for (var i = 0; i < root.items.length; i++) if (root.items[i].id === id) return root.items[i].name
+        return id
+    }
+
+    function recordQueueResult(id, ok, message) {
+        if (root.updateQueueTotal === 0) return
+        root.queueResults = root.queueResults.concat([{id: id, name: root.itemName(id), ok: ok, message: message || ""}])
+    }
+
+    // After the last item of an Update all: one line saying how it went, and the first
+    // failure's output left open -- not whichever item happened to run last.
+    function finishUpdateQueue() {
+        var results = root.queueResults
+        root.updateQueueTotal = 0
+        root.updateQueueDone = 0
+        root.queueResults = []
+        if (results.length === 0) return
+        root.actionStatus = Model.queueSummary(results)
+        for (var i = 0; i < results.length; i++) {
+            if (!results[i].ok) {
+                root.detailOpenId = results[i].id
+                root.detailMode = "output"
+                root.detailOk = false
+                root.detailText = results[i].message || "(no error message)"
+                return
+            }
+        }
+    }
+
     function advanceUpdateQueue() {
-        if (root.updateQueue.length === 0) { root.updateQueueTotal = 0; root.updateQueueDone = 0; return }
+        if (root.updateQueue.length === 0) { root.finishUpdateQueue(); return }
         var next = root.updateQueue[0]
         root.updateQueue = root.updateQueue.slice(1)
         root.updateQueueDone += 1
@@ -224,7 +261,9 @@ Panel {
                 try {
                     var r = JSON.parse(text)
                     root.actionStatus = r.ok ? "Done." : "Failed."
+                    if (kind === "update") root.recordQueueResult(targetId, !!r.ok, r.message)
                     if (kind === "add-app") {
+                        if (!r.ok) root.addAppNotes = [r.message || "Could not add it."]
                         if (r.ok) root.addAppFormOpen = false
                     } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
                         // The row is about to disappear from the list -- nothing left to show a panel on.
@@ -244,21 +283,54 @@ Panel {
                     }
                 } catch (e) {
                     root.actionStatus = "Action did not report a result."
+                    if (kind === "update") root.recordQueueResult(targetId, false, "The update did not report a result.")
                 }
                 root.busyId = ""
                 root.lastActionKind = ""
                 statusFile.reload()
                 if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
-                else { root.updateQueueTotal = 0; root.updateQueueDone = 0 }
+                else root.finishUpdateQueue()
             }
         }
         onExited: function(code) {
             if (code !== 0 && root.busyId !== "") {
+                if (root.lastActionKind === "update") root.recordQueueResult(root.busyId, false, "The update exited with code " + code + ".")
                 root.busyId = ""
                 root.lastActionKind = ""
                 if (!root.actionStatus) root.actionStatus = "Action failed."
                 if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
-                else { root.updateQueueTotal = 0; root.updateQueueDone = 0 }
+                else root.finishUpdateQueue()
+            }
+        }
+    }
+
+    // Fill the Add app form from a repo: inspect-repo for a typed path, pick-folder for the
+    // desktop's folder chooser (its own process; see cmd_pick_folder for why).
+    function applyRepoGuess(r) {
+        root.addAppNotes = r.notes || []
+        var f = r.fields || {}
+        if (f.repoDir !== undefined) repoField.text = f.repoDir
+        if (!r.ok) return
+        nameField.text = f.name || ""
+        idField.text = f.id || ""
+        pkgField.text = f.pkgName || ""
+        branchField.text = f.branch || ""
+        remoteField.text = f.remote || ""
+        cmdField.text = f.updateCmd || ""
+    }
+
+    Process {
+        id: repoProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                try {
+                    var r = JSON.parse(text)
+                    if (r.cancelled) return
+                    root.applyRepoGuess(r)
+                } catch (e) {
+                    root.addAppNotes = ["Could not read that repo."]
+                }
             }
         }
     }
@@ -426,6 +498,8 @@ Panel {
         width: parent ? parent.width : 0
         readonly property bool busy: root.busyId === row.modelData.id
         readonly property bool detailShown: root.detailOpenId === row.modelData.id
+        readonly property bool infoShown: root.infoOpenId === row.modelData.id
+        readonly property var info: row.modelData.info || ({})
         readonly property bool isSelf: row.modelData.id === root.moduleName
         readonly property color accentNow: root.pillAccent(row.modelData)
         // Which destructive button is waiting for its second click ("remove"/"rollback"), if any.
@@ -473,7 +547,18 @@ Panel {
                     anchors.verticalCenter: parent.verticalCenter
                     anchors.right: localPill.visible ? localPill.left : pillBox.left
                     anchors.rightMargin: 8
-                    Heading { text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: parent.width }
+                    Row {
+                        width: parent.width
+                        spacing: 6
+                        Heading { id: nameText; text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - 16) }
+                        Text {
+                            text: row.infoShown ? "▾" : "▸"
+                            anchors.verticalCenter: nameText.verticalCenter
+                            color: Util.alpha(root.ink, 0.45)
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.caption
+                        }
+                    }
                     Label {
                         width: parent.width
                         elide: Text.ElideRight
@@ -486,6 +571,12 @@ Panel {
                                  + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : ""))
                         font.pixelSize: Style.font.caption
                     }
+                }
+                // Over the name and subtitle only; the pills and buttons keep their own clicks.
+                MouseArea {
+                    anchors.fill: nameCol
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.infoOpenId = row.infoShown ? "" : row.modelData.id
                 }
                 // Muted on purpose: local commits are information (a fork, a held fix),
                 // not a problem -- the state pill beside it carries any urgency.
@@ -588,6 +679,44 @@ Panel {
                         onClicked: row.confirmThen("remove", function() {
                             root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
                         })
+                    }
+                }
+            }
+
+            Column {
+                visible: row.infoShown
+                width: parent.width
+                spacing: 4
+                Repeater {
+                    model: row.infoShown ? Model.infoRows(row.modelData, root.now, root.home) : []
+                    Row {
+                        required property var modelData
+                        width: parent ? parent.width : 0
+                        spacing: 8
+                        Label { text: modelData[0]; width: 64; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.45) }
+                        Label { text: modelData[1]; width: parent.width - 72; wrapMode: Text.Wrap; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.8) }
+                    }
+                }
+                Row {
+                    spacing: 6
+                    topPadding: 2
+                    SmallButton {
+                        text: Model.shortUrl(row.info.webUrl).split("/").slice(0, 3).join("/") + " ↗"
+                        visible: !!row.info.webUrl
+                        accent: Color.muted
+                        onClicked: Qt.openUrlExternally(row.info.webUrl)
+                    }
+                    SmallButton {
+                        text: "Open folder"
+                        visible: !!row.info.path
+                        accent: Color.muted
+                        onClicked: Quickshell.execDetached(["setsid", "uwsm-app", "--", "nautilus", "--new-window", row.info.path])
+                    }
+                    SmallButton {
+                        text: "Terminal"
+                        visible: !!row.info.path
+                        accent: Color.muted
+                        onClicked: Quickshell.execDetached(["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--dir=" + row.info.path])
                     }
                 }
             }
@@ -905,24 +1034,66 @@ Panel {
                             SmallButton {
                                 text: root.addAppFormOpen ? "Cancel" : "+ Add app"
                                 accent: root.addAppFormOpen ? Color.urgent : Color.accent
-                                onClicked: root.addAppFormOpen = !root.addAppFormOpen
+                                onClicked: { root.addAppFormOpen = !root.addAppFormOpen; root.addAppNotes = [] }
                             }
 
                             Column {
                                 width: parent.width
                                 visible: root.addAppFormOpen
                                 spacing: 6
-                                FieldInput { placeholder: "Display name"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {name: text}) }
-                                FieldInput { placeholder: "id (lowercase, no spaces)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {id: text}) }
-                                FieldInput { placeholder: "Repo dir, e.g. /home/you/Projects/myapp"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {repoDir: text}) }
-                                FieldInput { placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
+                                // The repo comes first: Choose… or Fill in reads it and guesses the rest
+                                // (name, id, package from .SRCINFO, upstream branch and remote, rebuild.sh).
+                                Item {
+                                    width: parent.width
+                                    height: repoField.height
+                                    FieldInput {
+                                        id: repoField
+                                        anchors.left: parent.left
+                                        anchors.right: repoButtons.left
+                                        anchors.rightMargin: 6
+                                        placeholder: "Repo dir, e.g. /home/you/Projects/myapp"
+                                        onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {repoDir: text})
+                                    }
+                                    Row {
+                                        id: repoButtons
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        spacing: 6
+                                        SmallButton {
+                                            text: "Choose…"
+                                            accent: Color.muted
+                                            enabled: !repoProc.running
+                                            onClicked: { repoProc.command = ["python3", root.helper, "pick-folder"]; repoProc.running = true }
+                                        }
+                                        SmallButton {
+                                            text: "Fill in"
+                                            accent: Color.muted
+                                            enabled: !repoProc.running && repoField.text.length > 0
+                                            onClicked: { repoProc.command = ["python3", root.helper, "inspect-repo", repoField.text]; repoProc.running = true }
+                                        }
+                                    }
+                                }
+                                FieldInput { id: nameField; placeholder: "Display name"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {name: text}) }
+                                FieldInput { id: idField; placeholder: "id (lowercase, no spaces)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {id: text}) }
+                                FieldInput { id: pkgField; placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
                                 Row {
                                     width: parent.width
                                     spacing: 6
-                                    FieldInput { width: (parent.width - 6) / 2; placeholder: "Branch (default master)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {branch: text}) }
-                                    FieldInput { width: (parent.width - 6) / 2; placeholder: "Remote (default origin)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {remote: text}) }
+                                    FieldInput { id: branchField; width: (parent.width - 6) / 2; placeholder: "Upstream branch (default master)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {branch: text}) }
+                                    FieldInput { id: remoteField; width: (parent.width - 6) / 2; placeholder: "Remote (default origin)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {remote: text}) }
                                 }
-                                FieldInput { text: "./rebuild.sh --install"; placeholder: "Update command"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
+                                FieldInput { id: cmdField; text: "./rebuild.sh --install"; placeholder: "Update command (builds and installs it)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
+                                Repeater {
+                                    model: root.addAppNotes
+                                    Label {
+                                        required property var modelData
+                                        width: parent ? parent.width : 0
+                                        wrapMode: Text.WordWrap
+                                        text: "· " + modelData
+                                        font.pixelSize: Style.font.caption
+                                        color: Color.urgent
+                                    }
+                                }
                                 SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
                             }
                         }

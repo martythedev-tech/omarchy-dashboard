@@ -627,16 +627,58 @@ def installed_older_than(installed, built):
         return False
 
 
+def web_url(remote_url):
+    """A browser link for a git remote, or '' if it is not one a browser can open. Never
+    carries credentials: an https remote can hold a token (https://user:token@host/...),
+    and this ends up in status.json and on screen."""
+    url = (remote_url or '').strip()
+    m = re.match(r'^[\w.-]+@([\w.-]+):(.+)$', url)                     # git@host:owner/repo
+    if m:
+        host, path = m.group(1), m.group(2)
+    else:
+        m = re.match(r'^(?:https?|ssh|git)://(?:[^@/]+@)?([\w.-]+)(?::\d+)?/(.+)$', url)
+        if not m:
+            return ''
+        host, path = m.group(1), m.group(2)
+    path = re.sub(r'\.git/?$', '', path.strip('/'))
+    if host == 'aur.archlinux.org':                                   # the package page, not the git
+        return f'https://aur.archlinux.org/packages/{path}'
+    return f'https://{host}/{path}'
+
+
+def repo_info(repo_dir, remote, upstream_ref):
+    """What the expanded row shows: where the checkout is, which branch it is on, a link to
+    its source, and when upstream last committed. upstream_ref is None when upstream was
+    never reached this check."""
+    repo_dir = str(repo_dir)
+    info = {'path': repo_dir, 'branch': '', 'webUrl': '', 'upstreamTs': 0}
+    if not (Path(repo_dir) / '.git').exists():
+        return info
+    rc, out, _ = run(['git', '-C', repo_dir, 'rev-parse', '--abbrev-ref', 'HEAD'])
+    if rc == 0:
+        info['branch'] = out.strip()
+    rc, out, _ = run(['git', '-C', repo_dir, 'remote', 'get-url', remote])
+    if rc == 0:
+        info['webUrl'] = web_url(out)
+    if upstream_ref:
+        rc, out, _ = run(['git', '-C', repo_dir, 'log', '-1', '--format=%ct', upstream_ref])
+        if rc == 0 and out.strip().isdigit():
+            info['upstreamTs'] = int(out.strip())
+    return info
+
+
 def check_plugin(p):
     pid = p['id']
     plugin_dir = PLUGINS_DIR / pid
     state, behind, reason = plugin_update_state(plugin_dir)
-    ahead = 0 if state in NO_COMPARISON_STATES else local_commit_count(plugin_dir, 'FETCH_HEAD')
+    compared = state not in NO_COMPARISON_STATES
+    ahead = local_commit_count(plugin_dir, 'FETCH_HEAD') if compared else 0
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
         'version': manifest_version(pid), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
+        'info': repo_info(plugin_dir, 'origin', 'FETCH_HEAD' if compared else None),
     }
 
 
@@ -652,11 +694,13 @@ def check_app(a):
         built = srcinfo_version(a['repoDir'])
         if built and installed_older_than(version, built):
             state, reason = 'not-installed', f'repo has {built}, installed is {version}'
-    ahead = 0 if state in NO_COMPARISON_STATES else local_commit_count(a['repoDir'], f'{remote}/{branch}')
+    compared = state not in NO_COMPARISON_STATES
+    ahead = local_commit_count(a['repoDir'], f'{remote}/{branch}') if compared else 0
     return {
         'id': a['id'], 'kind': 'app', 'name': a.get('name', a['id']),
         'version': version,
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
+        'info': repo_info(a['repoDir'], remote, f'{remote}/{branch}' if compared else None),
     }
 
 
@@ -1055,9 +1099,14 @@ def cmd_add_app(args):
     if not (Path(repo_dir).expanduser() / '.git').is_dir():
         print(json.dumps({'ok': False, 'message': repo_dir + ' is not a git repository.'}))
         return
-    update_cmd = fields.get('updateCmd') or ['./rebuild.sh', '--install']
+    # Missing means the default; given but empty (the form's field cleared, or a repo with
+    # no rebuild.sh) is an error rather than a silent rebuild.sh that may not exist.
+    update_cmd = fields.get('updateCmd', ['./rebuild.sh', '--install'])
     if isinstance(update_cmd, str):
         update_cmd = update_cmd.split()
+    if not update_cmd:
+        print(json.dumps({'ok': False, 'message': 'An update command is required: the one that builds and installs it.'}))
+        return
     entry = {
         'id': app_id, 'name': name, 'repoDir': repo_dir,
         'pkgName': str(fields.get('pkgName') or app_id),
@@ -1071,6 +1120,71 @@ def cmd_add_app(args):
     save_apps(apps)
     print(json.dumps({'ok': True, 'message': 'Added ' + name + '.'}))
     check_all()
+
+
+def inspect_repo(repo_dir):
+    """Best guesses for the Add app form from the repo itself, so only what cannot be
+    guessed needs typing: (fields, notes), or (None, [why not]) if it is not a git repo."""
+    repo = Path(repo_dir).expanduser()
+    if not (repo / '.git').exists():
+        return None, [f'{repo} is not a git repository.']
+    notes = []
+    base = re.sub(r'[^a-z0-9._-]+', '-', repo.name.lower()).strip('-') or 'app'
+    fields = {'name': repo.name[:1].upper() + repo.name[1:], 'id': base, 'repoDir': str(repo),
+              'pkgName': base, 'branch': '', 'remote': '', 'updateCmd': ''}
+    srcinfo = {}
+    try:
+        for line in (repo / '.SRCINFO').read_text().splitlines():
+            key, sep, value = line.strip().partition(' = ')
+            if sep and key in ('pkgbase', 'pkgname') and key not in srcinfo:
+                srcinfo[key] = value.strip()
+    except (OSError, UnicodeDecodeError):
+        notes.append('No .SRCINFO: the installed version will not be compared with the repo.')
+    if srcinfo:
+        fields['pkgName'] = srcinfo.get('pkgname') or srcinfo.get('pkgbase')
+    rc, out, _ = run(['git', '-C', str(repo), 'remote'])
+    remotes = out.split() if rc == 0 else []
+    if not remotes:
+        notes.append('No git remote: there is nothing to check for updates against.')
+    else:
+        fields['remote'] = 'origin' if 'origin' in remotes else remotes[0]
+        # The branch that tracks upstream (Flea: master, tracking the AUR), not
+        # necessarily the one checked out (Flea: aarch64-local, our patches on top).
+        rc, out, _ = run(['git', '-C', str(repo), 'symbolic-ref', '--short', f"refs/remotes/{fields['remote']}/HEAD"])
+        if rc == 0 and out.strip():
+            fields['branch'] = out.strip().split('/', 1)[-1]
+        else:
+            for candidate in ('master', 'main'):
+                if run(['git', '-C', str(repo), 'rev-parse', '--verify', '--quiet', candidate])[0] == 0:
+                    fields['branch'] = candidate
+                    break
+    if os.access(repo / 'rebuild.sh', os.X_OK):
+        fields['updateCmd'] = './rebuild.sh --install'
+    else:
+        notes.append('No executable rebuild.sh: enter the command that builds and installs it.')
+    if fields['id'] in {a.get('id') for a in load_apps()}:
+        notes.append(f"An app with id {fields['id']} is already tracked; saving replaces it.")
+    return fields, notes
+
+
+def cmd_inspect_repo(args):
+    ensure_apps_file()
+    fields, notes = inspect_repo(args.dir)
+    print(json.dumps({'ok': fields is not None, 'fields': fields or {}, 'notes': notes}))
+
+
+def cmd_pick_folder(args):
+    """The desktop's own folder chooser (the FileChooser portal, via omarchy-file-select)
+    in a process of its own -- Qt's FileDialog inside the shell has aborted the whole
+    shell before (omamail's attachment picker) -- then the same guesses as inspect-repo."""
+    ensure_apps_file()
+    rc, out, err = run(['omarchy-file-select', '--title', 'Choose the app\'s git repo', '--directory'], timeout=600)
+    path = out.strip().splitlines()[0] if rc == 0 and out.strip() else ''
+    if not path:
+        print(json.dumps({'ok': False, 'cancelled': rc == 0 or not err.strip(), 'notes': [err.strip()] if err.strip() else []}))
+        return
+    fields, notes = inspect_repo(path)
+    print(json.dumps({'ok': fields is not None, 'fields': fields or {'repoDir': path}, 'notes': notes}))
 
 
 def cmd_remove_app(args):
@@ -1092,6 +1206,8 @@ def main():
     for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app', 'rollback', 'unhold'):
         p = sub.add_parser(name)
         p.add_argument('id')
+    sub.add_parser('inspect-repo').add_argument('dir')
+    sub.add_parser('pick-folder')
     p_await = sub.add_parser('await-notification')
     p_await.add_argument('title')
     p_await.add_argument('body')
@@ -1107,6 +1223,7 @@ def main():
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
         'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
         'await-notification': cmd_await_notification,
+        'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
     }
     handlers[args.command](args)
 

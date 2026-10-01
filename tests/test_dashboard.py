@@ -1441,3 +1441,161 @@ class UpdateLoadCheckTests(RealRepoFixture):
         self.assertFalse(result['ok'])
         self.assertIn('could not load it', result['message'])
         self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+
+
+class WebUrlTests(unittest.TestCase):
+    def test_forms(self):
+        cases = {
+            'git@github.com:nixfred/pulse.git': 'https://github.com/nixfred/pulse',
+            'https://github.com/martythedev-tech/omamail.git': 'https://github.com/martythedev-tech/omamail',
+            'https://github.com/martythedev-tech/omamail': 'https://github.com/martythedev-tech/omamail',
+            'ssh://git@gitlab.com:2222/group/sub/repo.git': 'https://gitlab.com/group/sub/repo',
+            'https://aur.archlinux.org/flea.git': 'https://aur.archlinux.org/packages/flea',
+            'ssh://aur@aur.archlinux.org/howdy.git': 'https://aur.archlinux.org/packages/howdy',
+            '/home/x/mirror.git': '',
+            '': '',
+        }
+        for remote, expected in cases.items():
+            self.assertEqual(dash.web_url(remote), expected, remote)
+
+    def test_credentials_never_survive(self):
+        url = dash.web_url('https://martythedev-tech:ghp_SECRETTOKEN@github.com/martythedev-tech/omamail.git')
+        self.assertEqual(url, 'https://github.com/martythedev-tech/omamail')
+        self.assertNotIn('SECRET', url)
+
+
+class RepoGuessFixture(unittest.TestCase):
+    """A real repo with a real remote, so remote/branch guessing runs actual git."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.upstream = root / 'upstream'
+        self.upstream.mkdir()
+        git(self.upstream, 'init', '-q', '-b', 'master')
+        git(self.upstream, 'config', 'user.email', 't@t'); git(self.upstream, 'config', 'user.name', 't')
+        (self.upstream / '.SRCINFO').write_text('pkgbase = flea-bin\n\tpkgver = 1\n\tpkgrel = 1\n\npkgname = flea\n')
+        git(self.upstream, 'add', '.'); git(self.upstream, 'commit', '-qm', 'one')
+        self.repo = root / 'Flea'
+        import subprocess
+        subprocess.run(['git', 'clone', '-q', str(self.upstream), str(self.repo)], check=True)
+        git(self.repo, 'checkout', '-qb', 'aarch64-local')
+        for target, value in (('load_apps', lambda: []), ('ensure_apps_file', lambda: None)):
+            patcher = patch.object(dash, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
+class InspectRepoTests(RepoGuessFixture):
+    def test_guesses_from_srcinfo_remote_and_upstream_branch(self):
+        rebuild = self.repo / 'rebuild.sh'
+        rebuild.write_text('#!/bin/sh\n'); rebuild.chmod(0o755)
+        fields, notes = dash.inspect_repo(str(self.repo))
+        self.assertEqual(fields, {'name': 'Flea', 'id': 'flea', 'repoDir': str(self.repo), 'pkgName': 'flea',
+                                  'branch': 'master', 'remote': 'origin', 'updateCmd': './rebuild.sh --install'})
+        self.assertEqual(notes, [])
+
+    def test_upstream_branch_without_origin_head_falls_back_to_an_existing_master_or_main(self):
+        git(self.repo, 'remote', 'set-head', 'origin', '--delete')
+        self.assertEqual(dash.inspect_repo(str(self.repo))[0]['branch'], 'master')
+
+    def test_what_cannot_be_guessed_is_said(self):
+        (self.repo / '.SRCINFO').unlink()
+        fields, notes = dash.inspect_repo(str(self.repo))
+        self.assertEqual(fields['updateCmd'], '')
+        self.assertEqual(fields['pkgName'], 'flea')
+        self.assertTrue(any('.SRCINFO' in n for n in notes))
+        self.assertTrue(any('rebuild.sh' in n for n in notes))
+
+    def test_a_non_executable_rebuild_sh_is_not_offered(self):
+        (self.repo / 'rebuild.sh').write_text('#!/bin/sh\n')
+        self.assertEqual(dash.inspect_repo(str(self.repo))[0]['updateCmd'], '')
+
+    def test_already_tracked_is_said(self):
+        with patch.object(dash, 'load_apps', lambda: [{'id': 'flea'}]):
+            self.assertTrue(any('already tracked' in n for n in dash.inspect_repo(str(self.repo))[1]))
+
+    def test_not_a_repo(self):
+        fields, notes = dash.inspect_repo(self._tmp.name)
+        self.assertIsNone(fields)
+        self.assertIn('not a git repository', notes[0])
+
+    def test_no_remote_is_said(self):
+        git(self.repo, 'remote', 'remove', 'origin')
+        fields, notes = dash.inspect_repo(str(self.repo))
+        self.assertEqual((fields['remote'], fields['branch']), ('', ''))
+        self.assertTrue(any('No git remote' in n for n in notes))
+
+
+class RepoInfoTests(RepoGuessFixture):
+    def test_branch_link_and_upstream_date(self):
+        git(self.repo, 'remote', 'set-url', 'origin', 'https://user:tok@aur.archlinux.org/flea.git')
+        info = dash.repo_info(self.repo, 'origin', 'origin/master')
+        self.assertEqual(info['branch'], 'aarch64-local')
+        self.assertEqual(info['webUrl'], 'https://aur.archlinux.org/packages/flea')
+        self.assertEqual(info['path'], str(self.repo))
+        self.assertGreater(info['upstreamTs'], 0)
+
+    def test_no_upstream_date_when_upstream_was_not_compared(self):
+        self.assertEqual(dash.repo_info(self.repo, 'origin', None)['upstreamTs'], 0)
+
+    def test_not_a_repo_is_just_the_path(self):
+        self.assertEqual(dash.repo_info(self._tmp.name, 'origin', 'origin/master'),
+                         {'path': self._tmp.name, 'branch': '', 'webUrl': '', 'upstreamTs': 0})
+
+
+class PickFolderTests(RepoGuessFixture):
+    def pick(self, rc, out, err=''):
+        printed = []
+        real = dash.run
+        def fake(args, **kw):
+            if args[0] == 'omarchy-file-select':
+                self.assertIn('--directory', args)
+                return (rc, out, err)
+            return real(args, **kw)
+        with patch.object(dash, 'run', fake), patch('builtins.print', lambda *a, **k: printed.append(json.loads(a[0]))):
+            dash.cmd_pick_folder(None)
+        return printed[-1]
+
+    def test_a_chosen_repo_is_inspected(self):
+        r = self.pick(0, str(self.repo) + '\n')
+        self.assertTrue(r['ok'])
+        self.assertEqual(r['fields']['pkgName'], 'flea')
+
+    def test_cancel_is_quiet(self):
+        r = self.pick(0, '')
+        self.assertEqual((r['ok'], r['cancelled']), (False, True))
+
+    def test_a_portal_error_is_reported_not_treated_as_cancel(self):
+        r = self.pick(1, '', 'No FileChooser portal')
+        self.assertFalse(r['cancelled'])
+        self.assertIn('No FileChooser portal', r['notes'][0])
+
+    def test_a_chosen_folder_that_is_not_a_repo_keeps_the_path(self):
+        r = self.pick(0, self._tmp.name + '\n')
+        self.assertFalse(r['ok'])
+        self.assertEqual(r['fields'], {'repoDir': self._tmp.name})
+
+
+class AddAppUpdateCommandTests(RepoGuessFixture):
+    def add(self, **fields):
+        printed = []
+        saved = []
+        base = {'name': 'Flea', 'id': 'flea', 'repoDir': str(self.repo)}
+        base.update(fields)
+        with patch.object(dash, 'save_apps', saved.append), patch.object(dash, 'check_all'), \
+             patch('builtins.print', lambda *a, **k: printed.append(json.loads(a[0]))):
+            dash.cmd_add_app(type('A', (), {'json': json.dumps(base)})())
+        return printed[-1], saved
+
+    def test_an_empty_update_command_is_refused(self):
+        r, saved = self.add(updateCmd='')
+        self.assertFalse(r['ok'])
+        self.assertIn('update command is required', r['message'])
+        self.assertEqual(saved, [])
+
+    def test_a_missing_one_still_defaults_to_rebuild_sh(self):
+        r, saved = self.add()
+        self.assertTrue(r['ok'])
+        self.assertEqual(saved[0][-1]['updateCmd'], ['./rebuild.sh', '--install'])

@@ -179,4 +179,38 @@ assert.equal(ctx.historyMark({ok: true, action: 'update'}), '✓');
 assert.equal(ctx.historyMark({ok: true, action: 'rollback'}), '↩');
 assert.equal(ctx.historyMark({ok: false, action: 'update'}), '✗');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits and history all pass.');
+// statusRank / groupByKind order: needs-a-person, then updatable, then unreachable, then the rest
+var g = ctx.groupByKind([
+    {kind: 'plugin', name: 'A', updateState: 'up-to-date'},
+    {kind: 'plugin', name: 'B', updateState: 'behind', behind: 1},
+    {kind: 'plugin', name: 'C', updateState: 'dirty'},
+    {kind: 'plugin', name: 'D', updateState: 'unreachable'},
+    {kind: 'plugin', name: 'E', updateState: 'behind', held: true},
+    {kind: 'plugin', name: 'F', updateState: 'diverged'},
+    {kind: 'app', name: 'Alpha', updateState: 'up-to-date'},
+    {kind: 'app', name: 'Zeta', updateState: 'not-installed'},
+]);
+assert.deepEqual(JSON.parse(JSON.stringify(g.plugins.map(function (x) { return x.name }))), ['C', 'F', 'B', 'D', 'A', 'E']);
+assert.deepEqual(JSON.parse(JSON.stringify(g.apps.map(function (x) { return x.name }))), ['Zeta', 'Alpha']);
+
+// infoRows / shortUrl
+var rows = ctx.infoRows({updateState: 'up-to-date', ahead: 92, held: true, holdReason: 'rolled back from v2',
+                         info: {branch: 'ews-support', upstreamTs: 1000, path: '/home/ali/.config/omarchy/plugins/omamail', webUrl: 'x'}},
+                        1000 + 3 * 86400, '/home/ali');
+assert.deepEqual(JSON.parse(JSON.stringify(rows)), [
+    ['Status', 'Up to date · held (rolled back from v2) · 92 local commits'],
+    ['Branch', 'ews-support'],
+    ['Upstream', 'last commit 3 days ago'],
+    ['Folder', '~/.config/omarchy/plugins/omamail']]);
+assert.deepEqual(JSON.parse(JSON.stringify(ctx.infoRows({updateState: 'no-repo', info: {path: '/opt/x'}}, 0, '/home/ali'))),
+                 [['Status', 'No update source'], ['Folder', '/opt/x']]);
+assert.equal(ctx.infoRows(null).length, 0);
+assert.equal(ctx.shortUrl('https://aur.archlinux.org/packages/flea'), 'aur.archlinux.org/packages/flea');
+
+// queueSummary
+assert.equal(ctx.queueSummary([{id: 'a', name: 'A', ok: true}, {id: 'b', name: 'B', ok: false}, {id: 'c', name: 'C', ok: true}]),
+             'Update all: 2 updated, 1 failed (B).');
+assert.equal(ctx.queueSummary([{id: 'a', name: 'A', ok: true}]), 'Update all: 1 updated.');
+assert.equal(ctx.queueSummary([]), '');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary all pass.');
