@@ -1198,6 +1198,7 @@ class HoldTests(RealRepoFixture):
         self.assertIsNone(ids['other']['rollback'])
         self.assertNotIn('notify-send', [c[0] for c in self.calls])
         self.assertEqual(status['history'][0]['action'], 'update')
+        self.assertEqual(status['history'][0]['name'], 'X', 'the display name, not the id')
 
 
 class GitLogTests(RealRepoFixture):

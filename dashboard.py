@@ -833,6 +833,7 @@ def check_all():
     holds = load_holds()
     history = load_history()
     now = time.time()
+    display_names = {i['id']: i.get('name') for i in items}
     for item in items:
         item['held'] = item['id'] in holds
         item['holdReason'] = holds.get(item['id'], {}).get('reason', '')
@@ -843,8 +844,11 @@ def check_all():
         'ts': now,
         'items': items,
         'updatable': sum(1 for i in items if alerts(i)),
-        'history': [{k: e.get(k) for k in ('id', 'name', 'kind', 'action', 'ok', 'fromVersion',
-                                            'toVersion', 'ts', 'message')}
+        # Plugin entries were recorded under their id (cmd_update knows no display name), so
+        # Recent read "com.omastorm.radar updated"; show the name the rows use instead.
+        'history': [dict({k: e.get(k) for k in ('id', 'name', 'kind', 'action', 'ok', 'fromVersion',
+                                                 'toVersion', 'ts', 'message')},
+                         name=display_names.get(e.get('id')) or e.get('name') or e.get('id'))
                     for e in reversed(history[-HISTORY_SHOWN:])],
     }
     notify_new_updates(items, old_behind_ids)

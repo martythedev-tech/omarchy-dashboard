@@ -235,7 +235,11 @@ function historyLine(e, nowSeconds) {
     var versions = e.fromVersion && e.toVersion && e.fromVersion !== e.toVersion ? ' ' + e.fromVersion + ' → ' + e.toVersion : ''
     var what
     if (e.action === 'rollback') what = (e.ok ? 'rolled back' : 'rollback failed') + versions
-    else what = e.ok ? (versions ? 'updated' + versions : 'rebuilt, no version change') : 'update failed'
+    // Same version: an app's update really did rebuild and reinstall it; a plugin's only
+    // pulled commits that left the version alone (docs, tooling).
+    else if (!e.ok) what = 'update failed'
+    else if (versions) what = 'updated' + versions
+    else what = e.kind === 'app' ? 'rebuilt, no version change' : 'updated, same version'
     return name + ' ' + what + ' · ' + relativeAge(e.ts, nowSeconds)
 }
 
