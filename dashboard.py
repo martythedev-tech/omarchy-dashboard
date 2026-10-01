@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SELF_ID = 'martythedev-tech.dashboard'
@@ -51,6 +52,13 @@ UNIT_SKIP_DIRS = {'.git', 'tests', 'docs', 'node_modules', '__pycache__'}
 # reloaded to find it (the widget's file watch is set up at load, and a file that did not
 # exist then is never noticed).
 UNIT_SETTLE_SECONDS = 8
+# Every item's check is a network fetch with its own 20 s timeout. One at a time, a dozen
+# items took ~8 s on a good connection and would take minutes offline; side by side the
+# whole check costs about as long as the slowest single fetch.
+CHECK_WORKERS = 8
+# The states an Update click can act on: 'behind' pulls new commits, 'not-installed'
+# builds and installs what the repo already has (an app's updateCmd does both).
+UPDATABLE_STATES = ('behind', 'not-installed')
 
 # Seeded into APPS_PATH the first time it's missing; from then on the file on
 # disk is what's read; edit it there (or via the "+ Add app" form) to add or
@@ -413,14 +421,56 @@ def app_update_state(repo_dir, branch, remote):
     return 'behind', behind, ''
 
 
+def local_commit_count(repo_dir, upstream_ref):
+    """Commits on HEAD that upstream_ref does not have. 'up-to-date' and 'behind' say
+    nothing about these on their own, so a fork carrying its own work (omamail's
+    ews-support, 92 commits) or a held local fix (Power Pulse's, 1) read as plain
+    CURRENT, the same as an untouched checkout."""
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'rev-list', '--count', f'{upstream_ref}..HEAD'])
+    return int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+
+
+# States in which upstream was never compared, so there is no ahead count to give.
+NO_COMPARISON_STATES = ('no-repo', 'unreachable', 'in-progress')
+
+
+def srcinfo_version(repo_dir):
+    """'[epoch:]pkgver-pkgrel' as the repo's .SRCINFO declares it, or '' if it has none.
+    Read from .SRCINFO rather than by sourcing PKGBUILD, which is a shell script."""
+    try:
+        text = (Path(repo_dir) / '.SRCINFO').read_text()
+    except (OSError, UnicodeDecodeError):
+        return ''
+    fields = {}
+    for line in text.splitlines():
+        key, sep, value = line.strip().partition(' = ')
+        if sep and key in ('pkgver', 'pkgrel', 'epoch') and key not in fields:
+            fields[key] = value.strip()
+    if not fields.get('pkgver') or not fields.get('pkgrel'):
+        return ''
+    epoch = fields.get('epoch')
+    return (epoch + ':' if epoch and epoch != '0' else '') + fields['pkgver'] + '-' + fields['pkgrel']
+
+
+def installed_older_than(installed, built):
+    """pacman's own version ordering (vercmp), not string comparison: 0.3.10 > 0.3.9."""
+    rc, out, _ = run(['vercmp', installed, built], timeout=5)
+    try:
+        return rc == 0 and int(out.strip()) < 0
+    except ValueError:
+        return False
+
+
 def check_plugin(p):
     pid = p['id']
-    state, behind, reason = plugin_update_state(PLUGINS_DIR / pid)
+    plugin_dir = PLUGINS_DIR / pid
+    state, behind, reason = plugin_update_state(plugin_dir)
+    ahead = 0 if state in NO_COMPARISON_STATES else local_commit_count(plugin_dir, 'FETCH_HEAD')
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
         'version': manifest_version(pid), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
-        'updateState': state, 'behind': behind, 'reason': reason,
+        'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
     }
 
 
@@ -428,17 +478,26 @@ def check_app(a):
     branch = a.get('branch', 'master')
     remote = a.get('remote', 'origin')
     state, behind, reason = app_update_state(a['repoDir'], branch, remote)
+    version = pkg_version(a.get('pkgName', a['id']))
+    # The git check only says the SOURCE is current. After a merge whose build or install
+    # never ran (sudo prompt, failed makepkg), the installed package is still the old one
+    # and this row used to say "up to date" regardless (2026-09-21, Flea 0.3.0-1 vs 0.3.1-2).
+    if state == 'up-to-date' and version:
+        built = srcinfo_version(a['repoDir'])
+        if built and installed_older_than(version, built):
+            state, reason = 'not-installed', f'repo has {built}, installed is {version}'
+    ahead = 0 if state in NO_COMPARISON_STATES else local_commit_count(a['repoDir'], f'{remote}/{branch}')
     return {
         'id': a['id'], 'kind': 'app', 'name': a.get('name', a['id']),
-        'version': pkg_version(a.get('pkgName', a['id'])),
-        'updateState': state, 'behind': behind, 'reason': reason,
+        'version': version,
+        'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
     }
 
 
 def _previously_behind_ids():
     try:
         data = json.loads(STATUS_PATH.read_text())
-        return {i['id'] for i in data.get('items', []) if i.get('updateState') == 'behind'}
+        return {i['id'] for i in data.get('items', []) if i.get('updateState') in UPDATABLE_STATES}
     except (OSError, ValueError):
         return set()
 
@@ -448,7 +507,7 @@ def notify_new_updates(items, old_behind_ids):
     the last check -- not a repeat every cycle for something that's been
     sitting there, and not for 'dirty'/'diverged', which need a person
     regardless of how many checks go by."""
-    newly = [i for i in items if i['updateState'] == 'behind' and i['id'] not in old_behind_ids]
+    newly = [i for i in items if i['updateState'] in UPDATABLE_STATES and i['id'] not in old_behind_ids]
     if not newly:
         return
     names = ', '.join(i['name'] for i in newly[:5])
@@ -461,11 +520,14 @@ def notify_new_updates(items, old_behind_ids):
 
 def check_all():
     old_behind_ids = _previously_behind_ids()
-    items = [check_plugin(p) for p in discover_plugins()] + [check_app(a) for a in load_apps()]
+    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
+        jobs = [pool.submit(check_plugin, p) for p in discover_plugins()] + \
+               [pool.submit(check_app, a) for a in load_apps()]
+        items = [job.result() for job in jobs]
     status = {
         'ts': time.time(),
         'items': items,
-        'updatable': sum(1 for i in items if i['updateState'] == 'behind'),
+        'updatable': sum(1 for i in items if i['updateState'] in UPDATABLE_STATES),
     }
     notify_new_updates(items, old_behind_ids)
     STATE.mkdir(parents=True, exist_ok=True)
@@ -562,7 +624,13 @@ def cmd_diff(args):
         a = apps[args.id]
         branch = a.get('branch', 'master')
         remote_ref = f"{a.get('remote', 'origin')}/{branch}"
-        rc, out, err = run(['git', '-C', a['repoDir'], 'diff', branch, remote_ref], timeout=20)
+        # Diff from the same base app_update_state counted 'behind' from: `branch`, unless it
+        # already has upstream and only the checked-out branch (Flea's aarch64-local) lacks
+        # it -- diffing `branch` there was empty. Three dots: only upstream's side of the
+        # change, not our own local commits shown as if upstream would delete them.
+        rc, _, _ = run(['git', '-C', a['repoDir'], 'merge-base', '--is-ancestor', remote_ref, branch])
+        base = 'HEAD' if rc == 0 else branch
+        rc, out, err = run(['git', '-C', a['repoDir'], 'diff', f'{base}...{remote_ref}'], timeout=20)
     else:
         rc, out, err = run(['git', '-C', str(PLUGINS_DIR / args.id), 'diff', 'HEAD', 'FETCH_HEAD'], timeout=20)
     if rc != 0:

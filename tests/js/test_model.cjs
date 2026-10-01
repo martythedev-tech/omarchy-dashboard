@@ -127,4 +127,21 @@ assert.equal(ctx.relativeAge(now - 7200, now), '2 hours ago');
 assert.equal(ctx.relativeAge(now - 86400, now), '1 day ago');
 assert.equal(ctx.relativeAge(now - 172800, now), '2 days ago');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, and relativeAge buckets all pass.');
+
+// not-installed: an app whose repo is current but whose package is older
+assert.equal(ctx.canUpdate({updateState: 'not-installed'}), true);
+assert.equal(ctx.canShowDiff({updateState: 'not-installed'}), false);
+assert.equal(ctx.badgeCount([{updateState: 'not-installed'}, {updateState: 'behind'}]), 2);
+assert.equal(ctx.pillLabel({kind: 'app', updateState: 'not-installed'}), 'NOT INSTALLED');
+assert.equal(ctx.stripeKey({kind: 'app', updateState: 'not-installed'}), 'behind');
+assert.equal(ctx.stateLabel({updateState: 'not-installed', reason: 'repo has 0.3.1-2, installed is 0.3.0-1'}),
+             'Built, not installed (repo has 0.3.1-2, installed is 0.3.0-1)');
+
+// localTag
+assert.equal(ctx.localTag({updateState: 'up-to-date', ahead: 92}), '+92 LOCAL');
+assert.equal(ctx.localTag({updateState: 'behind', ahead: 1}), '+1 LOCAL');
+assert.equal(ctx.localTag({updateState: 'diverged', ahead: 1}), '');
+assert.equal(ctx.localTag({updateState: 'up-to-date', ahead: 0}), '');
+assert.equal(ctx.localTag({updateState: 'up-to-date'}), '');
+assert.equal(ctx.localTag(null), '');
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed and localTag all pass.');
