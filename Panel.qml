@@ -427,7 +427,7 @@ Panel {
                     id: nameCol
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    anchors.right: pillBox.left
+                    anchors.right: localPill.visible ? localPill.left : pillBox.left
                     anchors.rightMargin: 8
                     Heading { text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: parent.width }
                     Label {
@@ -437,8 +437,34 @@ Panel {
                               ? (Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s")
                               : ((row.modelData.version ? "v" + row.modelData.version : "no version")
                                  + (row.modelData.kind === "app" ? " · app" : "")
-                                 + (row.isSelf ? " · this widget" : ""))
+                                 + (row.isSelf ? " · this widget" : "")
+                                 + (row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : ""))
                         font.pixelSize: Style.font.caption
+                    }
+                }
+                // Muted on purpose: local commits are information (a fork, a held fix),
+                // not a problem -- the state pill beside it carries any urgency.
+                Rectangle {
+                    id: localPill
+                    readonly property string label: Model.localTag(row.modelData)
+                    visible: label !== "" && !row.busy
+                    anchors.right: pillBox.left
+                    anchors.rightMargin: 6
+                    anchors.verticalCenter: parent.verticalCenter
+                    implicitWidth: localPillText.implicitWidth + 12
+                    implicitHeight: 18
+                    radius: 9
+                    color: "transparent"
+                    border.color: Util.alpha(root.ink, 0.3)
+                    Text {
+                        id: localPillText
+                        anchors.centerIn: parent
+                        text: localPill.label
+                        color: Util.alpha(root.ink, 0.62)
+                        font.family: Style.font.family
+                        font.pixelSize: 9
+                        font.bold: true
+                        textFormat: Text.PlainText
                     }
                 }
                 Rectangle {

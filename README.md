@@ -42,6 +42,18 @@ never shows data older than that. Any item that just became updatable since
 the last check (not one that's been sitting there) fires a desktop
 notification via `notify-send`.
 
+## What the row tells you
+
+- **+N LOCAL**: the checkout carries N commits upstream does not have -- a fork you
+  maintain, or a local fix you are holding. Shown next to CURRENT or BEHIND so it is not
+  mistaken for an untouched install.
+- **NOT INSTALLED** (apps): the repo is current but the installed package is older than
+  the version its `.SRCINFO` builds -- an update whose build or install step never ran.
+  Update runs the app's `updateCmd`, which builds and installs it.
+
+Checks run side by side, so a full check takes about as long as the slowest single
+fetch rather than the sum of them.
+
 ## Extra actions
 
 - **Diff**: for anything `behind` or `diverged`, shows `git diff` against

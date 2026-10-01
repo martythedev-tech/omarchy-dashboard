@@ -288,6 +288,7 @@ class DiscoverPluginsTests(unittest.TestCase):
 
 class CheckAllTests(unittest.TestCase):
     def test_aggregates_and_counts_only_behind_as_updatable(self):
+        # plugin_update_state is keyed by directory, not call order: the checks run concurrently.
         with tempfile.TemporaryDirectory() as d:
             home = Path(d)
             with patch.object(Path, 'home', return_value=home), \
@@ -300,7 +301,9 @@ class CheckAllTests(unittest.TestCase):
                  ]), \
                  patch.object(dash, 'manifest_version', return_value='1.0.0'), \
                  patch.object(dash, 'pkg_version', return_value='0.1.6'), \
-                 patch.object(dash, 'plugin_update_state', side_effect=[('behind', 2, ''), ('up-to-date', 0, '')]), \
+                 patch.object(dash, 'plugin_update_state',
+                              side_effect=lambda d: {'a.plugin': ('behind', 2, ''),
+                                                     'b.plugin': ('up-to-date', 0, '')}[Path(d).name]), \
                  patch.object(dash, 'app_update_state', return_value=('dirty', 1, '')), \
                  patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
                 dash.PLUGINS_DIR = home / '.config/omarchy/plugins'
@@ -316,11 +319,116 @@ class CheckAllTests(unittest.TestCase):
             self.assertTrue(dash.STATUS_PATH.exists())
             # No prior status.json existed, so 'a.plugin' becoming 'behind' is
             # new -- notify-send should have fired once.
-            self.assertEqual(run_mock.call_count, 1)
-            self.assertEqual(run_mock.call_args.args[0][0], 'notify-send')
+            notifies = [c for c in run_mock.call_args_list if c.args[0][0] == 'notify-send']
+            self.assertEqual(len(notifies), 1)
+
+
+class LocalCommitsAndInstalledVersionTests(unittest.TestCase):
+    def test_local_commit_count_parses_rev_list(self):
+        with patch.object(dash, 'run', fake_run({('git', '-C', '/r', 'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '92\n', '')})):
+            self.assertEqual(dash.local_commit_count('/r', 'FETCH_HEAD'), 92)
+
+    def test_local_commit_count_is_zero_on_failure(self):
+        with patch.object(dash, 'run', return_value=(128, '', 'fatal: bad revision')):
+            self.assertEqual(dash.local_commit_count('/r', 'FETCH_HEAD'), 0)
+
+    def test_srcinfo_version(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.SRCINFO').write_text(
+                'pkgbase = flea\n\tpkgdesc = x\n\tpkgver = 0.3.7\n\tpkgrel = 2\n\npkgname = flea\n')
+            self.assertEqual(dash.srcinfo_version(d), '0.3.7-2')
+
+    def test_srcinfo_version_with_epoch(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / '.SRCINFO').write_text('pkgbase = x\n\tpkgver = 1.0\n\tpkgrel = 1\n\tepoch = 2\n')
+            self.assertEqual(dash.srcinfo_version(d), '2:1.0-1')
+
+    def test_srcinfo_version_missing_or_incomplete_is_empty(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(dash.srcinfo_version(d), '')
+            (Path(d) / '.SRCINFO').write_text('pkgbase = x\n\tpkgver = 1.0\n')
+            self.assertEqual(dash.srcinfo_version(d), '')
+
+    def test_installed_older_than_uses_vercmp(self):
+        with patch.object(dash, 'run', fake_run({('vercmp', '0.3.9-1', '0.3.10-1'): (0, '-1\n', '')})):
+            self.assertTrue(dash.installed_older_than('0.3.9-1', '0.3.10-1'))
+        with patch.object(dash, 'run', fake_run({('vercmp',): (0, '0\n', '')})):
+            self.assertFalse(dash.installed_older_than('1-1', '1-1'))
+        with patch.object(dash, 'run', return_value=(1, '', 'not found')):
+            self.assertFalse(dash.installed_older_than('1-1', '2-1'))
+
+    def _check_app(self, state, installed, srcinfo, vercmp_out='-1'):
+        with tempfile.TemporaryDirectory() as d:
+            if srcinfo:
+                (Path(d) / '.SRCINFO').write_text(srcinfo)
+            table = {
+                ('vercmp',): (0, vercmp_out + '\n', ''),
+                ('git', '-C', d, 'rev-list', '--count', 'origin/master..HEAD'): (0, '21\n', ''),
+            }
+            with patch.object(dash, 'app_update_state', return_value=(state, 0, '')), \
+                 patch.object(dash, 'pkg_version', return_value=installed), \
+                 patch.object(dash, 'run', fake_run(table)):
+                return dash.check_app({'id': 'flea', 'repoDir': d, 'branch': 'master', 'remote': 'origin'})
+
+    def test_current_source_with_older_package_is_not_installed(self):
+        item = self._check_app('up-to-date', '0.3.0-1', '\tpkgver = 0.3.1\n\tpkgrel = 2\n')
+        self.assertEqual(item['updateState'], 'not-installed')
+        self.assertEqual(item['reason'], 'repo has 0.3.1-2, installed is 0.3.0-1')
+        self.assertEqual(item['ahead'], 21)
+
+    def test_matching_package_stays_up_to_date(self):
+        item = self._check_app('up-to-date', '0.3.1-2', '\tpkgver = 0.3.1\n\tpkgrel = 2\n', vercmp_out='0')
+        self.assertEqual(item['updateState'], 'up-to-date')
+
+    def test_package_not_installed_at_all_is_left_alone(self):
+        # pacman -Q failing gives '' -- nothing to compare, and not this check's business.
+        item = self._check_app('up-to-date', '', '\tpkgver = 0.3.1\n\tpkgrel = 2\n')
+        self.assertEqual(item['updateState'], 'up-to-date')
+
+    def test_behind_is_not_overridden(self):
+        item = self._check_app('behind', '0.3.0-1', '\tpkgver = 0.3.1\n\tpkgrel = 2\n')
+        self.assertEqual(item['updateState'], 'behind')
+
+    def test_no_ahead_count_when_upstream_was_never_compared(self):
+        # fake_run raises on any git call, proving none is made.
+        with patch.object(dash, 'plugin_update_state', return_value=('unreachable', 0, 'offline')), \
+             patch.object(dash, 'manifest_version', return_value='1.0'), \
+             patch.object(dash, 'run', fake_run({})):
+            self.assertEqual(dash.check_plugin({'id': 'x'})['ahead'], 0)
+
+    def test_plugin_ahead_counted_against_fetch_head(self):
+        with patch.object(dash, 'plugin_update_state', return_value=('up-to-date', 0, '')), \
+             patch.object(dash, 'manifest_version', return_value='0.10.6'), \
+             patch.object(dash, 'run', fake_run({('git', '-C', str(dash.PLUGINS_DIR / 'omamail'),
+                                                   'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '92\n', '')})):
+            item = dash.check_plugin({'id': 'omamail', 'enabled': True})
+        self.assertEqual((item['updateState'], item['ahead']), ('up-to-date', 92))
+
+
+class CheckAllConcurrencyTests(unittest.TestCase):
+    def test_checks_run_side_by_side_and_keep_their_order(self):
+        # Each check blocks on a barrier that only opens once three are in flight at once;
+        # run one at a time, the first would wait forever (the barrier times out instead).
+        import threading
+        barrier = threading.Barrier(3, timeout=5)
+        def slow_check(p):
+            barrier.wait()
+            return {'id': p['id'], 'updateState': 'up-to-date'}
+        with tempfile.TemporaryDirectory() as d:
+            with patch.object(dash, 'discover_plugins', return_value=[{'id': 'p1'}, {'id': 'p2'}, {'id': 'p3'}]), \
+                 patch.object(dash, 'load_apps', return_value=[]), \
+                 patch.object(dash, 'check_plugin', slow_check), \
+                 patch.object(dash, 'STATE', Path(d)), patch.object(dash, 'STATUS_PATH', Path(d) / 'status.json'):
+                status = dash.check_all()
+        self.assertEqual([i['id'] for i in status['items']], ['p1', 'p2', 'p3'])
 
 
 class NotifyNewUpdatesTests(unittest.TestCase):
+    def test_not_installed_counts_as_newly_updatable(self):
+        with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
+            dash.notify_new_updates([{'id': 'flea', 'name': 'Flea', 'updateState': 'not-installed'}], set())
+        self.assertEqual(run_mock.call_count, 1)
+
     def test_fires_only_for_newly_behind_ids(self):
         items = [
             {'id': 'a', 'name': 'A', 'updateState': 'behind'},
@@ -462,15 +570,33 @@ class CmdDiffTests(unittest.TestCase):
         self.assertTrue(payload['ok'])
         self.assertIn('diff --git', payload['diff'])
 
-    def test_app_diff_uses_branch_and_remote_ref(self):
+    def _app_diff(self, branch_has_upstream):
+        repo = '/home/x/Projects/howdy'
+        table = {
+            ('git', '-C', repo, 'merge-base', '--is-ancestor'): (0 if branch_has_upstream else 1, '', ''),
+            ('git', '-C', repo, 'diff'): (0, 'diff --git a b\n', ''),
+        }
+        calls = []
+        def recording(args, **kw):
+            calls.append(args)
+            return fake_run(table)(args, **kw)
         with patch.object(dash, 'ensure_apps_file'), patch.object(dash, 'load_apps', return_value=[
-                 {'id': 'howdy', 'repoDir': '/home/x/Projects/howdy', 'branch': 'master', 'remote': 'origin'}]), \
-             patch.object(dash, 'run', return_value=(0, 'diff --git a b\n', '')) as run_mock, \
-             patch('builtins.print'):
-            args = type('A', (), {'id': 'howdy'})()
-            dash.cmd_diff(args)
-        run_mock.assert_called_once_with(
-            ['git', '-C', '/home/x/Projects/howdy', 'diff', 'master', 'origin/master'], timeout=20)
+                 {'id': 'howdy', 'repoDir': repo, 'branch': 'master', 'remote': 'origin'}]), \
+             patch.object(dash, 'run', recording), patch('builtins.print'):
+            dash.cmd_diff(type('A', (), {'id': 'howdy'})())
+        return calls[-1]
+
+    def test_app_diff_shows_upstreams_side_from_branch(self):
+        # Three dots: only what upstream changed, not howdy master's own rebuild.sh commit
+        # shown as if upstream were deleting it.
+        self.assertEqual(self._app_diff(branch_has_upstream=False),
+                         ['git', '-C', '/home/x/Projects/howdy', 'diff', 'master...origin/master'])
+
+    def test_app_diff_uses_head_when_only_the_checked_out_branch_lacks_upstream(self):
+        # Flea after an aborted merge: master already has origin/master, aarch64-local does
+        # not. app_update_state calls that 'behind'; diffing master showed nothing.
+        self.assertEqual(self._app_diff(branch_has_upstream=True),
+                         ['git', '-C', '/home/x/Projects/howdy', 'diff', 'HEAD...origin/master'])
 
     def test_diff_failure_reports_error_message(self):
         with patch.object(dash, 'ensure_apps_file'), patch.object(dash, 'load_apps', return_value=[]), \

@@ -4,8 +4,12 @@
 // "dirty", "diverged", "no-repo" and "unreachable" all need a person, not a
 // click, because each would fail (or silently do the wrong thing) if
 // `omarchy plugin update`'s fast-forward-only merge ran anyway.
+//
+// 'not-installed' is the other one: an app whose repo is current but whose installed
+// package is older than what the repo builds. Its updateCmd (rebuild.sh --install)
+// builds and installs whether or not upstream moved, so the same button applies.
 function canUpdate(item) {
-    return !!item && item.updateState === 'behind'
+    return !!item && (item.updateState === 'behind' || item.updateState === 'not-installed')
 }
 
 // True for anything a diff preview is meaningful for: 'behind' shows what
@@ -34,6 +38,7 @@ function stateLabel(item) {
         // when it hits a conflict. Update/Diff must both refuse this the same
         // way they refuse 'dirty'/'diverged': see canUpdate/canShowDiff below.
         case 'in-progress': return 'Git operation in progress' + why + ' -- resolve manually'
+        case 'not-installed': return 'Built, not installed' + why
         case 'no-repo': return 'No update source'
         case 'unreachable': return 'Could not reach source' + (item.reason ? ': ' + item.reason.split('\n')[0] : '')
         case 'up-to-date': return 'Up to date'
@@ -83,16 +88,25 @@ function pillLabel(item) {
         case 'diverged': return 'DIVERGED'
         case 'dirty': return 'DIRTY'
         case 'in-progress': return 'GIT'
+        case 'not-installed': return 'NOT INSTALLED'
         case 'no-repo': return 'NO SOURCE'
         case 'unreachable': return 'OFFLINE'
         default: return ''
     }
 }
 
+// The "+N LOCAL" tag next to the state pill: commits this checkout carries that upstream
+// does not. CURRENT/BEHIND alone said nothing about them, so a 92-commit fork looked the
+// same as an untouched install. Not shown for 'diverged', whose pill already says it.
+function localTag(item) {
+    if (!item || !(item.ahead > 0) || item.updateState === 'diverged') return ''
+    return '+' + item.ahead + ' LOCAL'
+}
+
 function stripeKey(item) {
     if (!item) return 'ok'
     if (item.enabled === false) return 'off'
-    if (item.updateState === 'behind') return 'behind'
+    if (item.updateState === 'behind' || item.updateState === 'not-installed') return 'behind'
     if (item.updateState === 'dirty' || item.updateState === 'diverged' || item.updateState === 'in-progress') return 'attention'
     return 'ok'
 }
