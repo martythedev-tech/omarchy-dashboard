@@ -32,7 +32,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -67,6 +69,19 @@ HISTORY_SHOWN = 8
 ROLLBACK_WINDOW_SECONDS = 7 * 24 * 3600
 # Commits listed per side in the "what's new" view.
 LOG_LIMIT = 50
+# The shell writes its log under the runtime dir, one directory per shell instance.
+SHELL_LOG_ROOT = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}') / 'quickshell/by-id'
+# How long after the last reload trigger the shell is given to (re)load a plugin before
+# its log is read. Loading is asynchronous; a broken plugin logs its failure within a
+# second or two.
+LOAD_SETTLE_SECONDS = 4
+_LOG_LEVEL = re.compile(r'^\S+ \S+\s+(WARN|ERROR|CRIT|FATAL)\b')
+_LOG_STAMP = re.compile(r'^\S+ \S+\s+')
+# What the shell says when a plugin did not load at all, as opposed to a warning from one
+# that did (Omastorm logs an IPC-handler warning on every load and works fine).
+_LOAD_FAILURE = re.compile(r'failed|\b\w*Error\b|is not a type|is not installed|unavailable', re.I)
+# A notification's buttons wait for a click; past this its waiter gives up.
+NOTIFY_WAIT_SECONDS = 3600
 
 # Seeded into APPS_PATH the first time it's missing; from then on the file on
 # disk is what's read; edit it there (or via the "+ Add app" form) to add or
@@ -379,6 +394,84 @@ def reload_plugin_widget(plugin_dir):
         pass
 
 
+def shell_log():
+    """The running shell's log: the newest one, since every shell restart starts a new
+    instance directory and the old ones stay behind."""
+    try:
+        logs = [d / 'log.log' for d in SHELL_LOG_ROOT.iterdir() if (d / 'log.log').is_file()]
+    except OSError:
+        return None
+    return max(logs, key=lambda f: f.stat().st_mtime) if logs else None
+
+
+def shell_log_mark():
+    """(log path, size) now, so what is logged after an update can be told from before."""
+    log = shell_log()
+    try:
+        return (log, log.stat().st_size) if log else (None, 0)
+    except OSError:
+        return (None, 0)
+
+
+def _plugin_lines(plugin_id, plugin_dir, text):
+    """WARN-or-worse lines about this plugin, timestamps stripped so the same message
+    from an earlier load compares equal."""
+    paths = {f'/plugins/{plugin_id}/'}
+    try:
+        paths.add(str(Path(plugin_dir).resolve()) + '/')  # the Dashboard is a symlink
+    except OSError:
+        pass
+    named = re.compile(r'(?i)(?:plugin(?: widget)?|failed for) ' + re.escape(plugin_id) + r'(?![\w.-])')
+    found = []
+    for line in text.splitlines():
+        if _LOG_LEVEL.match(line) and (any(p in line for p in paths) or named.search(line)):
+            found.append(_LOG_STAMP.sub('', line, count=1).strip())
+    return found
+
+
+def new_plugin_problems(plugin_id, plugin_dir, mark):
+    """(new lines, failed) for this plugin since `mark`, after giving the shell
+    LOAD_SETTLE_SECONDS to reload it. Only messages it had not already logged before the
+    mark count -- a warning it gives on every load is not news. `failed` is whether any of
+    them says the plugin did not load.
+
+    This is the check none of the earlier fixes made: Omastorm's engine and Pulse's GPU
+    recorder each left the widget broken after an update that reported success, and so
+    would a QML error in the new version, which nothing here looked for."""
+    time.sleep(LOAD_SETTLE_SECONDS)
+    log_before, offset = mark
+    log_now = shell_log()
+    if not log_now:
+        return [], False
+    try:
+        text_now = log_now.read_text(errors='replace')
+        text_before = log_before.read_text(errors='replace') if log_before else ''
+    except OSError:
+        return [], False
+    if log_now == log_before:
+        earlier, later = text_now[:offset], text_now[offset:]
+    else:  # the shell restarted in between: all of the new log is new
+        earlier, later = text_before, text_now
+    seen = set(_plugin_lines(plugin_id, plugin_dir, earlier))
+    lines = []
+    for line in _plugin_lines(plugin_id, plugin_dir, later):
+        if line not in seen and line not in lines:
+            lines.append(line)
+    return lines, any(_LOAD_FAILURE.search(line) for line in lines)
+
+
+def check_plugin_loaded(plugin_id, plugin_dir, mark):
+    """(ok, message) for the end of an update or rollback: '' when the shell said nothing
+    new about the plugin."""
+    lines, failed = new_plugin_problems(plugin_id, plugin_dir, mark)
+    if not lines:
+        return True, ''
+    shown = '\n'.join(lines[:8]) + (f'\n… and {len(lines) - 8} more' if len(lines) > 8 else '')
+    if failed:
+        return False, 'The shell could not load it:\n' + shown
+    return True, 'The shell logged new warnings after reloading it:\n' + shown
+
+
 def pkg_version(pkg_name):
     rc, out, _ = run(['pacman', '-Q', pkg_name])
     if rc != 0:
@@ -588,8 +681,60 @@ def notify_new_updates(items, old_behind_ids):
     if len(newly) > 5:
         names += f' and {len(newly) - 5} more'
     title = 'Update available' if len(newly) == 1 else f'{len(newly)} updates available'
-    run(['notify-send', '--app-name=Plugin Dashboard', '--icon=system-software-update',
-         title, names], timeout=5)
+    # The notification's buttons need a process waiting for the click. Run it as its own
+    # transient user unit: started from dashboard-check.service, a plain child would be
+    # killed with the service's cgroup the moment the check finished.
+    rc, _, _ = run(['systemd-run', '--user', '--collect', '--quiet',
+                    f'--unit=dashboard-notify-{int(time.time())}',
+                    sys.executable, str(Path(__file__).resolve()), 'await-notification',
+                    title, names, *[i['id'] for i in newly]], timeout=10)
+    if rc != 0:
+        run(['notify-send', '--app-name=Plugin Dashboard', '--icon=system-software-update',
+             title, names], timeout=5)
+
+
+def cmd_await_notification(args):
+    """Shows the update notification with Update and Open buttons and waits for a click.
+    Update updates the items the notification named that are still updatable and not held
+    by then (the same thing Update all does for them, one at a time), then says how it went.
+    Open opens the panel."""
+    try:
+        p = subprocess.run(['notify-send', '--app-name=Plugin Dashboard', '--icon=system-software-update',
+                            '--action=update=Update', '--action=open=Open',
+                            args.title, args.body], capture_output=True, text=True,
+                           timeout=NOTIFY_WAIT_SECONDS, check=False)
+        choice = p.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if choice == 'open':
+        run(['omarchy-shell', SELF_ID, 'open'], timeout=10)
+        return
+    if choice != 'update':
+        return
+    status = load_status() or {}
+    wanted = {i['id'] for i in status.get('items', [])
+              if i['id'] in args.ids and i.get('updateState') in UPDATABLE_STATES and not i.get('held')}
+    names = {i['id']: i.get('name', i['id']) for i in status.get('items', [])}
+    done, failed = [], []
+    for item_id in args.ids:
+        if item_id not in wanted:
+            continue
+        rc = subprocess.run([sys.executable, str(Path(__file__).resolve()), 'update', item_id],
+                            capture_output=True, text=True, check=False)
+        try:
+            ok = json.loads(rc.stdout.strip().splitlines()[-1]).get('ok')
+        except (ValueError, IndexError):
+            ok = False
+        (done if ok else failed).append(names.get(item_id, item_id))
+    if not done and not failed:
+        body = 'Nothing left to update.'
+    else:
+        body = ', '.join(filter(None, ['Updated ' + ', '.join(done) if done else '',
+                                       'failed: ' + ', '.join(failed) if failed else '']))
+    run(['notify-send', '--app-name=Plugin Dashboard',
+         '--icon=' + ('dialog-error' if failed else 'system-software-update'),
+         'Update failed' if failed else 'Updated', body + (' — open the Dashboard for details.' if failed else '')],
+        timeout=5)
 
 
 def check_all():
@@ -668,6 +813,7 @@ def cmd_update(args):
         plugin_dir = PLUGINS_DIR / args.id
         units_before = shipped_units(plugin_dir)
         units_installed_before = {name for name in units_before if (USER_UNIT_DIR / name).exists()}
+        log_mark = shell_log_mark()
         rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180, stream_log=STATE / 'action.log')
         if rc == 0 and has_ensure_bootstrap(plugin_dir):
             erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
@@ -687,6 +833,14 @@ def cmd_update(args):
                     rc = 1
                     err = (err + '\n' if err.strip() else '') + \
                         'Update landed but a new background service did not come up:\n' + text
+        # Last, after every reload the steps above may have triggered.
+        if rc == 0 and before != repo_head(plugin_dir):
+            load_ok, load_text = check_plugin_loaded(args.id, plugin_dir, log_mark)
+            if not load_ok:
+                rc = 1
+                err = (err + '\n' if err.strip() else '') + 'Update landed, but ' + load_text[0].lower() + load_text[1:]
+            elif load_text:
+                out = (out + '\n' if out.strip() else '') + load_text
     # Long build logs (Flea's cargo test output, say) aren't useful in full to
     # the UI -- the tail carries the actual result or error.
     # A failure carries both streams: stdout has what the command said it was doing, stderr
@@ -714,11 +868,14 @@ def cmd_update(args):
 
 def rollback_candidate(plugin_id, history, now=None):
     """The update this plugin can be rolled back from, or None: its most recent change
-    (a successful update that moved HEAD, or a rollback) must be an update, inside
+    (an update that moved HEAD, or a rollback) must be an update, inside
     ROLLBACK_WINDOW_SECONDS, with HEAD still where that update left it -- anything else
-    means the checkout moved on since and resetting would throw that away."""
+    means the checkout moved on since and resetting would throw that away. An update that
+    moved HEAD but reported failure counts: it landed and then broke (a service that would
+    not start, a widget the shell could not load), which is when a rollback is wanted most;
+    one omarchy refused outright left HEAD where it was."""
     changes = [e for e in history if e.get('id') == plugin_id and e.get('kind') == 'plugin'
-               and (e.get('action') == 'rollback' or (e.get('ok') and e.get('before') and e.get('before') != e.get('after')))]
+               and (e.get('action') == 'rollback' or (e.get('before') and e.get('before') != e.get('after')))]
     if not changes:
         return None
     last = changes[-1]
@@ -757,6 +914,7 @@ def cmd_rollback(args):
     _, dirty, _ = run(['git', '-C', str(plugin_dir), 'status', '--porcelain'])
     if dirty.strip():
         return done(False, f'{plugin_dir} has local changes a rollback would discard; commit or stash them first.')
+    log_mark = shell_log_mark()
     rc, out, err = run(['git', '-C', str(plugin_dir), 'reset', '--hard', entry['before']])
     if rc != 0:
         return done(False, 'git reset failed: ' + (err or out).strip())
@@ -792,6 +950,10 @@ def cmd_rollback(args):
             ok = False
             messages.append('The plugin did not come up cleanly:\n' + (eerr or eout).strip()[-1500:])
     run(['omarchy-shell', 'shell', 'rescanPlugins'], timeout=20)
+    load_ok, load_text = check_plugin_loaded(args.id, plugin_dir, log_mark)
+    if load_text:
+        messages.append(load_text)
+    ok = ok and load_ok
     holds = load_holds()
     holds[args.id] = {'ts': time.time(), 'reason': 'rolled back from v' + entry['toVersion']
                       if entry.get('toVersion') else 'rolled back'}
@@ -930,6 +1092,10 @@ def main():
     for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app', 'rollback', 'unhold'):
         p = sub.add_parser(name)
         p.add_argument('id')
+    p_await = sub.add_parser('await-notification')
+    p_await.add_argument('title')
+    p_await.add_argument('body')
+    p_await.add_argument('ids', nargs='*')
     p_hold = sub.add_parser('hold')
     p_hold.add_argument('id')
     p_hold.add_argument('--reason', default='')
@@ -940,6 +1106,7 @@ def main():
         'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
         'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
+        'await-notification': cmd_await_notification,
     }
     handlers[args.command](args)
 

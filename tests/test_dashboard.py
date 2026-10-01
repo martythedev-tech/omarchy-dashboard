@@ -21,6 +21,9 @@ def setUpModule():
     dash.STATE = Path(_STATE_DIR.name)
     dash.STATUS_PATH = dash.STATE / 'status.json'
     dash.APPS_PATH = dash.STATE / 'apps.json'
+    # Never read the real shell log, and never wait for a reload that is not happening.
+    dash.SHELL_LOG_ROOT = dash.STATE / 'no-shell'
+    dash.LOAD_SETTLE_SECONDS = 0
 
 
 def tearDownModule():
@@ -337,7 +340,7 @@ class CheckAllTests(unittest.TestCase):
             self.assertTrue(status_written)
             # No prior status.json existed, so 'a.plugin' becoming 'behind' is
             # new -- notify-send should have fired once.
-            notifies = [c for c in run_mock.call_args_list if c.args[0][0] == 'notify-send']
+            notifies = [c for c in run_mock.call_args_list if c.args[0][0] in ('notify-send', 'systemd-run')]
             self.assertEqual(len(notifies), 1)
 
 
@@ -457,9 +460,25 @@ class NotifyNewUpdatesTests(unittest.TestCase):
             dash.notify_new_updates(items, old_behind_ids={'a'})
         run_mock.assert_called_once()
         args = run_mock.call_args.args[0]
-        self.assertEqual(args[0], 'notify-send')
-        self.assertIn('B', args[-1])
-        self.assertNotIn('A', args[-1])
+        # A waiter in its own transient unit: title, body, then the ids it may update.
+        self.assertEqual(args[0], 'systemd-run')
+        i = args.index('await-notification')
+        self.assertEqual(args[i + 1:], ['Update available', 'B', 'b'])
+
+    def test_falls_back_to_a_plain_notification_without_systemd_run(self):
+        calls = []
+        def fake(args, **kw):
+            calls.append(args)
+            return (1, '', 'no systemd') if args[0] == 'systemd-run' else (0, '', '')
+        with patch.object(dash, 'run', fake):
+            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind'}], set())
+        self.assertEqual([c[0] for c in calls], ['systemd-run', 'notify-send'])
+        self.assertEqual(calls[-1][-2:], ['Update available', 'A'])
+
+    def test_held_items_never_notify(self):
+        with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
+            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'held': True}], set())
+        run_mock.assert_not_called()
 
     def test_no_new_ids_means_no_notification(self):
         items = [{'id': 'a', 'name': 'A', 'updateState': 'behind'}]
@@ -1193,3 +1212,232 @@ class GitLogTests(RealRepoFixture):
         self.assertTrue(r['ok'])
         self.assertEqual(r['incoming'], [])
         self.assertEqual([c['subject'] for c in r['local']], ['two'])
+
+
+class AwaitNotificationTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        state = Path(self._tmp.name)
+        for target, value in (('STATE', state), ('STATUS_PATH', state / 'status.json')):
+            patcher = patch.object(dash, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        dash.STATUS_PATH.write_text(json.dumps({'items': [
+            {'id': 'a', 'name': 'A', 'updateState': 'behind'},
+            {'id': 'b', 'name': 'B', 'updateState': 'behind', 'held': True},
+            {'id': 'c', 'name': 'C', 'updateState': 'up-to-date'},
+            {'id': 'd', 'name': 'D', 'updateState': 'not-installed'},
+        ]}))
+        self.subprocess_calls, self.run_calls = [], []
+        self.choice = 'update'
+        self.update_ok = {'a': True, 'd': False}
+
+        def fake_subprocess_run(args, **kw):
+            self.subprocess_calls.append(args)
+            if args[0] == 'notify-send':
+                return type('P', (), {'stdout': self.choice + '\n', 'returncode': 0})()
+            item = args[-1]
+            out = 'progress...\n' + json.dumps({'ok': self.update_ok[item], 'message': ''})
+            return type('P', (), {'stdout': out, 'returncode': 0})()
+        p1 = patch.object(dash.subprocess, 'run', fake_subprocess_run)
+        p2 = patch.object(dash, 'run', lambda args, **kw: self.run_calls.append(args) or (0, '', ''))
+        for pt in (p1, p2):
+            pt.start()
+            self.addCleanup(pt.stop)
+
+    def wait(self, ids=('a', 'b', 'c', 'd')):
+        dash.cmd_await_notification(type('A', (), {'title': 'T', 'body': 'B', 'ids': list(ids)})())
+
+    def test_update_runs_only_what_is_still_updatable_and_unheld_and_reports(self):
+        self.wait()
+        updated = [c[-1] for c in self.subprocess_calls if c[0] != 'notify-send']
+        self.assertEqual(updated, ['a', 'd'])
+        self.assertIn('--action=update=Update', self.subprocess_calls[0])
+        last = self.run_calls[-1]
+        self.assertEqual(last[0], 'notify-send')
+        self.assertIn('Update failed', last)
+        self.assertIn('Updated A, failed: D — open the Dashboard for details.', last)
+
+    def test_nothing_left(self):
+        self.wait(ids=('c',))
+        self.assertIn('Nothing left to update.', self.run_calls[-1])
+
+    def test_open_opens_the_panel(self):
+        self.choice = 'open'
+        self.wait()
+        self.assertEqual(self.run_calls, [['omarchy-shell', dash.SELF_ID, 'open']])
+        self.assertEqual(len(self.subprocess_calls), 1)
+
+    def test_dismissed_does_nothing(self):
+        self.choice = ''
+        self.wait()
+        self.assertEqual(self.run_calls, [])
+        self.assertEqual(len(self.subprocess_calls), 1)
+
+
+LOG_LINE = '2026-10-01 13:24:52.349  {level} {text}'
+
+
+class ShellLogFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name) / 'by-id'
+        self.instance = self.root / 'aaa'
+        self.instance.mkdir(parents=True)
+        self.log = self.instance / 'log.log'
+        self.log.write_text('')
+        self.plugin_dir = Path(self._tmp.name) / 'plugins' / 'x.plugin'
+        self.plugin_dir.mkdir(parents=True)
+        patcher = patch.object(dash, 'SHELL_LOG_ROOT', self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def say(self, level, text, log=None):
+        with (log or self.log).open('a') as f:
+            f.write(LOG_LINE.format(level=level, text=text) + '\n')
+
+    def problems(self, mark):
+        return dash.new_plugin_problems('x.plugin', self.plugin_dir, mark)
+
+
+class ShellLogTests(ShellLogFixture):
+    def test_only_new_warnings_about_this_plugin_count(self):
+        self.say('WARN', 'scene: QML IpcHandler at file:///h/.config/omarchy/plugins/x.plugin/Theme.qml[84:30]: no target')
+        mark = dash.shell_log_mark()
+        self.say('WARN', 'scene: QML IpcHandler at file:///h/.config/omarchy/plugins/x.plugin/Theme.qml[84:30]: no target')
+        self.say('WARN', 'scene: file:///h/.config/omarchy/plugins/other/Panel.qml:3: TypeError')
+        self.say('DEBUG', 'qml: file:///h/.config/omarchy/plugins/x.plugin/Panel.qml loaded')
+        self.say('INFO', 'qml: Local plugin changed, reloading: x.plugin')
+        self.assertEqual(self.problems(mark), ([], False))
+
+    def test_a_load_failure_is_a_failure(self):
+        mark = dash.shell_log_mark()
+        self.say('WARN', 'qml: Plugin widget x.plugin failed: Panel.qml:12 Type Foo unavailable')
+        lines, failed = self.problems(mark)
+        self.assertEqual(lines, ['WARN qml: Plugin widget x.plugin failed: Panel.qml:12 Type Foo unavailable'])
+        self.assertTrue(failed)
+
+    def test_a_runtime_type_error_in_its_files_is_a_failure(self):
+        mark = dash.shell_log_mark()
+        self.say('WARN', 'scene: file:///h/.config/omarchy/plugins/x.plugin/Panel.qml:40: TypeError: Cannot read property')
+        self.assertTrue(self.problems(mark)[1])
+
+    def test_a_new_plain_warning_is_reported_but_not_a_failure(self):
+        mark = dash.shell_log_mark()
+        self.say('WARN', 'scene: file:///h/.config/omarchy/plugins/x.plugin/Panel.qml:7: Binding loop detected')
+        lines, failed = self.problems(mark)
+        self.assertEqual(len(lines), 1)
+        self.assertFalse(failed)
+        ok, text = dash.check_plugin_loaded('x.plugin', self.plugin_dir, mark)
+        self.assertTrue(ok)
+        self.assertIn('new warnings', text)
+
+    def test_a_similarly_named_plugin_is_not_this_one(self):
+        mark = dash.shell_log_mark()
+        self.say('WARN', 'qml: Plugin widget x.plugin-two failed: nope')
+        self.say('WARN', 'scene: file:///h/.config/omarchy/plugins/x.plugin-two/Panel.qml:1: TypeError')
+        self.assertEqual(self.problems(mark), ([], False))
+
+    def test_the_resolved_path_of_a_symlinked_plugin_counts(self):
+        # The Dashboard's own plugin dir is a symlink to ~/Projects/dashboard, and the shell
+        # can log the resolved path, which has neither /plugins/ nor the id in it.
+        source = Path(self._tmp.name) / 'Projects' / 'dashboard'
+        source.mkdir(parents=True)
+        link = Path(self._tmp.name) / 'plugins' / 'linked.plugin'
+        link.symlink_to(source)
+        mark = dash.shell_log_mark()
+        self.say('WARN', f'scene: file://{source}/Panel.qml:1: ReferenceError: x is not defined')
+        lines, failed = dash.new_plugin_problems('linked.plugin', link, mark)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(failed)
+
+    def test_a_shell_restart_reads_the_whole_new_log_against_the_old_one(self):
+        self.say('WARN', 'scene: file:///h/.config/omarchy/plugins/x.plugin/Theme.qml: no target')
+        mark = dash.shell_log_mark()
+        newer = self.root / 'bbb'
+        newer.mkdir()
+        new_log = newer / 'log.log'
+        self.say('WARN', 'scene: file:///h/.config/omarchy/plugins/x.plugin/Theme.qml: no target', log=new_log)
+        self.say('WARN', 'qml: Plugin widget x.plugin failed: boom', log=new_log)
+        import os
+        os.utime(new_log, (time.time() + 5, time.time() + 5))
+        lines, failed = self.problems(mark)
+        self.assertEqual(lines, ['WARN qml: Plugin widget x.plugin failed: boom'])
+        self.assertTrue(failed)
+
+    def test_no_shell_log_at_all_is_quiet(self):
+        with patch.object(dash, 'SHELL_LOG_ROOT', Path(self._tmp.name) / 'missing'):
+            self.assertEqual(dash.shell_log_mark(), (None, 0))
+            self.assertEqual(dash.new_plugin_problems('x.plugin', self.plugin_dir, (None, 0)), ([], False))
+
+
+class UpdateLoadCheckTests(RealRepoFixture):
+    def setUp(self):
+        super().setUp()
+        self.instance = Path(self._tmp.name) / 'by-id' / 'aaa'
+        self.instance.mkdir(parents=True)
+        self.log = self.instance / 'log.log'
+        self.log.write_text('')
+        patcher = patch.object(dash, 'SHELL_LOG_ROOT', self.instance.parent)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.broken = False
+        real = dash.run
+        plugin, log, new = self.plugin, self.log, self.new
+
+        def updating(args, **kw):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                git(plugin, 'reset', '-q', '--hard', new)
+                if self.broken:
+                    with log.open('a') as f:
+                        f.write(LOG_LINE.format(level='WARN', text='qml: Plugin widget x.plugin failed: Panel.qml:1 bad') + '\n')
+                return (0, 'Updated.', '')
+            return real(args, **kw)
+        git(self.plugin, 'reset', '-q', '--hard', self.old)
+        patcher = patch.object(dash, 'run', updating)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def update(self):
+        with patch.object(dash, 'install_new_units', return_value=([], True)):
+            dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
+        return self.printed[-1]
+
+    def test_a_widget_the_shell_cannot_load_fails_the_update_and_can_be_rolled_back(self):
+        self.broken = True
+        result = self.update()
+        self.assertFalse(result['ok'])
+        self.assertIn('Update landed, but the shell could not load it', result['message'])
+        self.assertIn('Plugin widget x.plugin failed', result['message'])
+        self.assertFalse(dash.load_history()[-1]['ok'])
+        self.assertIsNotNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+    def test_a_clean_load_is_a_plain_success(self):
+        result = self.update()
+        self.assertTrue(result['ok'], result)
+        self.assertNotIn('shell', result['message'])
+
+    def test_an_update_that_moved_nothing_does_not_wait_for_a_reload(self):
+        git(self.plugin, 'reset', '-q', '--hard', self.new)
+        with patch.object(dash, 'check_plugin_loaded') as check:
+            self.update()
+        check.assert_not_called()
+
+    def test_a_rollback_whose_old_version_will_not_load_reports_failure(self):
+        git(self.plugin, 'reset', '-q', '--hard', self.new)
+        self.record_update()
+        real = dash.run
+        log = self.log
+
+        def rescan_breaks(args, **kw):
+            if args[:3] == ['omarchy-shell', 'shell', 'rescanPlugins']:
+                with log.open('a') as f:
+                    f.write(LOG_LINE.format(level='WARN', text='qml: Plugin widget x.plugin failed: old') + '\n')
+            return real(args, **kw)
+        with patch.object(dash, 'run', rescan_breaks):
+            result = self.rollback()
+        self.assertFalse(result['ok'])
+        self.assertIn('could not load it', result['message'])
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)

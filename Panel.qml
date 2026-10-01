@@ -158,6 +158,22 @@ Panel {
         if (!Model.statusFresh(root.status.ts, Date.now() / 1000, 300)) root.runCheck()
     }
 
+    // manageIpc is false so this handler can own the target (one handler per target; the
+    // shell answers with the first live one, so with a bar per monitor the first bar's
+    // copy opens). `omarchy-shell martythedev-tech.dashboard toggle` from a keybinding,
+    // `check` to force a check, `count` for scripts. The update notification's Open
+    // button calls `open`.
+    ShellIpc {
+        target: root.ipcTarget
+        function open(): void { root.open() }
+        function close(): void { root.close() }
+        function show(): void { root.open() }
+        function hide(): void { root.close() }
+        function toggle(): void { root.toggle() }
+        function check(): string { root.runCheck(true); return "ok" }
+        function count(): string { return String(root.updatable) }
+    }
+
     FileView {
         id: statusFile
         path: root.stateDir + "/status.json"
