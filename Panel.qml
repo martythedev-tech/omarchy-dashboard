@@ -22,7 +22,14 @@ Panel {
     property var status: ({})
     readonly property var items: status.items || []
     readonly property var grouped: Model.groupByKind(items)
+    // The bar badge, pulse, tooltip and IPC count: updates that change a version.
     readonly property int updatable: Model.badgeCount(items)
+    // Everything Update all would run, including commits that leave the version alone.
+    readonly property int updatableAll: {
+        var n = 0
+        for (var i = 0; i < items.length; i++) if (Model.canUpdate(items[i])) n++
+        return n
+    }
     property string actionStatus: ""
     property string busyId: ""
     property string lastActionKind: ""
@@ -569,7 +576,7 @@ Panel {
                                  + (row.isSelf ? " · this widget" : "")
                                  + (row.modelData.held ? " · held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "")
                                  + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : "")
-                                 + (!row.modelData.held && row.modelData.updateState === "behind" ? " · " + Model.stateLabel(row.modelData) : ""))
+                                 + (!row.modelData.held && row.modelData.updateState === "behind" ? " · " + Model.behindLabel(row.modelData) : ""))
                         font.pixelSize: Style.font.caption
                     }
                 }
@@ -914,8 +921,8 @@ Panel {
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 8
                         SmallButton {
-                            text: root.updateQueueTotal > 0 ? ("Updating " + root.updateQueueDone + "/" + root.updateQueueTotal + "…") : "Update all (" + root.updatable + ")"
-                            visible: root.updatable > 1 || root.updateQueueTotal > 0
+                            text: root.updateQueueTotal > 0 ? ("Updating " + root.updateQueueDone + "/" + root.updateQueueTotal + "…") : "Update all (" + root.updatableAll + ")"
+                            visible: root.updatableAll > 1 || root.updateQueueTotal > 0
                             enabled: root.updateQueueTotal === 0 && root.busyId === "" && !checkProc.running
                             anchors.verticalCenter: parent.verticalCenter
                             onClicked: root.runUpdateAll()

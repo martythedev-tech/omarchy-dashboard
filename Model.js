@@ -30,10 +30,28 @@ function canShowDiff(item) {
     return !!item && (item.updateState === 'behind' || item.updateState === 'diverged')
 }
 
+// Whether an item belongs in the bar badge (and its pulse): updatable, not held, and
+// not known to leave its version unchanged -- a README or screenshot commit is still an
+// update in the panel, just not one to flag from the bar. Mirrors alerts() in dashboard.py.
+function alerts(item) {
+    return canUpdate(item) && item.versionChange !== false
+}
+
 function badgeCount(items) {
     var n = 0
-    for (var i = 0; i < (items || []).length; i++) if (canUpdate(items[i])) n++
+    for (var i = 0; i < (items || []).length; i++) if (alerts(items[i])) n++
     return n
+}
+
+// What a behind row adds to its subtitle. The pill already says how many commits
+// ("BEHIND 1"), so this says only what they would do to the version -- short, because the
+// subtitle shares its line with the pill, the switch and the Update button. How far behind
+// is the fallback when the incoming version could not be read.
+function behindLabel(item) {
+    if (!item || item.updateState !== 'behind') return ''
+    if (item.versionChange === false) return 'same version'
+    if (item.upstreamVersion) return '→ v' + item.upstreamVersion
+    return stateLabel(item)
 }
 
 // What the row's status line says. Kept here rather than inline in QML so
@@ -137,6 +155,7 @@ function localTag(item) {
 function stripeKey(item) {
     if (!item) return 'ok'
     if (item.enabled === false || item.held) return 'off'
+    if (item.updateState === 'behind' && item.versionChange === false) return 'ok'
     if (item.updateState === 'behind' || item.updateState === 'not-installed') return 'behind'
     if (item.updateState === 'dirty' || item.updateState === 'diverged' || item.updateState === 'in-progress') return 'attention'
     return 'ok'

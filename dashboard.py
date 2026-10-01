@@ -607,6 +607,10 @@ def srcinfo_version(repo_dir):
         text = (Path(repo_dir) / '.SRCINFO').read_text()
     except (OSError, UnicodeDecodeError):
         return ''
+    return srcinfo_text_version(text)
+
+
+def srcinfo_text_version(text):
     fields = {}
     for line in text.splitlines():
         key, sep, value = line.strip().partition(' = ')
@@ -667,15 +671,45 @@ def repo_info(repo_dir, remote, upstream_ref):
     return info
 
 
+def upstream_version(repo_dir, ref, kind):
+    """The version the incoming commits would install -- the manifest's for a plugin, the
+    .SRCINFO's for an app -- read from `ref` without touching the checkout, or '' if it
+    cannot be read."""
+    path = 'manifest.json' if kind == 'plugin' else '.SRCINFO'
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'show', f'{ref}:{path}'])
+    if rc != 0:
+        return ''
+    if kind == 'app':
+        return srcinfo_text_version(out)
+    try:
+        version = json.loads(out).get('version', '')
+        return version if isinstance(version, str) else ''
+    except ValueError:
+        return ''
+
+
+def version_change(installed, incoming):
+    """True/False when both versions are known, None when either is not. A commit that
+    leaves the version alone (a README, a screenshot) is still an update, but not one worth
+    a notification -- 2026-10-01: Touchpad Glance's preview.png commit announced itself as
+    an update to a plugin already on the version it "updated" to."""
+    if not installed or not incoming:
+        return None
+    return installed != incoming
+
+
 def check_plugin(p):
     pid = p['id']
     plugin_dir = PLUGINS_DIR / pid
     state, behind, reason = plugin_update_state(plugin_dir)
     compared = state not in NO_COMPARISON_STATES
     ahead = local_commit_count(plugin_dir, 'FETCH_HEAD') if compared else 0
+    version = manifest_version(pid)
+    incoming = upstream_version(plugin_dir, 'FETCH_HEAD', 'plugin') if state == 'behind' else ''
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
-        'version': manifest_version(pid), 'enabled': bool(p.get('enabled')),
+        'version': version, 'upstreamVersion': incoming,
+        'versionChange': version_change(version, incoming), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
         'info': repo_info(plugin_dir, 'origin', 'FETCH_HEAD' if compared else None),
@@ -696,12 +730,22 @@ def check_app(a):
             state, reason = 'not-installed', f'repo has {built}, installed is {version}'
     compared = state not in NO_COMPARISON_STATES
     ahead = local_commit_count(a['repoDir'], f'{remote}/{branch}') if compared else 0
+    incoming = upstream_version(a['repoDir'], f'{remote}/{branch}', 'app') if state == 'behind' else ''
     return {
         'id': a['id'], 'kind': 'app', 'name': a.get('name', a['id']),
-        'version': version,
+        'version': version, 'upstreamVersion': incoming,
+        'versionChange': version_change(version, incoming),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
         'info': repo_info(a['repoDir'], remote, f'{remote}/{branch}' if compared else None),
     }
+
+
+def alerts(item):
+    """Whether an item belongs in the bar badge and the notification: it can be updated,
+    is not held, and is not known to leave its version unchanged. An update whose
+    incoming version could not be read still alerts."""
+    return (item.get('updateState') in UPDATABLE_STATES and not item.get('held')
+            and item.get('versionChange') is not False)
 
 
 def _previously_behind_ids():
@@ -717,8 +761,7 @@ def notify_new_updates(items, old_behind_ids):
     the last check -- not a repeat every cycle for something that's been
     sitting there, and not for 'dirty'/'diverged', which need a person
     regardless of how many checks go by."""
-    newly = [i for i in items if i['updateState'] in UPDATABLE_STATES and not i.get('held')
-             and i['id'] not in old_behind_ids]
+    newly = [i for i in items if alerts(i) and i['id'] not in old_behind_ids]
     if not newly:
         return
     names = ', '.join(i['name'] for i in newly[:5])
@@ -799,7 +842,7 @@ def check_all():
     status = {
         'ts': now,
         'items': items,
-        'updatable': sum(1 for i in items if i['updateState'] in UPDATABLE_STATES and not i['held']),
+        'updatable': sum(1 for i in items if alerts(i)),
         'history': [{k: e.get(k) for k in ('id', 'name', 'kind', 'action', 'ok', 'fromVersion',
                                             'toVersion', 'ts', 'message')}
                     for e in reversed(history[-HISTORY_SHOWN:])],
