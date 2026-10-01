@@ -170,8 +170,10 @@ assert.ok(ctx.commitsHtml(null).indexOf('no commits') >= 0);
 var now = 100000;
 assert.equal(ctx.historyLine({name: 'Omastorm', action: 'update', ok: true, fromVersion: '0.1.15', toVersion: '0.1.16', ts: now - 30}, now),
              'Omastorm updated 0.1.15 → 0.1.16 · just now');
-assert.equal(ctx.historyLine({id: 'flea', action: 'update', ok: true, fromVersion: '1', toVersion: '1', ts: now}, now),
+assert.equal(ctx.historyLine({id: 'flea', kind: 'app', action: 'update', ok: true, fromVersion: '1', toVersion: '1', ts: now}, now),
              'flea rebuilt, no version change · just now');
+assert.equal(ctx.historyLine({name: 'Omastorm', kind: 'plugin', action: 'update', ok: true, fromVersion: '0.1.16', toVersion: '0.1.16', ts: now}, now),
+             'Omastorm updated, same version · just now');
 assert.equal(ctx.historyLine({name: 'X', action: 'update', ok: false, ts: now}, now), 'X update failed · just now');
 assert.equal(ctx.historyLine({name: 'X', action: 'rollback', ok: true, fromVersion: '2', toVersion: '1', ts: now}, now),
              'X rolled back 2 → 1 · just now');
