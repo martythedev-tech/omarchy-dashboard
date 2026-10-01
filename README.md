@@ -44,6 +44,18 @@ notification via `notify-send`.
 
 ## What the row tells you
 
+Rows sort by what needs you: a stuck git operation or local changes blocking an
+update first, then anything one click would update, then sources that could not
+be reached, then the rest (held items with the rest) -- alphabetical within each.
+
+Click a row's name to expand it: its full status, the branch it is on, when
+upstream last committed, a link to its source (the GitHub repo, or the AUR
+package page for an app), and **Open folder** / **Terminal** buttons for its
+checkout.
+
+**Update all** ends with a one-line summary ("2 updated, 1 failed (Flea).") and
+leaves the first failure's output open.
+
 - **+N LOCAL**: the checkout carries N commits upstream does not have -- a fork you
   maintain, or a local fix you are holding. Shown next to CURRENT or BEHIND so it is not
   mistaken for an untouched install.
@@ -133,8 +145,13 @@ shell's generic `shell toggle`, which did not open this bar widget's popup when 
 
 ## Tracked apps
 
-Use "+ Add app" in the panel: name, id, repo dir, and it validates the repo
-dir is a real git checkout before saving. Remove one the same way as a
+Use "+ Add app" in the panel. Start with the repo: **Choose…** opens the
+desktop's folder chooser, or type a path and press **Fill in**. Either reads the
+repo and fills the rest -- name and id from the folder, the package name from
+`.SRCINFO`, the upstream branch and remote from git, and `./rebuild.sh --install`
+if the repo has an executable `rebuild.sh` -- and says what it could not work
+out. Saving checks the repo dir is a real git checkout and that there is an
+update command. Remove one the same way as a
 plugin, via its Remove button -- that only forgets it here, it never touches
 the repo or package.
 

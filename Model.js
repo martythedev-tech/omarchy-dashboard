@@ -76,8 +76,23 @@ function healthFraction(items) {
     return { done: done, total: total }
 }
 
-// Plugins first (alphabetical), then apps (alphabetical) -- a stable split
-// so the two sections in Panel.qml never need their own sort call.
+// Where a row sorts within its section: what needs a person first (a stuck git
+// operation, local changes or commits blocking an update), then what one click would
+// update, then a source that could not be reached, then everything else. Held items
+// sort with everything else -- holding is saying "not now".
+function statusRank(item) {
+    if (!item) return 9
+    if (item.held) return 3
+    switch (item.updateState) {
+        case 'in-progress': case 'dirty': case 'diverged': return 0
+        case 'behind': case 'not-installed': return 1
+        case 'unreachable': return 2
+        default: return 3
+    }
+}
+
+// Plugins, disabled plugins and apps, each sorted by statusRank then name -- a stable
+// split so the sections in Panel.qml never need their own sort call.
 function groupByKind(items) {
     var plugins = [], disabled = [], apps = []
     for (var i = 0; i < (items || []).length; i++) {
@@ -87,9 +102,10 @@ function groupByKind(items) {
         else plugins.push(it)
     }
     function byName(a, b) { return a.name < b.name ? -1 : a.name > b.name ? 1 : 0 }
-    plugins.sort(byName)
-    disabled.sort(byName)
-    apps.sort(byName)
+    function byStatusThenName(a, b) { return (statusRank(a) - statusRank(b)) || byName(a, b) }
+    plugins.sort(byStatusThenName)
+    disabled.sort(byName)  // off is off; nothing in here is waiting on anyone
+    apps.sort(byStatusThenName)
     return { plugins: plugins, disabled: disabled, apps: apps }
 }
 
@@ -208,4 +224,38 @@ function historyMark(e) {
     if (!e) return ''
     if (!e.ok) return '✗'
     return e.action === 'rollback' ? '↩' : '✓'
+}
+
+// The expanded row's facts, as [label, value] pairs; empty values are left out.
+function infoRows(item, nowSeconds, home) {
+    if (!item) return []
+    var info = item.info || {}
+    var rows = []
+    var status = stateLabel(item)
+    if (item.held) status += ' · held' + (item.holdReason && item.holdReason !== 'held' ? ' (' + item.holdReason + ')' : '')
+    if (item.ahead > 0) status += ' · ' + item.ahead + (item.ahead === 1 ? ' local commit' : ' local commits')
+    rows.push(['Status', status])
+    if (info.branch) rows.push(['Branch', info.branch])
+    if (info.upstreamTs) rows.push(['Upstream', 'last commit ' + relativeAge(info.upstreamTs, nowSeconds)])
+    if (info.path) rows.push(['Folder', home && info.path.indexOf(home + '/') === 0 ? '~' + info.path.slice(home.length) : info.path])
+    return rows
+}
+
+// The source link as shown: host and path, no scheme.
+function shortUrl(url) {
+    return String(url || '').replace(/^https?:\/\//, '')
+}
+
+// The Update all summary, from [{id, name, ok}] in the order they ran.
+function queueSummary(results) {
+    results = results || []
+    var ok = 0, failed = []
+    for (var i = 0; i < results.length; i++) {
+        if (results[i].ok) ok++
+        else failed.push(results[i].name || results[i].id)
+    }
+    var parts = []
+    if (ok) parts.push(ok + ' updated')
+    if (failed.length) parts.push(failed.length + ' failed (' + failed.join(', ') + ')')
+    return parts.length ? 'Update all: ' + parts.join(', ') + '.' : ''
 }
