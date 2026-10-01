@@ -59,6 +59,14 @@ CHECK_WORKERS = 8
 # The states an Update click can act on: 'behind' pulls new commits, 'not-installed'
 # builds and installs what the repo already has (an app's updateCmd does both).
 UPDATABLE_STATES = ('behind', 'not-installed')
+# history.json keeps this many entries; the panel shows the newest few.
+HISTORY_LIMIT = 50
+HISTORY_SHOWN = 8
+# A plugin can be rolled back from its last update for this long. Past it, the Roll back
+# button would sit on every row the Dashboard ever updated.
+ROLLBACK_WINDOW_SECONDS = 7 * 24 * 3600
+# Commits listed per side in the "what's new" view.
+LOG_LIMIT = 50
 
 # Seeded into APPS_PATH the first time it's missing; from then on the file on
 # disk is what's read; edit it there (or via the "+ Add app" form) to add or
@@ -134,6 +142,71 @@ def load_status():
     except (OSError, ValueError):
         pass
     return None
+
+
+def _read_json(path, default):
+    try:
+        data = json.loads(Path(path).read_text())
+        return data if isinstance(data, type(default)) else default
+    except (OSError, ValueError):
+        return default
+
+
+def _write_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix('.tmp')
+    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.replace(path)
+
+
+# Read through STATE at call time (not fixed at import), so a test that points STATE
+# somewhere else takes these with it.
+def history_path():
+    return STATE / 'history.json'
+
+
+def holds_path():
+    return STATE / 'holds.json'
+
+
+def load_history():
+    return _read_json(history_path(), [])
+
+
+def append_history(entry):
+    _write_json(history_path(), (load_history() + [entry])[-HISTORY_LIMIT:])
+
+
+def load_holds():
+    """{id: {'ts', 'reason'}} for everything held: left out of the badge, Update all and
+    notifications until unheld, because its update is not wanted yet (a local fix waiting
+    on upstream, or an update that was just rolled back)."""
+    return _read_json(holds_path(), {})
+
+
+def save_holds(holds):
+    _write_json(holds_path(), holds)
+
+
+def repo_head(repo_dir):
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'rev-parse', 'HEAD'])
+    return out.strip() if rc == 0 else ''
+
+
+def git_log(repo_dir, rev_range):
+    """[{hash, subject, author, ts}] for rev_range, newest first, at most LOG_LIMIT."""
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'log', f'-n{LOG_LIMIT}',
+                      '--format=%h%x1f%s%x1f%an%x1f%ct', rev_range], timeout=20)
+    commits = []
+    if rc != 0:
+        return commits
+    for line in out.splitlines():
+        parts = line.split('\x1f')
+        if len(parts) == 4:
+            commits.append({'hash': parts[0], 'subject': parts[1], 'author': parts[2],
+                            'ts': int(parts[3]) if parts[3].isdigit() else 0})
+    return commits
 
 
 def load_apps():
@@ -507,7 +580,8 @@ def notify_new_updates(items, old_behind_ids):
     the last check -- not a repeat every cycle for something that's been
     sitting there, and not for 'dirty'/'diverged', which need a person
     regardless of how many checks go by."""
-    newly = [i for i in items if i['updateState'] in UPDATABLE_STATES and i['id'] not in old_behind_ids]
+    newly = [i for i in items if i['updateState'] in UPDATABLE_STATES and not i.get('held')
+             and i['id'] not in old_behind_ids]
     if not newly:
         return
     names = ', '.join(i['name'] for i in newly[:5])
@@ -524,10 +598,22 @@ def check_all():
         jobs = [pool.submit(check_plugin, p) for p in discover_plugins()] + \
                [pool.submit(check_app, a) for a in load_apps()]
         items = [job.result() for job in jobs]
+    holds = load_holds()
+    history = load_history()
+    now = time.time()
+    for item in items:
+        item['held'] = item['id'] in holds
+        item['holdReason'] = holds.get(item['id'], {}).get('reason', '')
+        candidate = rollback_candidate(item['id'], history, now) if item.get('kind') == 'plugin' else None
+        item['rollback'] = ({'to': candidate['before'][:7], 'toVersion': candidate.get('fromVersion', ''),
+                             'fromVersion': candidate.get('toVersion', '')} if candidate else None)
     status = {
-        'ts': time.time(),
+        'ts': now,
         'items': items,
-        'updatable': sum(1 for i in items if i['updateState'] in UPDATABLE_STATES),
+        'updatable': sum(1 for i in items if i['updateState'] in UPDATABLE_STATES and not i['held']),
+        'history': [{k: e.get(k) for k in ('id', 'name', 'kind', 'action', 'ok', 'fromVersion',
+                                            'toVersion', 'ts', 'message')}
+                    for e in reversed(history[-HISTORY_SHOWN:])],
     }
     notify_new_updates(items, old_behind_ids)
     STATE.mkdir(parents=True, exist_ok=True)
@@ -563,15 +649,25 @@ def cmd_disable(args):
     check_all()
 
 
+def item_version(item_id, app=None):
+    return pkg_version(app.get('pkgName', item_id)) if app else manifest_version(item_id)
+
+
 def cmd_update(args):
     ensure_apps_file()
     apps = {a['id']: a for a in load_apps()}
-    if args.id in apps:
-        a = apps[args.id]
+    app = apps.get(args.id)
+    repo_dir = app['repoDir'] if app else PLUGINS_DIR / args.id
+    before = repo_head(repo_dir)
+    from_version = item_version(args.id, app)
+    units_installed_before = set()
+    if app:
+        a = app
         rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900, stream_log=STATE / 'action.log')
     else:
         plugin_dir = PLUGINS_DIR / args.id
         units_before = shipped_units(plugin_dir)
+        units_installed_before = {name for name in units_before if (USER_UNIT_DIR / name).exists()}
         rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180, stream_log=STATE / 'action.log')
         if rc == 0 and has_ensure_bootstrap(plugin_dir):
             erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
@@ -599,7 +695,142 @@ def cmd_update(args):
         message = (out or err).strip()[-4000:]
     else:
         message = '\n'.join(t for t in (out.strip(), err.strip()) if t)[-4000:]
+    # What a rollback needs: where HEAD was, and which units this update started (so a
+    # rollback to a version that does not ship them can stop them again).
+    units_added = [] if app else sorted(
+        name for name in shipped_units(repo_dir)
+        if name not in units_installed_before and (USER_UNIT_DIR / name).exists())
+    append_history({
+        'ts': time.time(), 'id': args.id, 'name': app.get('name', args.id) if app else args.id,
+        'kind': 'app' if app else 'plugin', 'action': 'update', 'ok': rc == 0,
+        'before': before, 'after': repo_head(repo_dir),
+        'fromVersion': from_version, 'toVersion': item_version(args.id, app),
+        'unitsInstalled': units_added,
+        'message': '' if rc == 0 else (message.strip().splitlines() or [''])[-1][:200],
+    })
     print(json.dumps({'ok': rc == 0, 'message': message}))
+    check_all()
+
+
+def rollback_candidate(plugin_id, history, now=None):
+    """The update this plugin can be rolled back from, or None: its most recent change
+    (a successful update that moved HEAD, or a rollback) must be an update, inside
+    ROLLBACK_WINDOW_SECONDS, with HEAD still where that update left it -- anything else
+    means the checkout moved on since and resetting would throw that away."""
+    changes = [e for e in history if e.get('id') == plugin_id and e.get('kind') == 'plugin'
+               and (e.get('action') == 'rollback' or (e.get('ok') and e.get('before') and e.get('before') != e.get('after')))]
+    if not changes:
+        return None
+    last = changes[-1]
+    if last.get('action') != 'update':
+        return None
+    if (now if now is not None else time.time()) - last.get('ts', 0) > ROLLBACK_WINDOW_SECONDS:
+        return None
+    if repo_head(PLUGINS_DIR / plugin_id) != last.get('after'):
+        return None
+    return last
+
+
+def cmd_rollback(args):
+    """Puts a plugin back where its last Dashboard update found it: the same
+    `reset --hard` omarchy-plugin-update itself does when an update fails validation,
+    then the same steps an update takes (validate, the plugin's own --ensure, a plugin
+    rescan), run in reverse for any service the update had started. Then holds the plugin,
+    or the next check would offer the same update straight back."""
+    def done(ok, message):
+        print(json.dumps({'ok': ok, 'message': message}))
+        if ok:
+            check_all()
+
+    ensure_apps_file()
+    if args.id in {a['id'] for a in load_apps()}:
+        return done(False, 'Roll back is for plugins. An app is rebuilt from source; '
+                           'check out the commit you want in its repo and run its update command.')
+    plugin_dir = PLUGINS_DIR / args.id
+    entry = rollback_candidate(args.id, load_history())
+    if not entry:
+        return done(False, 'Nothing to roll back: no Dashboard update of this plugin in the last '
+                           f'{ROLLBACK_WINDOW_SECONDS // 86400} days, or it has changed since.')
+    op = repo_operation_in_progress(plugin_dir)
+    if op:
+        return done(False, f'A git {op} is in progress in {plugin_dir}; resolve it first.')
+    _, dirty, _ = run(['git', '-C', str(plugin_dir), 'status', '--porcelain'])
+    if dirty.strip():
+        return done(False, f'{plugin_dir} has local changes a rollback would discard; commit or stash them first.')
+    rc, out, err = run(['git', '-C', str(plugin_dir), 'reset', '--hard', entry['before']])
+    if rc != 0:
+        return done(False, 'git reset failed: ' + (err or out).strip())
+    rc, out, err = run(['omarchy', 'plugin', 'validate', str(plugin_dir)], timeout=60)
+    if rc != 0:
+        run(['git', '-C', str(plugin_dir), 'reset', '--hard', entry['after']])
+        return done(False, 'The earlier version no longer passes validation, so the plugin was left on the '
+                           'update:\n' + (err or out).strip()[-1500:])
+    ok = True
+    messages = [f"Rolled back to {entry['before'][:7]}"
+                + (f" (v{entry['fromVersion']})" if entry.get('fromVersion') else '') + '.']
+    shipped_now = shipped_units(plugin_dir)
+    removed = False
+    for name in entry.get('unitsInstalled') or []:
+        if name in shipped_now:
+            continue
+        run(['systemctl', '--user', 'disable', '--now', name], timeout=60)
+        try:
+            (USER_UNIT_DIR / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            messages.append(f'Could not remove {name}: {e}')
+            ok = False
+            continue
+        removed = True
+        messages.append(f'Stopped and removed {name}, which the update had added.')
+    if removed:
+        run(['systemctl', '--user', 'daemon-reload'], timeout=30)
+    if has_ensure_bootstrap(plugin_dir):
+        erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
+        if erc != 0:
+            ok = False
+            messages.append('The plugin did not come up cleanly:\n' + (eerr or eout).strip()[-1500:])
+    run(['omarchy-shell', 'shell', 'rescanPlugins'], timeout=20)
+    holds = load_holds()
+    holds[args.id] = {'ts': time.time(), 'reason': 'rolled back from v' + entry['toVersion']
+                      if entry.get('toVersion') else 'rolled back'}
+    save_holds(holds)
+    messages.append('Held, so the update is not offered again until you unhold it.')
+    append_history({
+        'ts': time.time(), 'id': args.id, 'name': entry.get('name', args.id), 'kind': 'plugin',
+        'action': 'rollback', 'ok': ok, 'before': entry['after'], 'after': repo_head(plugin_dir),
+        'fromVersion': entry.get('toVersion', ''), 'toVersion': manifest_version(args.id),
+        'unitsInstalled': [], 'message': '' if ok else messages[-1][:200],
+    })
+    print(json.dumps({'ok': ok, 'message': '\n'.join(messages)}))
+    check_all()
+
+
+def known_item(item_id):
+    return item_id in {a['id'] for a in load_apps()} or (PLUGINS_DIR / item_id).is_dir()
+
+
+def cmd_hold(args):
+    ensure_apps_file()
+    if not known_item(args.id):
+        print(json.dumps({'ok': False, 'message': f'No plugin or tracked app called {args.id}.'}))
+        return
+    holds = load_holds()
+    holds[args.id] = {'ts': time.time(), 'reason': getattr(args, 'reason', None) or 'held'}
+    save_holds(holds)
+    print(json.dumps({'ok': True, 'message': f'Holding {args.id}: its updates stay out of the badge, '
+                                             f'Update all and notifications until you unhold it.'}))
+    check_all()
+
+
+def cmd_unhold(args):
+    holds = load_holds()
+    if holds.pop(args.id, None) is None:
+        print(json.dumps({'ok': False, 'message': f'{args.id} is not held.'}))
+        return
+    save_holds(holds)
+    print(json.dumps({'ok': True, 'message': f'{args.id} is no longer held.'}))
     check_all()
 
 
@@ -631,12 +862,20 @@ def cmd_diff(args):
         rc, _, _ = run(['git', '-C', a['repoDir'], 'merge-base', '--is-ancestor', remote_ref, branch])
         base = 'HEAD' if rc == 0 else branch
         rc, out, err = run(['git', '-C', a['repoDir'], 'diff', f'{base}...{remote_ref}'], timeout=20)
+        if rc == 0:
+            # No 'local' list for apps: their checked-out branch (Flea's aarch64-local)
+            # carries our own patches by design, and those are not what the update changes.
+            incoming, local = git_log(a['repoDir'], f'{base}..{remote_ref}'), []
     else:
-        rc, out, err = run(['git', '-C', str(PLUGINS_DIR / args.id), 'diff', 'HEAD', 'FETCH_HEAD'], timeout=20)
+        plugin_dir = PLUGINS_DIR / args.id
+        rc, out, err = run(['git', '-C', str(plugin_dir), 'diff', 'HEAD', 'FETCH_HEAD'], timeout=20)
+        if rc == 0:
+            incoming, local = git_log(plugin_dir, 'HEAD..FETCH_HEAD'), git_log(plugin_dir, 'FETCH_HEAD..HEAD')
     if rc != 0:
         print(json.dumps({'ok': False, 'message': (err or 'Could not compute diff.').strip()[-2000:]}))
         return
-    print(json.dumps({'ok': True, 'diff': out[-20000:] or '(no textual diff)'}))
+    print(json.dumps({'ok': True, 'diff': out[-20000:] or '(no textual diff)',
+                      'incoming': incoming, 'local': local}))
 
 
 def cmd_add_app(args):
@@ -688,15 +927,19 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('check').add_argument('--force', action='store_true')
-    for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app'):
+    for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app', 'rollback', 'unhold'):
         p = sub.add_parser(name)
         p.add_argument('id')
+    p_hold = sub.add_parser('hold')
+    p_hold.add_argument('id')
+    p_hold.add_argument('--reason', default='')
     p_add_app = sub.add_parser('add-app')
     p_add_app.add_argument('json')
     args = parser.parse_args()
     handlers = {
         'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
+        'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
     }
     handlers[args.command](args)
 

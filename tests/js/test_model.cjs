@@ -144,4 +144,39 @@ assert.equal(ctx.localTag({updateState: 'diverged', ahead: 1}), '');
 assert.equal(ctx.localTag({updateState: 'up-to-date', ahead: 0}), '');
 assert.equal(ctx.localTag({updateState: 'up-to-date'}), '');
 assert.equal(ctx.localTag(null), '');
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed and localTag all pass.');
+// holds: out of the badge, ring and Update all; pill and stripe go quiet
+assert.equal(ctx.canUpdate({updateState: 'behind', held: true}), false);
+assert.equal(ctx.canHold({updateState: 'behind'}), true);
+assert.equal(ctx.canHold({updateState: 'behind', held: true}), false);
+assert.equal(ctx.canHold({updateState: 'up-to-date'}), false);
+assert.equal(ctx.badgeCount([{updateState: 'behind', held: true}, {updateState: 'behind'}]), 1);
+assert.equal(ctx.pillLabel({kind: 'plugin', enabled: true, updateState: 'behind', behind: 2, held: true}), 'HELD');
+assert.equal(ctx.pillLabel({kind: 'plugin', enabled: false, held: true}), 'OFF');
+assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', held: true}), 'off');
+var hh = ctx.healthFraction([{updateState: 'behind', held: true}, {updateState: 'up-to-date'}]);
+assert.equal(hh.done, 1); assert.equal(hh.total, 1);
+
+// commitsHtml
+var ch = ctx.commitsHtml({incoming: [{hash: 'abc1234', subject: 'Fix <thing>', author: 'nix', ts: 1000}],
+                          local: [{hash: 'def5678', subject: 'Local fix', author: 'me', ts: 1000}]}, {}, 1000 + 7200);
+assert.ok(ch.indexOf('Upstream · 1 commit') >= 0);
+assert.ok(ch.indexOf('Only here · 1 commit') >= 0);
+assert.ok(ch.indexOf('Fix &lt;thing&gt;') >= 0);
+assert.ok(ch.indexOf('2 hours ago') >= 0);
+assert.ok(ctx.commitsHtml({incoming: [], local: []}).indexOf('no commits') >= 0);
+assert.ok(ctx.commitsHtml(null).indexOf('no commits') >= 0);
+
+// historyLine / historyMark
+var now = 100000;
+assert.equal(ctx.historyLine({name: 'Omastorm', action: 'update', ok: true, fromVersion: '0.1.15', toVersion: '0.1.16', ts: now - 30}, now),
+             'Omastorm updated 0.1.15 → 0.1.16 · just now');
+assert.equal(ctx.historyLine({id: 'flea', action: 'update', ok: true, fromVersion: '1', toVersion: '1', ts: now}, now),
+             'flea rebuilt, no version change · just now');
+assert.equal(ctx.historyLine({name: 'X', action: 'update', ok: false, ts: now}, now), 'X update failed · just now');
+assert.equal(ctx.historyLine({name: 'X', action: 'rollback', ok: true, fromVersion: '2', toVersion: '1', ts: now}, now),
+             'X rolled back 2 → 1 · just now');
+assert.equal(ctx.historyMark({ok: true, action: 'update'}), '✓');
+assert.equal(ctx.historyMark({ok: true, action: 'rollback'}), '↩');
+assert.equal(ctx.historyMark({ok: false, action: 'update'}), '✗');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits and history all pass.');

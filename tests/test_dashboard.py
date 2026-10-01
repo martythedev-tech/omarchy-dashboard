@@ -8,6 +8,23 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import dashboard as dash
+from unittest.mock import call
+
+_STATE_DIR = None
+
+
+def setUpModule():
+    # Every test that ends up writing history.json, holds.json or status.json writes it
+    # here, never into the real ~/.local/state.
+    global _STATE_DIR
+    _STATE_DIR = tempfile.TemporaryDirectory()
+    dash.STATE = Path(_STATE_DIR.name)
+    dash.STATUS_PATH = dash.STATE / 'status.json'
+    dash.APPS_PATH = dash.STATE / 'apps.json'
+
+
+def tearDownModule():
+    _STATE_DIR.cleanup()
 
 
 def fake_run(table):
@@ -307,16 +324,17 @@ class CheckAllTests(unittest.TestCase):
                  patch.object(dash, 'app_update_state', return_value=('dirty', 1, '')), \
                  patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
                 dash.PLUGINS_DIR = home / '.config/omarchy/plugins'
-                dash.STATE = home / '.local/state/omarchy/plugins/martythedev-tech.dashboard'
-                dash.STATUS_PATH = dash.STATE / 'status.json'
-                status = dash.check_all()
+                state = home / '.local/state/omarchy/plugins/martythedev-tech.dashboard'
+                with patch.object(dash, 'STATE', state), patch.object(dash, 'STATUS_PATH', state / 'status.json'):
+                    status = dash.check_all()
+                    status_written = dash.STATUS_PATH.exists()
 
             self.assertEqual(status['updatable'], 1)
             ids = {i['id']: i for i in status['items']}
             self.assertEqual(ids['a.plugin']['updateState'], 'behind')
             self.assertEqual(ids['b.plugin']['updateState'], 'up-to-date')
             self.assertEqual(ids['flea']['updateState'], 'dirty')
-            self.assertTrue(dash.STATUS_PATH.exists())
+            self.assertTrue(status_written)
             # No prior status.json existed, so 'a.plugin' becoming 'behind' is
             # new -- notify-send should have fired once.
             notifies = [c for c in run_mock.call_args_list if c.args[0][0] == 'notify-send']
@@ -467,7 +485,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': 'howdy'})()
             dash.cmd_update(args)
-        run_mock.assert_called_once_with(['./rebuild.sh', '--install'], cwd='/home/x/Projects/howdy', timeout=900, stream_log=dash.STATE / 'action.log')
+        self.assertIn(call(['./rebuild.sh', '--install'], cwd='/home/x/Projects/howdy', timeout=900, stream_log=dash.STATE / 'action.log'), run_mock.call_args_list)
 
     def test_unknown_id_falls_through_to_omarchy_plugin_update(self):
         with patch.object(dash, 'ensure_apps_file'), \
@@ -476,7 +494,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': 'sslvpn'})()
             dash.cmd_update(args)
-        run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', 'sslvpn', '--yes'], timeout=180, stream_log=dash.STATE / 'action.log')
+        self.assertIn(call(['omarchy', 'plugin', 'update', 'sslvpn', '--yes'], timeout=180, stream_log=dash.STATE / 'action.log'), run_mock.call_args_list)
 
     def test_a_failed_update_reports_what_it_said_and_what_went_wrong(self):
         # rebuild.sh explains a conflict on stdout and git's complaint arrives on stderr;
@@ -500,7 +518,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': dash.SELF_ID})()
             dash.cmd_update(args)
-        run_mock.assert_called_once_with(['omarchy', 'plugin', 'update', dash.SELF_ID, '--yes'], timeout=180, stream_log=dash.STATE / 'action.log')
+        self.assertIn(call(['omarchy', 'plugin', 'update', dash.SELF_ID, '--yes'], timeout=180, stream_log=dash.STATE / 'action.log'), run_mock.call_args_list)
 
 
 class CmdEnableTests(unittest.TestCase):
@@ -564,8 +582,8 @@ class CmdDiffTests(unittest.TestCase):
             dash.PLUGINS_DIR = Path('/home/x/.config/omarchy/plugins')
             args = type('A', (), {'id': 'sslvpn'})()
             dash.cmd_diff(args)
-        run_mock.assert_called_once_with(
-            ['git', '-C', '/home/x/.config/omarchy/plugins/sslvpn', 'diff', 'HEAD', 'FETCH_HEAD'], timeout=20)
+        self.assertIn(call(['git', '-C', '/home/x/.config/omarchy/plugins/sslvpn', 'diff', 'HEAD', 'FETCH_HEAD'], timeout=20),
+                      run_mock.call_args_list)
         payload = json.loads(print_mock.call_args.args[0])
         self.assertTrue(payload['ok'])
         self.assertIn('diff --git', payload['diff'])
@@ -575,6 +593,7 @@ class CmdDiffTests(unittest.TestCase):
         table = {
             ('git', '-C', repo, 'merge-base', '--is-ancestor'): (0 if branch_has_upstream else 1, '', ''),
             ('git', '-C', repo, 'diff'): (0, 'diff --git a b\n', ''),
+            ('git', '-C', repo, 'log'): (0, '', ''),
         }
         calls = []
         def recording(args, **kw):
@@ -584,7 +603,7 @@ class CmdDiffTests(unittest.TestCase):
                  {'id': 'howdy', 'repoDir': repo, 'branch': 'master', 'remote': 'origin'}]), \
              patch.object(dash, 'run', recording), patch('builtins.print'):
             dash.cmd_diff(type('A', (), {'id': 'howdy'})())
-        return calls[-1]
+        return [c for c in calls if c[3] == 'diff'][0]
 
     def test_app_diff_shows_upstreams_side_from_branch(self):
         # Three dots: only what upstream changed, not howdy master's own rebuild.sh commit
@@ -938,3 +957,239 @@ class CmdCheckCacheTests(unittest.TestCase):
                  patch.object(dash, 'ensure_apps_file'), patch('builtins.print'):
                 dash.cmd_check(type('A', (), {'force': False})())
         check_mock.assert_called_once()
+
+
+def git(repo, *args):
+    import subprocess
+    return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+class RealRepoFixture(unittest.TestCase):
+    """A real plugin git repo with two commits, so reset/rev-parse/log run for real; only
+    omarchy, systemctl and the shell rescan are faked (and recorded)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.plugins = root / 'plugins'
+        self.plugin = self.plugins / 'x.plugin'
+        self.plugin.mkdir(parents=True)
+        self.units = root / 'units'
+        self.units.mkdir()
+        git(self.plugin, 'init', '-q')
+        git(self.plugin, 'config', 'user.email', 't@t'); git(self.plugin, 'config', 'user.name', 't')
+        (self.plugin / 'manifest.json').write_text('{"version": "1.0.0"}')
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'one')
+        self.old = git(self.plugin, 'rev-parse', 'HEAD')
+        (self.plugin / 'manifest.json').write_text('{"version": "1.1.0"}')
+        (self.plugin / 'gpu.service').write_text('[Service]\nExecStart=/p/x.plugin/run\n')
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'two')
+        self.new = git(self.plugin, 'rev-parse', 'HEAD')
+        (self.units / 'gpu.service').write_text('[Service]\n')
+        self.calls = []
+        self.validate_rc = 0
+        real_run = dash.run
+
+        def fake(args, cwd=None, timeout=20, **kw):
+            if args[0] == 'git':
+                return real_run(args, cwd=cwd, timeout=timeout)
+            self.calls.append(list(args))
+            if args[:3] == ['omarchy', 'plugin', 'validate']:
+                return (self.validate_rc, '', 'invalid manifest' if self.validate_rc else '')
+            return (0, '', '')
+        self.printed = []
+        state = root / 'state'
+        for target, value in (('run', fake), ('PLUGINS_DIR', self.plugins), ('USER_UNIT_DIR', self.units),
+                              ('STATE', state), ('STATUS_PATH', state / 'status.json'),
+                              ('APPS_PATH', state / 'apps.json'), ('load_apps', lambda: []),
+                              ('ensure_apps_file', lambda: None), ('discover_plugins', lambda: [])):
+            patcher = patch.object(dash, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        printer = patch('builtins.print', lambda *a, **k: self.printed.append(json.loads(a[0])))
+        printer.start()
+        self.addCleanup(printer.stop)
+
+    def record_update(self, **over):
+        entry = {'ts': time.time(), 'id': 'x.plugin', 'name': 'x.plugin', 'kind': 'plugin', 'action': 'update',
+                 'ok': True, 'before': self.old, 'after': self.new, 'fromVersion': '1.0.0', 'toVersion': '1.1.0',
+                 'unitsInstalled': ['gpu.service'], 'message': ''}
+        entry.update(over)
+        dash.append_history(entry)
+
+    def rollback(self):
+        dash.cmd_rollback(type('A', (), {'id': 'x.plugin'})())
+        return self.printed[-1]
+
+
+class RollbackCandidateTests(RealRepoFixture):
+    def test_last_update_at_current_head_is_a_candidate(self):
+        self.record_update()
+        self.assertEqual(dash.rollback_candidate('x.plugin', dash.load_history())['before'], self.old)
+
+    def test_too_old_is_not(self):
+        self.record_update(ts=time.time() - dash.ROLLBACK_WINDOW_SECONDS - 60)
+        self.assertIsNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+    def test_head_moved_since_is_not(self):
+        self.record_update(after='0' * 40)
+        self.assertIsNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+    def test_after_a_rollback_is_not(self):
+        self.record_update()
+        self.record_update(action='rollback', before=self.new, after=self.new)
+        self.assertIsNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+    def test_a_later_failed_update_does_not_hide_the_earlier_one(self):
+        # omarchy plugin update puts HEAD back on failure, so it changed nothing.
+        self.record_update()
+        self.record_update(ok=False, before=self.new, after=self.new)
+        self.assertIsNotNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+    def test_an_update_that_moved_nothing_is_not(self):
+        self.record_update(before=self.new)
+        self.assertIsNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+
+class CmdRollbackTests(RealRepoFixture):
+    def test_rolls_back_removes_the_added_unit_rescans_and_holds(self):
+        self.record_update()
+        result = self.rollback()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+        self.assertFalse((self.units / 'gpu.service').exists())
+        self.assertIn(['systemctl', '--user', 'disable', '--now', 'gpu.service'], self.calls)
+        self.assertIn(['omarchy-shell', 'shell', 'rescanPlugins'], self.calls)
+        self.assertEqual(dash.load_holds()['x.plugin']['reason'], 'rolled back from v1.1.0')
+        last = dash.load_history()[-1]
+        self.assertEqual((last['action'], last['ok'], last['toVersion']), ('rollback', True, '1.0.0'))
+        # and it cannot be rolled back again
+        self.assertIsNone(dash.rollback_candidate('x.plugin', dash.load_history()))
+
+    def test_a_unit_the_old_version_also_ships_is_kept(self):
+        self.record_update(unitsInstalled=['manifest.json'])  # stands in for a unit present in both
+        (self.units / 'manifest.json').write_text('x')
+        with patch.object(dash, 'shipped_units', return_value={'manifest.json': (None, '')}):
+            self.assertTrue(self.rollback()['ok'])
+        self.assertTrue((self.units / 'manifest.json').exists())
+
+    def test_local_changes_refuse_and_touch_nothing(self):
+        self.record_update()
+        (self.plugin / 'manifest.json').write_text('{"version": "edited"}')
+        result = self.rollback()
+        self.assertFalse(result['ok'])
+        self.assertIn('local changes', result['message'])
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.new)
+        self.assertTrue((self.units / 'gpu.service').exists())
+
+    def test_old_version_failing_validation_puts_the_update_back(self):
+        self.record_update()
+        self.validate_rc = 1
+        result = self.rollback()
+        self.assertFalse(result['ok'])
+        self.assertIn('invalid manifest', result['message'])
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.new)
+        self.assertNotIn('x.plugin', dash.load_holds())
+
+    def test_nothing_to_roll_back(self):
+        result = self.rollback()
+        self.assertFalse(result['ok'])
+        self.assertIn('Nothing to roll back', result['message'])
+
+    def test_apps_are_refused(self):
+        with patch.object(dash, 'load_apps', lambda: [{'id': 'x.plugin', 'repoDir': '/x'}]):
+            self.assertIn('for plugins', self.rollback()['message'])
+
+
+class UpdateHistoryTests(RealRepoFixture):
+    def test_a_plugin_update_records_heads_versions_and_the_units_it_started(self):
+        git(self.plugin, 'reset', '-q', '--hard', self.old)
+        (self.units / 'gpu.service').unlink()
+        (self.units / 'other.service').write_text('x')
+        # Shipped AND installed before the update: not something this update started.
+        (self.plugin / 'cpu.service').write_text('[Service]\n'); (self.units / 'cpu.service').write_text('x')
+        real = dash.run
+        plugin, units, new = self.plugin, self.units, self.new
+
+        def updating(args, **kw):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                git(plugin, 'reset', '-q', '--hard', new)
+                (units / 'gpu.service').write_text('x')   # what install_new_units would do
+                return (0, 'Updated.', '')
+            return real(args, **kw)
+        with patch.object(dash, 'run', updating), patch.object(dash, 'install_new_units', return_value=([], True)):
+            dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
+        e = dash.load_history()[-1]
+        self.assertEqual((e['before'], e['after'], e['fromVersion'], e['toVersion']), (self.old, self.new, '1.0.0', '1.1.0'))
+        self.assertEqual(e['unitsInstalled'], ['gpu.service'])
+        self.assertTrue(e['ok'])
+
+    def test_a_failed_update_is_recorded_with_its_last_line(self):
+        real = dash.run
+
+        def failing(args, **kw):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                return (1, '', 'fetch failed\ncannot fast-forward')
+            return real(args, **kw)
+        with patch.object(dash, 'run', failing):
+            dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
+        e = dash.load_history()[-1]
+        self.assertFalse(e['ok'])
+        self.assertEqual(e['message'], 'cannot fast-forward')
+
+    def test_history_is_capped(self):
+        for i in range(dash.HISTORY_LIMIT + 5):
+            dash.append_history({'id': str(i)})
+        h = dash.load_history()
+        self.assertEqual(len(h), dash.HISTORY_LIMIT)
+        self.assertEqual(h[-1]['id'], str(dash.HISTORY_LIMIT + 4))
+
+
+class HoldTests(RealRepoFixture):
+    def test_hold_and_unhold(self):
+        dash.cmd_hold(type('A', (), {'id': 'x.plugin', 'reason': ''})())
+        self.assertTrue(self.printed[-1]['ok'])
+        self.assertIn('x.plugin', dash.load_holds())
+        dash.cmd_unhold(type('A', (), {'id': 'x.plugin'})())
+        self.assertTrue(self.printed[-1]['ok'])
+        self.assertNotIn('x.plugin', dash.load_holds())
+
+    def test_unknown_id_is_refused(self):
+        dash.cmd_hold(type('A', (), {'id': 'nope', 'reason': ''})())
+        self.assertFalse(self.printed[-1]['ok'])
+        self.assertEqual(dash.load_holds(), {})
+
+    def test_held_items_leave_the_count_and_notifications_and_carry_rollback(self):
+        self.record_update()
+        dash.save_holds({'other': {'ts': 0, 'reason': 'waiting on upstream'}})
+        items = [{'id': 'x.plugin', 'kind': 'plugin', 'name': 'X', 'updateState': 'up-to-date'},
+                 {'id': 'other', 'kind': 'plugin', 'name': 'O', 'updateState': 'behind'}]
+        with patch.object(dash, 'discover_plugins', lambda: [{'id': 'x.plugin'}, {'id': 'other'}]), \
+             patch.object(dash, 'check_plugin', lambda p: dict(next(i for i in items if i['id'] == p['id']))):
+            status = dash.check_all()
+        ids = {i['id']: i for i in status['items']}
+        self.assertEqual(status['updatable'], 0)
+        self.assertEqual(ids['other']['holdReason'], 'waiting on upstream')
+        self.assertTrue(ids['other']['held'])
+        self.assertEqual(ids['x.plugin']['rollback'], {'to': self.old[:7], 'toVersion': '1.0.0', 'fromVersion': '1.1.0'})
+        self.assertIsNone(ids['other']['rollback'])
+        self.assertNotIn('notify-send', [c[0] for c in self.calls])
+        self.assertEqual(status['history'][0]['action'], 'update')
+
+
+class GitLogTests(RealRepoFixture):
+    def test_parses_commits_newest_first(self):
+        commits = dash.git_log(self.plugin, f'{self.old}..HEAD')
+        self.assertEqual([c['subject'] for c in commits], ['two'])
+        self.assertEqual(commits[0]['author'], 't')
+        self.assertGreater(commits[0]['ts'], 0)
+
+    def test_plugin_diff_returns_incoming_and_local(self):
+        # Upstream is one commit behind us, written the way `git fetch` leaves it.
+        (self.plugin / '.git' / 'FETCH_HEAD').write_text(self.old + "\t\tbranch 'main' of origin\n")
+        dash.cmd_diff(type('A', (), {'id': 'x.plugin'})())
+        r = self.printed[-1]
+        self.assertTrue(r['ok'])
+        self.assertEqual(r['incoming'], [])
+        self.assertEqual([c['subject'] for c in r['local']], ['two'])
