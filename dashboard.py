@@ -27,9 +27,15 @@ offline recorder as the worst thing on the machine: the bar showed "GPU · OFFLI
 place of its live readings while the dashboard said "up to date". cmd_update now
 compares the units the plugin ships before and after the update and installs the ones
 that are new (see install_new_units for the guards).
+
+The third (2026-10-05): updates, rollbacks and removals run as a job in their own transient
+user unit, not as a child of the panel (see JOB_KINDS for why), and an update that changed
+a plugin's code restarts the services it ships (restart_updated_units).
 """
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
@@ -82,6 +88,16 @@ _LOG_STAMP = re.compile(r'^\S+ \S+\s+')
 _LOAD_FAILURE = re.compile(r'failed|\b\w*Error\b|is not a type|is not installed|unavailable', re.I)
 # A notification's buttons wait for a click; past this its waiter gives up.
 NOTIFY_WAIT_SECONDS = 3600
+# Changed files that do not make a plugin's running services stale.
+_NOT_CODE = re.compile(r'(^|/)(docs|tests)/|\.(md|txt|png|jpe?g|gif|svg|webp)$|(^|/)LICENSE$', re.I)
+# The actions that change a plugin's directory. The shell answers any such change by
+# unloading and reloading every plugin widget, this one included, and a process the panel
+# started dies with it (QProcess kills its child on destruction): 2026-10-05, three updates
+# from the panel landed but none reached history. So these run as a job in their own
+# transient user unit, and the panel follows job.json instead of a process's output.
+JOB_KINDS = ('update', 'rollback', 'remove')
+# A job that is 'starting' this long without its worker having taken it never will.
+JOB_START_GRACE_SECONDS = 60
 
 # Seeded into APPS_PATH the first time it's missing; from then on the file on
 # disk is what's read; edit it there (or via the "+ Add app" form) to add or
@@ -392,6 +408,43 @@ def reload_plugin_widget(plugin_dir):
         os.utime(Path(plugin_dir) / 'manifest.json')
     except OSError:
         pass
+
+
+def restart_updated_units(plugin_dir, old_head, new_head, units_before):
+    """Restarts the running services this plugin already had installed when the code
+    between old_head and new_head changed (2026-10-05, Pulse 1.3.2 -> 1.3.5: the update
+    changed collectors/cpu_pulse.py, and cpu-pulse.service went on running the old code
+    for hours). Docs, tests and images do not count as code. Only services: a timer's
+    service starts fresh each time anyway. Only units that run this plugin's own code,
+    the same guard install_new_units uses. Returns (messages, ok)."""
+    plugin_dir = Path(plugin_dir)
+    if not old_head or not new_head or old_head == new_head:
+        return [], True
+    rc, out, _ = run(['git', '-C', str(plugin_dir), 'diff', '--name-only', old_head, new_head])
+    if rc != 0 or not any(f.strip() and not _NOT_CODE.search(f) for f in out.splitlines()):
+        return [], True
+    messages, ok, restarted = [], True, []
+    for name in sorted(units_before):
+        target = USER_UNIT_DIR / name
+        if not name.endswith('.service') or not target.exists():
+            continue
+        try:
+            if plugin_dir.name not in target.read_text():
+                continue
+        except (OSError, UnicodeDecodeError):
+            continue
+        _, state, _ = run(['systemctl', '--user', 'is-active', name], timeout=10)
+        if state.strip() != 'active':
+            continue
+        rc, out, err = run(['systemctl', '--user', 'restart', name], timeout=60)
+        if rc == 0:
+            restarted.append(name)
+        else:
+            ok = False
+            messages.append(f'{name} did not restart: {(err or out).strip()[-300:]}')
+    if restarted:
+        messages.insert(0, 'Restarted ' + ', '.join(restarted) + ' to run the new code.')
+    return messages, ok
 
 
 def shell_log():
@@ -803,16 +856,16 @@ def cmd_await_notification(args):
               if i['id'] in args.ids and i.get('updateState') in UPDATABLE_STATES and not i.get('held')}
     names = {i['id']: i.get('name', i['id']) for i in status.get('items', [])}
     done, failed = [], []
-    for item_id in args.ids:
-        if item_id not in wanted:
-            continue
-        rc = subprocess.run([sys.executable, str(Path(__file__).resolve()), 'update', item_id],
-                            capture_output=True, text=True, check=False)
-        try:
-            ok = json.loads(rc.stdout.strip().splitlines()[-1]).get('ok')
-        except (ValueError, IndexError):
-            ok = False
-        (done if ok else failed).append(names.get(item_id, item_id))
+    ids = [i for i in args.ids if i in wanted]
+    # As a job, so an open panel shows it going like one it started itself. This waiter
+    # is already its own unit, so it runs the job in-process.
+    job = new_job('update', ids) if ids else None
+    if ids and job is None:
+        run(['notify-send', '--app-name=Plugin Dashboard', '--icon=dialog-information', 'Not updated',
+             'Another update is still running; try again once it is done.'], timeout=5)
+        return
+    for r in (execute_job(job)['results'] if job else []):
+        (done if r['ok'] else failed).append(names.get(r['id'], r['id']))
     if not done and not failed:
         body = 'Nothing left to update.'
     else:
@@ -861,6 +914,7 @@ def check_all():
 
 def cmd_check(args):
     ensure_apps_file()
+    reap_stale_job()
     if not getattr(args, 'force', False):
         cached = load_status()
         if status_is_fresh(cached):
@@ -924,6 +978,17 @@ def cmd_update(args):
                     rc = 1
                     err = (err + '\n' if err.strip() else '') + \
                         'Update landed but a new background service did not come up:\n' + text
+        if rc == 0:
+            restart_messages, restarted_ok = restart_updated_units(plugin_dir, before, repo_head(plugin_dir),
+                                                                   units_before)
+            if restart_messages:
+                text = '\n'.join(restart_messages)
+                if restarted_ok:
+                    out = (out + '\n' if out.strip() else '') + text
+                else:
+                    rc = 1
+                    err = (err + '\n' if err.strip() else '') + \
+                        'Update landed but a background service did not restart:\n' + text
         # Last, after every reload the steps above may have triggered.
         if rc == 0 and before != repo_head(plugin_dir):
             load_ok, load_text = check_plugin_loaded(args.id, plugin_dir, log_mark)
@@ -1043,6 +1108,10 @@ def cmd_rollback(args):
         messages.append(f'Stopped and removed {name}, which the update had added.')
     if removed:
         run(['systemctl', '--user', 'daemon-reload'], timeout=30)
+    restart_messages, restarted_ok = restart_updated_units(plugin_dir, entry['after'], entry['before'],
+                                                           shipped_now)
+    messages.extend(restart_messages)
+    ok = ok and restarted_ok
     if has_ensure_bootstrap(plugin_dir):
         erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
         if erc != 0:
@@ -1103,6 +1172,134 @@ def cmd_remove(args):
     rc, out, err = run(['omarchy', 'plugin', 'remove', args.id, '--yes'], timeout=60)
     print(json.dumps({'ok': rc == 0, 'message': (out or err).strip()}))
     check_all()
+
+
+def job_path():
+    return STATE / 'job.json'
+
+
+def load_job():
+    return _read_json(job_path(), {})
+
+
+def save_job(job):
+    _write_json(job_path(), job)
+
+
+def pid_alive(pid):
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def job_active(job, now=None):
+    """Whether this job is still going: its worker is alive, or it was handed over so
+    recently that the worker may not have taken it yet."""
+    if job.get('state') == 'running':
+        return pid_alive(job.get('pid'))
+    if job.get('state') == 'starting':
+        return (now if now is not None else time.time()) - job.get('startTs', 0) < JOB_START_GRACE_SECONDS
+    return False
+
+
+def reap_stale_job(now=None):
+    """Closes a job whose worker died without closing it (killed, the machine went down),
+    so the panel does not show it busy forever."""
+    job = load_job()
+    if job.get('state') not in ('starting', 'running') or job_active(job, now):
+        return
+    finished = {r.get('id') for r in job.get('results', [])}
+    job['results'] = job.get('results', []) + [
+        {'id': i, 'ok': False, 'message': 'Did not finish: the Dashboard\'s worker stopped first '
+                                          '(journalctl --user -u "dashboard-job-*").'}
+        for i in job.get('ids', []) if i not in finished]
+    job.update(state='done', current='', finishedTs=now if now is not None else time.time())
+    save_job(job)
+
+
+def new_job(kind, ids):
+    """Claims job.json for a new job, or returns None while another one is still going."""
+    reap_stale_job()
+    if job_active(load_job()):
+        return None
+    now = time.time()
+    job = {'jobId': f'{int(now * 1000)}', 'kind': kind, 'ids': list(ids), 'state': 'starting',
+           'current': ids[0] if ids else '', 'itemTs': now, 'startTs': now, 'results': [], 'pid': None}
+    save_job(job)
+    return job
+
+
+def run_job_item(kind, item_id):
+    """One item of a job through the same command the panel used to run directly; its
+    printed JSON result is what the job records."""
+    handler = {'update': cmd_update, 'rollback': cmd_rollback, 'remove': cmd_remove}[kind]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            handler(argparse.Namespace(id=item_id))
+    except Exception as e:  # noqa: BLE001 -- one item's crash must not lose the rest of the job
+        return {'ok': False, 'message': f'{type(e).__name__}: {e}'}
+    for line in buf.getvalue().splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and 'ok' in r:
+            return {'ok': bool(r['ok']), 'message': r.get('message') or ''}
+    return {'ok': False, 'message': 'It did not report a result.'}
+
+
+def execute_job(job):
+    """Runs a claimed job in this process, item by item, keeping job.json current so a
+    panel (re)created at any point shows where it is."""
+    job.update(state='running', pid=os.getpid())
+    save_job(job)
+    try:
+        for item_id in job['ids']:
+            job.update(current=item_id, itemTs=time.time())
+            save_job(job)
+            job['results'].append(dict(run_job_item(job['kind'], item_id), id=item_id))
+            save_job(job)
+    finally:
+        job.update(state='done', current='', finishedTs=time.time())
+        save_job(job)
+    return job
+
+
+def cmd_start(args):
+    """Hands a job to its own transient user unit and returns at once; see JOB_KINDS."""
+    job = new_job(args.kind, args.ids)
+    if job is None:
+        print(json.dumps({'ok': False, 'message': 'Another update is still running; wait for it to finish.'}))
+        return
+    worker = [sys.executable, str(Path(__file__).resolve()), 'run-job', job['jobId']]
+    rc, out, err = run(['systemd-run', '--user', '--collect', '--quiet',
+                        f'--unit=dashboard-job-{job["jobId"]}', *worker], timeout=15)
+    if rc != 0:
+        # No user manager to ask: a new session still outlives the panel's process.
+        try:
+            subprocess.Popen(worker, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            job.update(state='done', current='', finishedTs=time.time(),
+                       results=[{'id': i, 'ok': False, 'message': f'Could not start: {e}'} for i in job['ids']])
+            save_job(job)
+            print(json.dumps({'ok': False, 'message': f'Could not start: {e}'}))
+            return
+    print(json.dumps({'ok': True, 'jobId': job['jobId']}))
+
+
+def cmd_run_job(args):
+    job = load_job()
+    if job.get('jobId') != args.job_id or job.get('state') != 'starting':
+        return
+    execute_job(job)
 
 
 def cmd_diff(args):
@@ -1272,12 +1469,16 @@ def main():
     p_hold.add_argument('--reason', default='')
     p_add_app = sub.add_parser('add-app')
     p_add_app.add_argument('json')
+    p_start = sub.add_parser('start')
+    p_start.add_argument('kind', choices=JOB_KINDS)
+    p_start.add_argument('ids', nargs='+')
+    sub.add_parser('run-job').add_argument('job_id')
     args = parser.parse_args()
     handlers = {
         'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
         'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
-        'await-notification': cmd_await_notification,
+        'await-notification': cmd_await_notification, 'start': cmd_start, 'run-job': cmd_run_job,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
     }
     handlers[args.command](args)

@@ -128,11 +128,25 @@ into a failure -- with the shell's words in the output, and Roll back offered,
 since the update did land. A new plain warning is shown but doesn't fail it.
 Messages the plugin was already logging before the update are not counted.
 
+## Updates run outside the panel
+
+Updating, rolling back or removing a plugin changes its folder, and the shell
+answers any change there by rebuilding every plugin widget -- this one too,
+mid-update. So the panel doesn't run these itself: it hands them to a
+transient user unit (`dashboard-job-*`) and follows `job.json` in the state
+folder. A panel rebuilt halfway through still shows the job going and how it
+ended, and the history entry, the load check and Roll back all still happen.
+Only one job runs at a time.
+
+When an update changes a plugin's code (not just docs, tests or images), the
+services it ships that are running are restarted, so they run the new code.
+
 ## Notifications
 
 The "update available" notification has **Update** and **Open** buttons. Update
 updates the items it named that are still updatable and not held, then says how
-that went; Open opens the panel. The notification is waited on by a small
+that went; Open opens the panel. It runs as a job like any other, so an open panel shows it going.
+The notification is waited on by a small
 transient user unit (`dashboard-notify-*`), which goes away once it is clicked,
 dismissed, or an hour has passed.
 
@@ -144,6 +158,7 @@ The panel answers the shell's IPC:
 omarchy-shell martythedev-tech.dashboard toggle   # open, close, show, hide too
 omarchy-shell martythedev-tech.dashboard check    # force a check now
 omarchy-shell martythedev-tech.dashboard count    # updates waiting, e.g. for a script
+omarchy-shell martythedev-tech.dashboard update <plugin-or-app-id>   # as if Update was clicked
 ```
 
 For a key, add to `~/.config/hypr/bindings.lua`:

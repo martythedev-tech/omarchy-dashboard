@@ -34,7 +34,6 @@ Panel {
     property string busyId: ""
     property string lastActionKind: ""
     property real actionStartSec: 0
-    property var updateQueue: []
     property int updateQueueTotal: 0
     property int updateQueueDone: 0
     // One expandable panel per row, used for either a pre-update diff preview
@@ -52,6 +51,10 @@ Panel {
     readonly property string home: Quickshell.env("HOME") || ""
     // Update all's per-item results, for the summary once the queue is done.
     property var queueResults: []
+    // Updates, rollbacks and removals run as a job outside this widget (see Model.isJobKind):
+    // the job this instance last saw going, and the last one whose ending it showed.
+    property string jobSeenId: ""
+    property string jobAppliedId: ""
     property var addAppNotes: []
     // The Changes panel's two views of the same update: the commit list (default, readable
     // at any size) and the raw diff.
@@ -104,30 +107,97 @@ Panel {
             root.detailOk = true
             root.detailText = ""
         }
+        if (Model.isJobKind(kind)) { startJob(kind, [id]); return }
         actionProc.command = ["python3", helper, kind, id]
         actionProc.running = true
     }
 
     function runUpdateAll() {
-        if (root.busyId !== "" || root.updateQueue.length > 0) return
+        if (root.busyId !== "" || root.updateQueueTotal > 0) return
         var ids = []
         for (var i = 0; i < root.items.length; i++) if (Model.canUpdate(root.items[i])) ids.push(root.items[i].id)
         if (ids.length === 0) return
-        root.updateQueue = ids
         root.updateQueueTotal = ids.length
-        root.updateQueueDone = 0
+        root.updateQueueDone = 1
         root.queueResults = []
-        advanceUpdateQueue()
+        root.busyId = ids[0]
+        root.lastActionKind = "update"
+        root.actionStartSec = Date.now() / 1000
+        root.actionStatus = actionVerb("update") + ids[0] + "…"
+        startJob("update", ids)
+    }
+
+    function startJob(kind, ids) {
+        startProc.command = ["python3", helper, "start", kind].concat(ids)
+        startProc.running = true
+    }
+
+    // job.json changed (or this instance was just created and read it): mirror a running
+    // job as busy, and show how one ended -- the same way a direct action's result shows.
+    function syncJob(job) {
+        var v = Model.jobView(job, root.jobSeenId, root.jobAppliedId, Date.now() / 1000)
+        if (v.busy) {
+            var fresh = root.jobSeenId !== job.jobId || root.busyId !== v.id
+            root.jobSeenId = job.jobId
+            root.busyId = v.id
+            root.lastActionKind = v.kind
+            root.actionStartSec = v.startSec
+            root.updateQueueTotal = v.total > 1 ? v.total : 0
+            root.updateQueueDone = v.total > 1 ? Math.min(v.done + 1, v.total) : 0
+            root.actionStatus = actionVerb(v.kind) + root.itemName(v.id) + "…"
+            if (fresh && v.kind === "update") {
+                root.detailOpenId = v.id
+                root.detailMode = "output"
+                root.detailOk = true
+                root.detailText = ""
+                actionLog.reload()
+            }
+            return
+        }
+        if (!v.apply) return
+        root.jobAppliedId = job.jobId
+        root.busyId = ""
+        root.lastActionKind = ""
+        var results = v.results
+        if (v.total > 1) {
+            root.queueResults = results.map(function(r) { return {id: r.id, name: root.itemName(r.id), ok: !!r.ok, message: r.message || ""} })
+            root.finishUpdateQueue()
+        } else {
+            root.updateQueueTotal = 0
+            root.updateQueueDone = 0
+            if (results.length > 0) root.applyActionResult(v.kind, results[0].id, results[0])
+        }
+        statusFile.reload()
+    }
+
+    // A finished action's result, shown on its row: the command's own output, or nothing
+    // where the row itself already says it.
+    function applyActionResult(kind, targetId, r) {
+        root.actionStatus = r.ok ? "Done." : "Failed."
+        if (kind === "add-app") {
+            if (!r.ok) root.addAppNotes = [r.message || "Could not add it."]
+            if (r.ok) root.addAppFormOpen = false
+        } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
+            // The row is about to disappear from the list -- nothing left to show a panel on.
+            if (root.detailOpenId === targetId) root.detailOpenId = ""
+        } else if (r.ok && (kind === "hold" || kind === "unhold")) {
+            // The pill says it; an output panel reading "Holding x" adds nothing.
+            if (root.detailOpenId === targetId) root.detailOpenId = ""
+            root.actionStatus = r.message
+        } else {
+            // This is the actual answer to "did anything happen": the
+            // command's real output, shown until closed or overwritten
+            // by the next action -- not just a terse Done./Failed.
+            root.detailOpenId = targetId
+            root.detailMode = "output"
+            root.detailOk = !!r.ok
+            root.detailText = r.message || (r.ok ? "(no output)" : "(no error message)")
+        }
     }
 
     function itemName(id) {
         for (var i = 0; i < root.items.length; i++) if (root.items[i].id === id) return root.items[i].name
         return id
-    }
-
-    function recordQueueResult(id, ok, message) {
-        if (root.updateQueueTotal === 0) return
-        root.queueResults = root.queueResults.concat([{id: id, name: root.itemName(id), ok: ok, message: message || ""}])
     }
 
     // After the last item of an Update all: one line saying how it went, and the first
@@ -148,14 +218,6 @@ Panel {
                 return
             }
         }
-    }
-
-    function advanceUpdateQueue() {
-        if (root.updateQueue.length === 0) { root.finishUpdateQueue(); return }
-        var next = root.updateQueue[0]
-        root.updateQueue = root.updateQueue.slice(1)
-        root.updateQueueDone += 1
-        runAction("update", next)
     }
 
     function showDiff(id) {
@@ -216,6 +278,11 @@ Panel {
         function toggle(): void { root.toggle() }
         function check(): string { root.runCheck(true); return "ok" }
         function count(): string { return String(root.updatable) }
+        function update(id: string): string {
+            if (root.busyId !== "") return "busy"
+            root.runAction("update", id)
+            return "started"
+        }
     }
 
     FileView {
@@ -266,49 +333,53 @@ Panel {
                 var kind = root.lastActionKind
                 var targetId = root.busyId
                 try {
-                    var r = JSON.parse(text)
-                    root.actionStatus = r.ok ? "Done." : "Failed."
-                    if (kind === "update") root.recordQueueResult(targetId, !!r.ok, r.message)
-                    if (kind === "add-app") {
-                        if (!r.ok) root.addAppNotes = [r.message || "Could not add it."]
-                        if (r.ok) root.addAppFormOpen = false
-                    } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
-                        // The row is about to disappear from the list -- nothing left to show a panel on.
-                        if (root.detailOpenId === targetId) root.detailOpenId = ""
-                    } else if (r.ok && (kind === "hold" || kind === "unhold")) {
-                        // The pill says it; an output panel reading "Holding x" adds nothing.
-                        if (root.detailOpenId === targetId) root.detailOpenId = ""
-                        root.actionStatus = r.message
-                    } else {
-                        // This is the actual answer to "did anything happen": the
-                        // command's real output, shown until closed or overwritten
-                        // by the next action -- not just a terse Done./Failed.
-                        root.detailOpenId = targetId
-                        root.detailMode = "output"
-                        root.detailOk = !!r.ok
-                        root.detailText = r.message || (r.ok ? "(no output)" : "(no error message)")
-                    }
+                    root.applyActionResult(kind, targetId, JSON.parse(text))
                 } catch (e) {
                     root.actionStatus = "Action did not report a result."
-                    if (kind === "update") root.recordQueueResult(targetId, false, "The update did not report a result.")
                 }
                 root.busyId = ""
                 root.lastActionKind = ""
                 statusFile.reload()
-                if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
-                else root.finishUpdateQueue()
             }
         }
         onExited: function(code) {
             if (code !== 0 && root.busyId !== "") {
-                if (root.lastActionKind === "update") root.recordQueueResult(root.busyId, false, "The update exited with code " + code + ".")
                 root.busyId = ""
                 root.lastActionKind = ""
                 if (!root.actionStatus) root.actionStatus = "Action failed."
-                if (root.updateQueue.length > 0) Qt.callLater(root.advanceUpdateQueue)
-                else root.finishUpdateQueue()
             }
         }
+    }
+
+    // Hands a job over and returns at once; job.json reports from then on.
+    Process {
+        id: startProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var r = null
+                try { r = JSON.parse(text) } catch (e) {}
+                if (r && r.ok) {
+                    root.jobSeenId = r.jobId
+                    jobFile.reload()
+                    return
+                }
+                root.busyId = ""
+                root.lastActionKind = ""
+                root.updateQueueTotal = 0
+                root.updateQueueDone = 0
+                root.actionStatus = (r && r.message) || "Could not start it."
+            }
+        }
+    }
+
+    FileView {
+        id: jobFile
+        path: root.stateDir + "/job.json"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: { try { root.syncJob(JSON.parse(text())) } catch (e) {} }
     }
 
     // Fill the Add app form from a repo: inspect-repo for a typed path, pick-folder for the

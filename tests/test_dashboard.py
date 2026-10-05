@@ -1239,14 +1239,17 @@ class AwaitNotificationTests(unittest.TestCase):
 
         def fake_subprocess_run(args, **kw):
             self.subprocess_calls.append(args)
-            if args[0] == 'notify-send':
-                return type('P', (), {'stdout': self.choice + '\n', 'returncode': 0})()
-            item = args[-1]
-            out = 'progress...\n' + json.dumps({'ok': self.update_ok[item], 'message': ''})
-            return type('P', (), {'stdout': out, 'returncode': 0})()
+            return type('P', (), {'stdout': self.choice + '\n', 'returncode': 0})()
+
+        def fake_update(args):
+            self.updated.append(args.id)
+            print('progress...')
+            print(json.dumps({'ok': self.update_ok[args.id], 'message': ''}))
+        self.updated = []
         p1 = patch.object(dash.subprocess, 'run', fake_subprocess_run)
         p2 = patch.object(dash, 'run', lambda args, **kw: self.run_calls.append(args) or (0, '', ''))
-        for pt in (p1, p2):
+        p3 = patch.object(dash, 'cmd_update', fake_update)
+        for pt in (p1, p2, p3):
             pt.start()
             self.addCleanup(pt.stop)
 
@@ -1255,8 +1258,7 @@ class AwaitNotificationTests(unittest.TestCase):
 
     def test_update_runs_only_what_is_still_updatable_and_unheld_and_reports(self):
         self.wait()
-        updated = [c[-1] for c in self.subprocess_calls if c[0] != 'notify-send']
-        self.assertEqual(updated, ['a', 'd'])
+        self.assertEqual(self.updated, ['a', 'd'])
         self.assertIn('--action=update=Update', self.subprocess_calls[0])
         last = self.run_calls[-1]
         self.assertEqual(last[0], 'notify-send')
@@ -1698,3 +1700,221 @@ class AlertsTests(unittest.TestCase):
                                      {'id': 'b', 'name': 'B', 'updateState': 'behind', 'versionChange': True}], set())
         args = run_mock.call_args.args[0]
         self.assertEqual(args[args.index('await-notification') + 1:], ['Update available', 'B', 'b'])
+
+
+class JobFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = patch.object(dash, 'STATE', Path(self._tmp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.ran = []
+
+        def fake_update(args):
+            self.ran.append(args.id)
+            if args.id == 'boom':
+                raise RuntimeError('kaput')
+            if args.id == 'silent':
+                return
+            print('noise from a command')
+            print(json.dumps({'ok': args.id != 'bad', 'message': 'did ' + args.id}))
+        patcher = patch.object(dash, 'cmd_update', fake_update)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class JobTests(JobFixture):
+    def test_a_job_runs_every_item_and_records_each_result_then_closes(self):
+        job = dash.execute_job(dash.new_job('update', ['a', 'bad', 'c']))
+        self.assertEqual(self.ran, ['a', 'bad', 'c'])
+        saved = dash.load_job()
+        self.assertEqual(saved['state'], 'done')
+        self.assertEqual(saved['current'], '')
+        self.assertEqual([(r['id'], r['ok'], r['message']) for r in saved['results']],
+                         [('a', True, 'did a'), ('bad', False, 'did bad'), ('c', True, 'did c')])
+        self.assertEqual(job['results'], saved['results'])
+
+    def test_one_item_crashing_does_not_lose_the_rest(self):
+        dash.execute_job(dash.new_job('update', ['boom', 'silent', 'a']))
+        results = dash.load_job()['results']
+        self.assertEqual([r['ok'] for r in results], [False, False, True])
+        self.assertIn('kaput', results[0]['message'])
+        self.assertIn('did not report', results[1]['message'])
+
+    def test_job_json_says_which_item_is_running_while_it_runs(self):
+        seen = []
+        def peek(args):
+            j = dash.load_job()
+            seen.append((j['state'], j['current'], j['pid']))
+            print(json.dumps({'ok': True}))
+        with patch.object(dash, 'cmd_update', peek):
+            dash.execute_job(dash.new_job('update', ['x', 'y']))
+        self.assertEqual(seen, [('running', 'x', dash.os.getpid()), ('running', 'y', dash.os.getpid())])
+
+    def test_a_second_job_is_refused_while_one_is_going(self):
+        self.assertIsNotNone(dash.new_job('update', ['a']))
+        self.assertIsNone(dash.new_job('update', ['b']))   # still 'starting', inside the grace
+        job = dash.load_job()
+        job.update(state='running', pid=dash.os.getpid())
+        dash.save_job(job)
+        self.assertIsNone(dash.new_job('rollback', ['b']))
+
+    def test_a_job_whose_worker_died_is_closed_with_failures_and_frees_the_slot(self):
+        job = dash.new_job('update', ['a', 'b', 'c'])
+        job.update(state='running', pid=2 ** 22 + 12345, results=[{'id': 'a', 'ok': True, 'message': ''}])
+        dash.save_job(job)
+        dash.reap_stale_job()
+        saved = dash.load_job()
+        self.assertEqual(saved['state'], 'done')
+        self.assertEqual([(r['id'], r['ok']) for r in saved['results']], [('a', True), ('b', False), ('c', False)])
+        self.assertIsNotNone(dash.new_job('update', ['d']))   # the slot is free again
+
+    def test_a_job_never_taken_up_is_reaped_after_the_grace(self):
+        dash.new_job('update', ['a'])
+        dash.reap_stale_job(now=time.time() + dash.JOB_START_GRACE_SECONDS + 1)
+        self.assertEqual(dash.load_job()['state'], 'done')
+
+    def test_run_job_only_takes_the_job_it_was_started_for(self):
+        job = dash.new_job('update', ['a'])
+        dash.cmd_run_job(type('A', (), {'job_id': 'not-' + job['jobId']})())
+        self.assertEqual(self.ran, [])
+        dash.cmd_run_job(type('A', (), {'job_id': job['jobId']})())
+        self.assertEqual(self.ran, ['a'])
+        dash.cmd_run_job(type('A', (), {'job_id': job['jobId']})())   # already done: not again
+        self.assertEqual(self.ran, ['a'])
+
+    def test_rollback_and_remove_go_through_their_own_commands(self):
+        calls = []
+        for name in ('cmd_rollback', 'cmd_remove'):
+            p = patch.object(dash, name, lambda a, n=name: calls.append((n, a.id)) or print(json.dumps({'ok': True})))
+            p.start()
+            self.addCleanup(p.stop)
+        dash.execute_job(dash.new_job('rollback', ['r']))
+        dash.execute_job(dash.new_job('remove', ['m']))
+        self.assertEqual(calls, [('cmd_rollback', 'r'), ('cmd_remove', 'm')])
+
+
+class StartJobTests(JobFixture):
+    def start(self, run_rc=0, popen=None):
+        printed, calls = [], []
+        def fake_run(args, **kw):
+            calls.append(list(args))
+            return (run_rc, '', '' if run_rc == 0 else 'no user bus')
+        with patch.object(dash, 'run', fake_run), \
+                patch('builtins.print', lambda *a, **k: printed.append(json.loads(a[0]))), \
+                patch.object(dash.subprocess, 'Popen', popen or (lambda *a, **k: calls.append(('popen', a[0])))):
+            dash.cmd_start(type('A', (), {'kind': 'update', 'ids': ['a', 'b']})())
+        return printed[-1], calls
+
+    def test_the_worker_runs_in_its_own_transient_unit_named_for_the_job(self):
+        r, calls = self.start()
+        self.assertTrue(r['ok'])
+        job = dash.load_job()
+        self.assertEqual((job['state'], job['ids'], r['jobId']), ('starting', ['a', 'b'], job['jobId']))
+        self.assertEqual(calls[0][:5], ['systemd-run', '--user', '--collect', '--quiet',
+                                        f'--unit=dashboard-job-{job["jobId"]}'])
+        self.assertEqual(calls[0][-2:], ['run-job', job['jobId']])
+        self.assertEqual(self.ran, [])   # it only hands over
+
+    def test_without_systemd_run_it_starts_a_new_session(self):
+        seen = {}
+        def popen(args, **kw):
+            seen.update(kw, args=args)
+        r, _ = self.start(run_rc=1, popen=popen)
+        self.assertTrue(r['ok'])
+        self.assertTrue(seen['start_new_session'])
+        self.assertEqual(seen['args'][-2], 'run-job')
+
+    def test_when_nothing_can_start_it_the_job_is_closed_as_failed(self):
+        def popen(*a, **k):
+            raise OSError('no python')
+        r, _ = self.start(run_rc=1, popen=popen)
+        self.assertFalse(r['ok'])
+        job = dash.load_job()
+        self.assertEqual(job['state'], 'done')
+        self.assertEqual([x['ok'] for x in job['results']], [False, False])
+
+    def test_busy_is_reported_not_queued(self):
+        dash.new_job('update', ['z'])
+        r, calls = self.start()
+        self.assertFalse(r['ok'])
+        self.assertIn('still running', r['message'])
+        self.assertEqual(calls, [])
+
+
+class RestartUpdatedUnitsTests(RealRepoFixture):
+    def setUp(self):
+        super().setUp()
+        (self.units / 'gpu.service').write_text('[Service]\nExecStart=/p/x.plugin/run\n')
+        (self.units / 'other.service').write_text('[Service]\nExecStart=/elsewhere/run\n')
+        (self.units / 'gpu.timer').write_text('[Timer]\n')
+        self.active = {'gpu.service', 'other.service', 'gpu.timer'}
+        self.restart_rc = 0
+        real = dash.run
+        def fake(args, cwd=None, timeout=20, **kw):
+            if args[:3] == ['systemctl', '--user', 'is-active']:
+                self.calls.append(list(args))
+                return (0 if args[3] in self.active else 3, 'active\n' if args[3] in self.active else 'inactive\n', '')
+            if args[:3] == ['systemctl', '--user', 'restart']:
+                self.calls.append(list(args))
+                return (self.restart_rc, '', 'nope' if self.restart_rc else '')
+            return real(args, cwd=cwd, timeout=timeout, **kw)
+        p = patch.object(dash, 'run', fake)
+        p.start()
+        self.addCleanup(p.stop)
+        self.shipped = {'gpu.service': None, 'other.service': None, 'gpu.timer': None}
+
+    def restarted(self):
+        return [c[3] for c in self.calls if c[:3] == ['systemctl', '--user', 'restart']]
+
+    def commit(self, name, text='x'):
+        (self.plugin / name).parent.mkdir(parents=True, exist_ok=True)
+        (self.plugin / name).write_text(text)
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'c')
+        return git(self.plugin, 'rev-parse', 'HEAD')
+
+    def test_a_code_change_restarts_the_running_services_that_run_this_plugin(self):
+        head = self.commit('collectors/cpu.py')
+        messages, ok = dash.restart_updated_units(self.plugin, self.new, head, self.shipped)
+        self.assertTrue(ok)
+        self.assertEqual(self.restarted(), ['gpu.service'])   # not the foreign one, not the timer
+        self.assertIn('Restarted gpu.service', messages[0])
+
+    def test_docs_tests_and_images_do_not(self):
+        self.commit('README.md'); self.commit('docs/a.txt'); self.commit('tests/t.py')
+        head = self.commit('preview.png')
+        self.assertEqual(dash.restart_updated_units(self.plugin, self.new, head, self.shipped), ([], True))
+        self.assertEqual(self.restarted(), [])
+
+    def test_a_stopped_service_is_left_stopped(self):
+        self.active = set()
+        head = self.commit('collectors/cpu.py')
+        dash.restart_updated_units(self.plugin, self.new, head, self.shipped)
+        self.assertEqual(self.restarted(), [])
+
+    def test_a_failed_restart_is_a_failure(self):
+        self.restart_rc = 1
+        head = self.commit('collectors/cpu.py')
+        messages, ok = dash.restart_updated_units(self.plugin, self.new, head, self.shipped)
+        self.assertFalse(ok)
+        self.assertIn('gpu.service did not restart: nope', messages)
+
+    def test_nothing_moved_nothing_restarted(self):
+        self.assertEqual(dash.restart_updated_units(self.plugin, self.new, self.new, self.shipped), ([], True))
+        self.assertEqual(dash.restart_updated_units(self.plugin, '', self.new, self.shipped), ([], True))
+
+    def test_an_update_that_changed_code_restarts_and_says_so(self):
+        head = self.commit('collectors/cpu.py')
+        git(self.plugin, 'reset', '-q', '--hard', self.new)
+        real = dash.run
+        def updating(args, **kw):
+            if args[:3] == ['omarchy', 'plugin', 'update']:
+                git(self.plugin, 'reset', '-q', '--hard', head)
+                return (0, 'Updated x.plugin.', '')
+            return real(args, **kw)
+        with patch.object(dash, 'run', updating):
+            dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
+        self.assertTrue(self.printed[-1]['ok'], self.printed[-1])
+        self.assertIn('Restarted gpu.service', self.printed[-1]['message'])
+        self.assertEqual(self.restarted(), ['gpu.service'])

@@ -229,4 +229,28 @@ assert.equal(ctx.behindLabel({updateState: 'up-to-date'}), '');
 assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: false}), 'ok');
 assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: true}), 'behind');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge all pass.');
+
+// jobs: which actions run detached, and what a job.json means for one panel instance
+assert.equal(ctx.isJobKind('update'), true);
+assert.equal(ctx.isJobKind('rollback'), true);
+assert.equal(ctx.isJobKind('remove'), true);
+assert.equal(ctx.isJobKind('remove-app'), false);
+assert.equal(ctx.isJobKind('hold'), false);
+assert.equal(ctx.jobView(null, '', '', 100).busy, false);
+assert.equal(ctx.jobView({}, '', '', 100).apply, false);
+var running = ctx.jobView({jobId: 'j1', kind: 'update', state: 'running', ids: ['a', 'b', 'c'], current: 'b',
+                           results: [{id: 'a', ok: true}], itemTs: 90}, '', '', 100);
+assert.equal(running.busy, true);
+assert.equal(running.id, 'b');
+assert.equal(running.total, 3);
+assert.equal(running.done, 1);
+assert.equal(running.startSec, 90);
+assert.equal(ctx.jobView({jobId: 'j1', state: 'starting', ids: ['a'], startTs: 95}, '', '', 100).id, 'a');
+var done = {jobId: 'j1', kind: 'update', state: 'done', ids: ['a'], results: [{id: 'a', ok: true}], finishedTs: 50};
+assert.equal(ctx.jobView(done, 'j1', '', 100).apply, true, 'one this instance saw going');
+assert.equal(ctx.jobView(done, 'j1', 'j1', 100).apply, false, 'once only');
+assert.equal(ctx.jobView(done, '', '', 100).apply, false, 'an old one found on load');
+assert.equal(ctx.jobView(done, '', '', 60).apply, true, 'one that only just finished (rebuilt at the end)');
+assert.equal(ctx.jobView(done, 'j1', '', 100).busy, false);
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs all pass.');

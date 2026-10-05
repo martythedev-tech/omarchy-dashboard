@@ -282,3 +282,26 @@ function queueSummary(results) {
     if (failed.length) parts.push(failed.length + ' failed (' + failed.join(', ') + ')')
     return parts.length ? 'Update all: ' + parts.join(', ') + '.' : ''
 }
+
+// The actions that run as a job (dashboard.py JOB_KINDS): each changes a plugin's
+// directory, and the shell answers that by rebuilding this widget mid-action.
+function isJobKind(kind) {
+    return kind === 'update' || kind === 'rollback' || kind === 'remove'
+}
+
+// What job.json means for this panel instance. busy: show it going (whichever instance
+// started it -- this one may have been rebuilt since). apply: show how it ended, once,
+// and only for a job this instance saw going or one that has only just finished, never
+// an old one found on load.
+var JOB_FRESH_SECONDS = 15
+function jobView(job, seenJobId, appliedJobId, nowSeconds) {
+    if (!job || !job.jobId) return {busy: false, apply: false}
+    var ids = job.ids || [], results = job.results || []
+    if (job.state === 'starting' || job.state === 'running') {
+        return {busy: true, apply: false, id: job.current || ids[0] || '', kind: job.kind || 'update',
+                total: ids.length, done: results.length, startSec: job.itemTs || job.startTs || nowSeconds}
+    }
+    var apply = job.state === 'done' && job.jobId !== appliedJobId &&
+                (job.jobId === seenJobId || nowSeconds - (job.finishedTs || 0) < JOB_FRESH_SECONDS)
+    return {busy: false, apply: apply, kind: job.kind || 'update', total: ids.length, results: results}
+}
