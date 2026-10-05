@@ -284,7 +284,12 @@ def discover_plugins():
         return []
     if not isinstance(data, list):
         return []
-    return [p for p in data if not p.get('firstParty')]
+    # The list is the shell's registry, which rescans in the background: just after a
+    # removal it still names a plugin whose folder is already gone (2026-10-05, CPU Pulse
+    # lingered as a row until the next check). Every plugin listed here lives in
+    # PLUGINS_DIR, so the folder on disk decides.
+    return [p for p in data if not p.get('firstParty') and isinstance(p.get('id'), str)
+            and (PLUGINS_DIR / p['id']).exists()]
 
 
 def manifest_version(plugin_id):
