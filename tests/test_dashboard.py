@@ -283,6 +283,29 @@ class AppUpdateStateTests(unittest.TestCase):
 
 
 class DiscoverPluginsTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.plugins = Path(self._tmp.name)
+        for pid in ('martythedev-tech.dashboard', 'sslvpn'):
+            (self.plugins / pid).mkdir()
+        patcher = patch.object(dash, 'PLUGINS_DIR', self.plugins)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_plugin_the_shell_still_lists_but_whose_folder_is_gone_is_left_out(self):
+        payload = json.dumps([{'id': 'sslvpn', 'firstParty': False},
+                              {'id': 'nixfred.cpu-pulse', 'firstParty': False},
+                              {'firstParty': False}])
+        with patch.object(dash, 'run', return_value=(0, payload, '')):
+            self.assertEqual([p['id'] for p in dash.discover_plugins()], ['sslvpn'])
+
+    def test_a_symlinked_plugin_counts_as_there(self):
+        (self.plugins / 'linked').symlink_to(self.plugins / 'sslvpn')
+        payload = json.dumps([{'id': 'linked', 'firstParty': False}])
+        with patch.object(dash, 'run', return_value=(0, payload, '')):
+            self.assertEqual([p['id'] for p in dash.discover_plugins()], ['linked'])
+
     def test_filters_first_party_but_includes_self(self):
         # SELF_ID is no longer excluded here -- the dashboard checks and can
         # update itself; it's cmd_disable/cmd_remove that separately refuse
