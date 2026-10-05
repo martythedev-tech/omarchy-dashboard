@@ -31,6 +31,10 @@ that are new (see install_new_units for the guards).
 The third (2026-10-05): updates, rollbacks and removals run as a job in their own transient
 user unit, not as a child of the panel (see JOB_KINDS for why), and an update that changed
 a plugin's code restarts the services it ships (restart_updated_units).
+
+The fourth (2026-10-05, 1.9.0): Remove also stops and removes the plugin's services and,
+if asked, trashes its data folders (cmd_remove); `omarchy plugin remove` touches only the
+plugin's own folder. Leftovers lists what removals left behind.
 """
 import argparse
 import contextlib
@@ -95,7 +99,7 @@ _NOT_CODE = re.compile(r'(^|/)(docs|tests)/|\.(md|txt|png|jpe?g|gif|svg|webp)$|(
 # started dies with it (QProcess kills its child on destruction): 2026-10-05, three updates
 # from the panel landed but none reached history. So these run as a job in their own
 # transient user unit, and the panel follows job.json instead of a process's output.
-JOB_KINDS = ('update', 'rollback', 'remove')
+JOB_KINDS = ('update', 'rollback', 'remove', 'cleanup')
 # A job that is 'starting' this long without its worker having taken it never will.
 JOB_START_GRACE_SECONDS = 60
 
@@ -897,6 +901,7 @@ def check_all():
         'ts': now,
         'items': items,
         'updatable': sum(1 for i in items if alerts(i)),
+        'leftovers': leftovers(),
         # Plugin entries were recorded under their id (cmd_update knows no display name), so
         # Recent read "com.omastorm.radar updated"; show the name the rows use instead.
         'history': [dict({k: e.get(k) for k in ('id', 'name', 'kind', 'action', 'ok', 'fromVersion',
@@ -1164,13 +1169,289 @@ def cmd_unhold(args):
     check_all()
 
 
+# Where a plugin keeps data outside its own folder. Not ~/.config: what is there is
+# the user's own configuration more often than the plugin's leftovers.
+DATA_ROOTS = (Path.home() / '.local/state', Path.home() / '.cache', Path.home() / '.local/share')
+# The shell's own per-plugin state folder (this Dashboard keeps its state there too).
+PLUGIN_STATE_ROOT = Path.home() / '.local/state/omarchy/plugins'
+# Never offered for deletion, whoever seems to own them.
+SHARED_DATA_NAMES = {'omarchy', 'quickshell', 'systemd', 'applications', 'icons', 'fonts', 'Trash',
+                     'fontconfig', 'mesa_shader_cache', 'qtshadercache', 'QtProject', 'plugins'}
+# Id segments that name nobody's data ("com" in com.omastorm.radar).
+_GENERIC_SEGMENTS = {'com', 'org', 'net', 'io', 'dev', 'app', 'tech', 'ali'}
+_DATA_REF = re.compile(r'(?:\.local/state|\.cache|\.local/share)/([A-Za-z0-9][A-Za-z0-9._-]*)')
+_CODE_SUFFIXES = {'.qml', '.js', '.py', '.sh', '.rs', '.json', '.toml', '.service'}
+
+
+def _slug(text):
+    return re.sub(r'[^a-z0-9]+', '-', str(text or '').lower()).strip('-')
+
+
+def plugin_unit_pattern(plugin_id):
+    return re.compile(r'plugins/' + re.escape(plugin_id) + r'(?=[/\s"\']|$)', re.M)
+
+
+def installed_plugin_units(plugin_id):
+    """The user units that run this plugin's code: installed by its own install.py or by
+    this Dashboard, and left running by `omarchy plugin remove`, which knows nothing of
+    them. Matched on the plugin's path in the unit, not the unit's name: cpu-pulse.service
+    belongs to Pulse now, not to the CPU Pulse plugin it was once named for."""
+    pattern = plugin_unit_pattern(plugin_id)
+    found = []
+    try:
+        candidates = sorted(USER_UNIT_DIR.iterdir())
+    except OSError:
+        return []
+    for unit in candidates:
+        if unit.suffix not in UNIT_SUFFIXES or not unit.is_file():
+            continue
+        try:
+            if pattern.search(unit.read_text()):
+                found.append(unit.name)
+        except (OSError, UnicodeDecodeError):
+            continue
+    return found
+
+
+def plugin_data_names(plugin_id, plugin_dir=None):
+    """Names this plugin might keep data under in DATA_ROOTS: its id, the meaningful parts
+    of it, its display name, the units it ships, and whatever its code names under
+    .local/state, .cache or .local/share."""
+    plugin_dir = Path(plugin_dir or PLUGINS_DIR / plugin_id)
+    names = {plugin_id}
+    names.update(seg for seg in plugin_id.split('.') if len(seg) > 2 and seg not in _GENERIC_SEGMENTS)
+    try:
+        manifest = json.loads((plugin_dir / 'manifest.json').read_text())
+        if _slug(manifest.get('name')):
+            names.add(_slug(manifest.get('name')))
+    except (OSError, ValueError, AttributeError):
+        pass
+    names.update(Path(name).stem for name in shipped_units(plugin_dir))
+    seen = 0
+    for path in sorted(plugin_dir.rglob('*')) if plugin_dir.is_dir() else []:
+        if seen >= 400:
+            break
+        if path.suffix not in _CODE_SUFFIXES or any(part in UNIT_SKIP_DIRS for part in path.parts) \
+                or not path.is_file():
+            continue
+        seen += 1
+        try:
+            if path.stat().st_size > 512 * 1024:
+                continue
+            names.update(_DATA_REF.findall(path.read_text(errors='ignore')))
+        except OSError:
+            continue
+    return {n for n in names if n and n not in SHARED_DATA_NAMES}
+
+
+def dir_size(path, limit=200000):
+    total, count = 0, 0
+    stack = [Path(path)]
+    while stack and count < limit:
+        try:
+            entries = list(os.scandir(stack.pop()))
+        except OSError:
+            continue
+        for e in entries:
+            count += 1
+            try:
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(Path(e.path))
+                else:
+                    total += e.stat(follow_symlinks=False).st_size
+            except OSError:
+                continue
+    return total
+
+
+def plugin_data_dirs(plugin_id):
+    """The data folders that are this plugin's alone: they exist, and no other installed
+    plugin points at the same name (every plugin reads ~/.local/state/omarchy/current/theme;
+    Pulse writes the old CPU Pulse's ~/.local/state/cpu-pulse)."""
+    mine = plugin_data_names(plugin_id)
+    others = set()
+    try:
+        siblings = [d for d in PLUGINS_DIR.iterdir() if not d.name.startswith('.') and d.name != plugin_id]
+    except OSError:
+        siblings = []
+    for other in siblings:
+        others |= plugin_data_names(other.name, other)
+    found = []
+    for root in DATA_ROOTS:
+        for name in sorted(mine - others):
+            path = root / name
+            if path.is_dir() and not path.is_symlink():
+                found.append({'path': str(path), 'size': dir_size(path)})
+    state_dir = PLUGIN_STATE_ROOT / plugin_id
+    if state_dir.is_dir() and plugin_id != SELF_ID:
+        found.append({'path': str(state_dir), 'size': dir_size(state_dir)})
+    return found
+
+
+def plugin_backups(plugin_id=None):
+    """The folders `omarchy plugin remove` keeps for a plugin that was not a git checkout
+    (.<id>.bak.<UTC stamp>[-n]) -- never cleaned up by anything."""
+    try:
+        entries = sorted(PLUGINS_DIR.iterdir())
+    except OSError:
+        return []
+    out = []
+    for d in entries:
+        m = re.match(r'^\.(.+)\.bak\.(\d{14})(?:-\d+)?$', d.name)
+        if m and d.is_dir() and (plugin_id is None or m.group(1) == plugin_id):
+            out.append({'path': str(d), 'id': m.group(1), 'stamp': m.group(2), 'size': dir_size(d)})
+    return out
+
+
+def removal_plan(plugin_id):
+    plugin_dir = PLUGINS_DIR / plugin_id
+    kind = 'link' if plugin_dir.is_symlink() else 'git' if (plugin_dir / '.git').is_dir() else 'plain'
+    name = plugin_id
+    try:
+        name = json.loads((plugin_dir / 'manifest.json').read_text()).get('name') or plugin_id
+    except (OSError, ValueError, AttributeError):
+        pass
+    return {'id': plugin_id, 'name': name, 'folder': {'path': str(plugin_dir), 'kind': kind},
+            'units': installed_plugin_units(plugin_id), 'data': plugin_data_dirs(plugin_id),
+            'backups': plugin_backups(plugin_id)}
+
+
+def cmd_remove_plan(args):
+    if args.id == SELF_ID or not (PLUGINS_DIR / args.id).exists():
+        print(json.dumps({'ok': False, 'message': f'No removable plugin called {args.id}.'}))
+        return
+    print(json.dumps(dict(removal_plan(args.id), ok=True)))
+
+
+def trash(path):
+    """Into the desktop trash, so a wrong guess about whose data it was can be undone."""
+    rc, out, err = run(['gio', 'trash', str(path)], timeout=60)
+    return rc == 0, (err or out).strip()
+
+
+def stop_and_remove_units(names):
+    messages, ok = [], True
+    for name in names:
+        run(['systemctl', '--user', 'disable', '--now', name], timeout=60)
+        try:
+            (USER_UNIT_DIR / name).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            ok = False
+            messages.append(f'Could not remove {name}: {e}')
+            continue
+        messages.append(f'Stopped and removed {name}.')
+    if names:
+        run(['systemctl', '--user', 'daemon-reload'], timeout=30)
+    return messages, ok
+
+
 def cmd_remove(args):
+    """`omarchy plugin remove`, plus what it leaves behind: the plugin's services are
+    stopped first (they would crash-loop against a deleted folder) and their unit files
+    removed once the plugin is gone; with --purge its data folders go to the trash, and
+    without, they are remembered so Leftovers can offer them later. A hold on it is
+    dropped. If omarchy refuses, the services are started again."""
     if args.id == SELF_ID:
         print(json.dumps({'ok': False, 'message': 'Refusing to remove the Dashboard from within itself -- '
                                                     'use `omarchy plugin remove` from a terminal instead.'}))
         return
+    plan = removal_plan(args.id)
+    units = plan['units']
+    for name in units:
+        run(['systemctl', '--user', 'stop', name], timeout=60)
     rc, out, err = run(['omarchy', 'plugin', 'remove', args.id, '--yes'], timeout=60)
-    print(json.dumps({'ok': rc == 0, 'message': (out or err).strip()}))
+    if rc != 0:
+        for name in units:
+            run(['systemctl', '--user', 'start', name], timeout=60)
+        print(json.dumps({'ok': False, 'message': (err or out).strip() or 'omarchy plugin remove failed.'}))
+        check_all()
+        return
+    messages = [(out or err).strip()]
+    unit_messages, ok = stop_and_remove_units(units)
+    messages += unit_messages
+    kept = []
+    for d in plan['data']:
+        if getattr(args, 'purge', False):
+            done, why = trash(d['path'])
+            if done:
+                messages.append(f"Moved {d['path']} to the trash.")
+            else:
+                ok = False
+                kept.append(d['path'])
+                messages.append(f"Could not move {d['path']} to the trash: {why}")
+        else:
+            kept.append(d['path'])
+    if kept and not getattr(args, 'purge', False):
+        messages.append('Kept its data (' + ', '.join(kept) + '); Leftovers lists it.')
+    holds = load_holds()
+    if holds.pop(args.id, None) is not None:
+        save_holds(holds)
+    append_history({
+        'ts': time.time(), 'id': args.id, 'name': plan['name'], 'kind': 'plugin', 'action': 'remove',
+        'ok': ok, 'before': '', 'after': '', 'fromVersion': '', 'toVersion': '', 'unitsInstalled': [],
+        'dataKept': kept, 'message': '' if ok else messages[-1][:200],
+    })
+    print(json.dumps({'ok': ok, 'message': '\n'.join(m for m in messages if m)}))
+    check_all()
+
+
+def leftovers():
+    """What removed plugins left behind: omarchy's backup folders, units that run a plugin
+    that is no longer there, and data a removal kept. Each has a key cleanup acts on."""
+    items = []
+    for b in plugin_backups():
+        stamp = b['stamp']
+        name = b['id']
+        try:
+            name = json.loads((Path(b['path']) / 'manifest.json').read_text()).get('name') or name
+        except (OSError, ValueError, AttributeError):
+            pass
+        items.append({'key': 'backup:' + Path(b['path']).name, 'kind': 'backup', 'path': b['path'],
+                      'size': b['size'], 'label': f"{name} backup · {stamp[:4]}-{stamp[4:6]}-{stamp[6:8]}"})
+    try:
+        units = sorted(USER_UNIT_DIR.iterdir())
+    except OSError:
+        units = []
+    for unit in units:
+        if unit.suffix not in UNIT_SUFFIXES or not unit.is_file():
+            continue
+        try:
+            text = unit.read_text()
+        except (OSError, UnicodeDecodeError):
+            continue
+        m = re.search(r'\.config/omarchy/plugins/([A-Za-z0-9][A-Za-z0-9._-]*)', text)
+        if m and not (PLUGINS_DIR / m.group(1)).exists():
+            items.append({'key': 'unit:' + unit.name, 'kind': 'unit', 'path': str(unit), 'size': 0,
+                          'label': f'{unit.name} runs {m.group(1)}, which is not installed'})
+    seen = set()
+    for e in reversed(load_history()):
+        if e.get('action') != 'remove' or (PLUGINS_DIR / e.get('id', '')).exists():
+            continue
+        for path in e.get('dataKept') or []:
+            if path in seen or not Path(path).is_dir():
+                continue
+            seen.add(path)
+            items.append({'key': 'data:' + path, 'kind': 'data', 'path': path, 'size': dir_size(path),
+                          'label': f"{e.get('name') or e.get('id')} data: {path.replace(str(Path.home()), '~', 1)}"})
+    return items
+
+
+def cmd_cleanup(args):
+    """Clears one Leftovers entry, by its key -- only a key the current list has, so this
+    never deletes a path it was merely handed."""
+    item = next((i for i in leftovers() if i['key'] == args.id), None)
+    if not item:
+        print(json.dumps({'ok': False, 'message': 'That is no longer in Leftovers.'}))
+        return
+    if item['kind'] == 'unit':
+        messages, ok = stop_and_remove_units([Path(item['path']).name])
+        message = '\n'.join(messages)
+    else:
+        ok, why = trash(item['path'])
+        message = f"Moved {item['path']} to the trash." if ok else f"Could not move {item['path']} to the trash: {why}"
+    print(json.dumps({'ok': ok, 'message': message}))
     check_all()
 
 
@@ -1223,26 +1504,27 @@ def reap_stale_job(now=None):
     save_job(job)
 
 
-def new_job(kind, ids):
+def new_job(kind, ids, options=None):
     """Claims job.json for a new job, or returns None while another one is still going."""
     reap_stale_job()
     if job_active(load_job()):
         return None
     now = time.time()
     job = {'jobId': f'{int(now * 1000)}', 'kind': kind, 'ids': list(ids), 'state': 'starting',
-           'current': ids[0] if ids else '', 'itemTs': now, 'startTs': now, 'results': [], 'pid': None}
+           'current': ids[0] if ids else '', 'itemTs': now, 'startTs': now, 'results': [], 'pid': None,
+           'options': options or {}}
     save_job(job)
     return job
 
 
-def run_job_item(kind, item_id):
+def run_job_item(kind, item_id, options=None):
     """One item of a job through the same command the panel used to run directly; its
     printed JSON result is what the job records."""
-    handler = {'update': cmd_update, 'rollback': cmd_rollback, 'remove': cmd_remove}[kind]
+    handler = {'update': cmd_update, 'rollback': cmd_rollback, 'remove': cmd_remove, 'cleanup': cmd_cleanup}[kind]
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
-            handler(argparse.Namespace(id=item_id))
+            handler(argparse.Namespace(id=item_id, **(options or {})))
     except Exception as e:  # noqa: BLE001 -- one item's crash must not lose the rest of the job
         return {'ok': False, 'message': f'{type(e).__name__}: {e}'}
     for line in buf.getvalue().splitlines():
@@ -1264,7 +1546,7 @@ def execute_job(job):
         for item_id in job['ids']:
             job.update(current=item_id, itemTs=time.time())
             save_job(job)
-            job['results'].append(dict(run_job_item(job['kind'], item_id), id=item_id))
+            job['results'].append(dict(run_job_item(job['kind'], item_id, job.get('options')), id=item_id))
             save_job(job)
     finally:
         job.update(state='done', current='', finishedTs=time.time())
@@ -1274,7 +1556,7 @@ def execute_job(job):
 
 def cmd_start(args):
     """Hands a job to its own transient user unit and returns at once; see JOB_KINDS."""
-    job = new_job(args.kind, args.ids)
+    job = new_job(args.kind, args.ids, {'purge': True} if getattr(args, 'purge', False) else None)
     if job is None:
         print(json.dumps({'ok': False, 'message': 'Another update is still running; wait for it to finish.'}))
         return
@@ -1472,6 +1754,9 @@ def main():
     p_start = sub.add_parser('start')
     p_start.add_argument('kind', choices=JOB_KINDS)
     p_start.add_argument('ids', nargs='+')
+    p_start.add_argument('--purge', action='store_true')
+    sub.add_parser('remove-plan').add_argument('id')
+    sub.add_parser('cleanup').add_argument('id')
     sub.add_parser('run-job').add_argument('job_id')
     args = parser.parse_args()
     handlers = {
@@ -1479,6 +1764,7 @@ def main():
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
         'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
         'await-notification': cmd_await_notification, 'start': cmd_start, 'run-job': cmd_run_job,
+        'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
     }
     handlers[args.command](args)

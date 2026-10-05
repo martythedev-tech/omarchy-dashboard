@@ -1918,3 +1918,212 @@ class RestartUpdatedUnitsTests(RealRepoFixture):
         self.assertTrue(self.printed[-1]['ok'], self.printed[-1])
         self.assertIn('Restarted gpu.service', self.printed[-1]['message'])
         self.assertEqual(self.restarted(), ['gpu.service'])
+
+
+class RemovalFixture(unittest.TestCase):
+    """Plugins, units, data roots and state all under one temp dir; systemctl, omarchy and
+    gio are recorded, and `omarchy plugin remove` really deletes the folder."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.root = root
+        self.plugins = root / 'plugins'
+        self.units = root / 'units'
+        self.state_root = root / 'local/state'
+        self.cache = root / 'cache'
+        for d in (self.plugins, self.units, self.state_root, self.cache):
+            d.mkdir(parents=True)
+        self.calls, self.trashed = [], []
+        self.remove_rc = 0
+        self.trash_rc = 0
+
+        def fake(args, cwd=None, timeout=20, **kw):
+            self.calls.append(list(args))
+            if args[:3] == ['omarchy', 'plugin', 'remove']:
+                if self.remove_rc == 0:
+                    import shutil
+                    shutil.rmtree(self.plugins / args[3])
+                    return (0, f'Removed {args[3]}.', '')
+                return (1, '', 'refused')
+            if args[:2] == ['gio', 'trash']:
+                if self.trash_rc == 0:
+                    import shutil
+                    shutil.rmtree(args[2])
+                    self.trashed.append(args[2])
+                    return (0, '', '')
+                return (1, '', 'no trash')
+            return (0, '', '')
+        self.printed = []
+        state = root / 'dashstate'
+        for target, value in (('run', fake), ('PLUGINS_DIR', self.plugins), ('USER_UNIT_DIR', self.units),
+                              ('DATA_ROOTS', (self.state_root, self.cache)),
+                              ('PLUGIN_STATE_ROOT', self.state_root / 'omarchy/plugins'),
+                              ('STATE', state), ('STATUS_PATH', state / 'status.json'),
+                              ('check_all', lambda: None)):
+            patcher = patch.object(dash, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        printer = patch('builtins.print', lambda *a, **k: self.printed.append(json.loads(a[0])))
+        printer.start()
+        self.addCleanup(printer.stop)
+
+    def plugin(self, pid, name='', code='', units=()):
+        d = self.plugins / pid
+        d.mkdir(parents=True)
+        (d / 'manifest.json').write_text(json.dumps({'name': name or pid}))
+        if code:
+            (d / 'Panel.qml').write_text(code)
+        for u in units:
+            (d / u).write_text(f'[Service]\nExecStart=/h/.config/omarchy/plugins/{pid}/run\n')
+        return d
+
+    def install_unit(self, name, pid):
+        (self.units / name).write_text(f'[Service]\nExecStart=/h/.config/omarchy/plugins/{pid}/collectors/x.py\n')
+
+    def data(self, root, name):
+        d = root / name
+        d.mkdir(parents=True)
+        (d / 'f').write_text('12345')
+        return d
+
+    def remove(self, pid, purge=False):
+        dash.cmd_remove(type('A', (), {'id': pid, 'purge': purge})())
+        return self.printed[-1]
+
+
+class RemovalPlanTests(RemovalFixture):
+    def test_units_are_matched_on_the_plugin_path_not_the_unit_name(self):
+        self.plugin('nixfred.pulse', 'Pulse')
+        self.plugin('nixfred.cpu-pulse', 'CPU Pulse')
+        self.install_unit('cpu-pulse.service', 'nixfred.pulse')
+        self.install_unit('nixfred.pulse-ish.service', 'nixfred.pulse-ish')
+        self.assertEqual(dash.installed_plugin_units('nixfred.pulse'), ['cpu-pulse.service'])
+        self.assertEqual(dash.installed_plugin_units('nixfred.cpu-pulse'), [])
+
+    def test_data_named_by_id_name_units_and_code_is_found_with_its_size(self):
+        self.plugin('com.omastorm.radar', 'Omastorm', code='dir: home + "/.cache/omastorm-tiles/x"',
+                    units=('radar-feed.service',))
+        for root, name in ((self.state_root, 'omastorm'), (self.cache, 'omastorm-tiles'),
+                           (self.state_root, 'radar-feed'), (self.state_root, 'radar'),
+                           (self.state_root, 'omarchy/plugins/com.omastorm.radar')):
+            self.data(root, name)
+        self.data(self.state_root, 'unrelated')
+        paths = sorted(Path(d['path']).relative_to(self.root).as_posix() for d in dash.plugin_data_dirs('com.omastorm.radar'))
+        self.assertEqual(paths, ['cache/omastorm-tiles', 'local/state/omarchy/plugins/com.omastorm.radar',
+                                 'local/state/omastorm', 'local/state/radar', 'local/state/radar-feed'])
+        self.assertEqual(dash.plugin_data_dirs('com.omastorm.radar')[0]['size'], 5)
+
+    def test_data_another_plugin_also_points_at_or_everyone_shares_is_never_offered(self):
+        self.plugin('nixfred.cpu-pulse', 'CPU Pulse')
+        self.plugin('nixfred.pulse', 'Pulse', units=('cpu-pulse.service',),
+                    code='"/.local/state/omarchy/current/theme"')
+        self.data(self.state_root, 'cpu-pulse')
+        self.data(self.state_root, 'omarchy')
+        self.assertEqual(dash.plugin_data_dirs('nixfred.cpu-pulse'), [])
+        self.assertEqual(dash.plugin_data_dirs('nixfred.pulse'), [])
+
+    def test_plan_reports_folder_kind_and_backups(self):
+        self.plugin('a.b', 'AB')
+        (self.plugins / '.a.b.bak.20260908163316').mkdir()
+        (self.plugins / '.a.bc.bak.20260908163316').mkdir()
+        plan = dash.removal_plan('a.b')
+        self.assertEqual((plan['name'], plan['folder']['kind']), ('AB', 'plain'))
+        self.assertEqual([Path(b['path']).name for b in plan['backups']], ['.a.b.bak.20260908163316'])
+
+
+class CmdRemoveTests(RemovalFixture):
+    def setUp(self):
+        super().setUp()
+        self.plugin('nixfred.pulse', 'Pulse')
+        self.install_unit('cpu-pulse.service', 'nixfred.pulse')
+        self.data_dir = self.data(self.state_root, 'pulse')
+
+    def test_services_stop_before_the_folder_goes_and_their_units_are_removed(self):
+        r = self.remove('nixfred.pulse')
+        self.assertTrue(r['ok'], r)
+        self.assertLess(self.calls.index(['systemctl', '--user', 'stop', 'cpu-pulse.service']),
+                        self.calls.index(['omarchy', 'plugin', 'remove', 'nixfred.pulse', '--yes']))
+        self.assertIn(['systemctl', '--user', 'disable', '--now', 'cpu-pulse.service'], self.calls)
+        self.assertFalse((self.units / 'cpu-pulse.service').exists())
+        self.assertIn('Stopped and removed cpu-pulse.service.', r['message'])
+
+    def test_without_purge_data_is_kept_and_remembered_for_leftovers(self):
+        r = self.remove('nixfred.pulse')
+        self.assertTrue(self.data_dir.exists())
+        self.assertIn('Kept its data', r['message'])
+        entry = dash.load_history()[-1]
+        self.assertEqual((entry['action'], entry['name'], entry['dataKept']), ('remove', 'Pulse', [str(self.data_dir)]))
+        self.assertEqual([i['key'] for i in dash.leftovers()], ['data:' + str(self.data_dir)])
+
+    def test_purge_moves_data_to_the_trash(self):
+        r = self.remove('nixfred.pulse', purge=True)
+        self.assertTrue(r['ok'])
+        self.assertEqual(self.trashed, [str(self.data_dir)])
+        self.assertEqual(dash.load_history()[-1]['dataKept'], [])
+
+    def test_a_trash_that_fails_is_a_failure_and_the_data_is_still_listed(self):
+        self.trash_rc = 1
+        r = self.remove('nixfred.pulse', purge=True)
+        self.assertFalse(r['ok'])
+        self.assertIn('no trash', r['message'])
+        self.assertEqual(dash.load_history()[-1]['dataKept'], [str(self.data_dir)])
+
+    def test_if_omarchy_refuses_the_services_start_again_and_nothing_is_recorded(self):
+        self.remove_rc = 1
+        r = self.remove('nixfred.pulse')
+        self.assertFalse(r['ok'])
+        self.assertIn(['systemctl', '--user', 'start', 'cpu-pulse.service'], self.calls)
+        self.assertTrue((self.units / 'cpu-pulse.service').exists())
+        self.assertEqual(dash.load_history(), [])
+
+    def test_a_hold_is_dropped(self):
+        dash.save_holds({'nixfred.pulse': {'ts': 1, 'reason': 'x'}, 'other': {'ts': 1, 'reason': 'y'}})
+        self.remove('nixfred.pulse')
+        self.assertEqual(list(dash.load_holds()), ['other'])
+
+    def test_the_dashboard_still_refuses_to_remove_itself(self):
+        r = self.remove(dash.SELF_ID)
+        self.assertFalse(r['ok'])
+        self.assertEqual(self.calls, [])
+
+
+class LeftoversTests(RemovalFixture):
+    def test_backups_and_units_of_missing_plugins_are_listed_and_live_ones_are_not(self):
+        self.plugin('here.plugin')
+        (self.plugins / '.gone.plugin.bak.20260908163316').mkdir()
+        self.install_unit('alive.service', 'here.plugin')
+        self.install_unit('orphan.service', 'gone.plugin')
+        items = {i['key']: i for i in dash.leftovers()}
+        self.assertEqual(sorted(items), ['backup:.gone.plugin.bak.20260908163316', 'unit:orphan.service'])
+        self.assertEqual(items['backup:.gone.plugin.bak.20260908163316']['label'], 'gone.plugin backup · 2026-09-08')
+        (self.plugins / '.gone.plugin.bak.20260908163316' / 'manifest.json').write_text('{"name": "Gone"}')
+        self.assertEqual(dash.leftovers()[0]['label'], 'Gone backup · 2026-09-08')
+
+    def test_kept_data_stops_being_a_leftover_once_the_plugin_is_back_or_the_folder_is_gone(self):
+        d = self.data(self.state_root, 'x')
+        dash.append_history({'id': 'x.plugin', 'name': 'X', 'action': 'remove', 'dataKept': [str(d)], 'ok': True})
+        self.assertEqual(len(dash.leftovers()), 1)
+        self.plugin('x.plugin')
+        self.assertEqual(dash.leftovers(), [])
+
+    def test_cleanup_acts_only_on_a_key_the_list_has(self):
+        (self.plugins / '.gone.plugin.bak.20260908163316').mkdir()
+        self.install_unit('orphan.service', 'gone.plugin')
+        dash.cmd_cleanup(type('A', (), {'id': 'data:/etc'})())
+        self.assertFalse(self.printed[-1]['ok'])
+        self.assertEqual(self.trashed, [])
+        dash.cmd_cleanup(type('A', (), {'id': 'backup:.gone.plugin.bak.20260908163316'})())
+        self.assertTrue(self.printed[-1]['ok'])
+        self.assertFalse((self.plugins / '.gone.plugin.bak.20260908163316').exists())
+        dash.cmd_cleanup(type('A', (), {'id': 'unit:orphan.service'})())
+        self.assertTrue(self.printed[-1]['ok'])
+        self.assertFalse((self.units / 'orphan.service').exists())
+        self.assertIn(['systemctl', '--user', 'disable', '--now', 'orphan.service'], self.calls)
+
+    def test_purge_rides_along_in_the_job(self):
+        seen = []
+        with patch.object(dash, 'cmd_remove', lambda a: seen.append(a.purge) or print(json.dumps({'ok': True}))):
+            dash.execute_job(dash.new_job('remove', ['p'], {'purge': True}))
+        self.assertEqual(seen, [True])
