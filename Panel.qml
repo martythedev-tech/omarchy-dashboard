@@ -54,6 +54,18 @@ Panel {
     // Updates, rollbacks and removals run as a job outside this widget (see Model.isJobKind):
     // the job this instance last saw going, and the last one whose ending it showed.
     property string jobSeenId: ""
+    // Remove's confirmation: what dashboard.py remove-plan says it would do, and whether
+    // the plugin's data goes to the trash with it.
+    property var removePlan: null
+    property bool removePurge: false
+    readonly property var leftovers: status.leftovers || []
+    property bool leftoversOpen: false
+    // The theme's named colours (colors.toml), for the gauge's mood.
+    property var palette: ({})
+    readonly property string gaugeToneName: Model.gaugeTone(items, history, Date.now() / 1000)
+    readonly property color gaugeTone: Model.toneColor(gaugeToneName, palette,
+        {urgent: String(Color.urgent), accent: String(Color.accent), muted: String(Color.muted)})
+    readonly property bool working: busyId !== "" || checkProc.running
     property string jobAppliedId: ""
     property var addAppNotes: []
     // The Changes panel's two views of the same update: the commit list (default, readable
@@ -84,6 +96,7 @@ Panel {
             case "rollback": return "Rolling back "
             case "hold": return "Holding "
             case "unhold": return "Unholding "
+            case "cleanup": return "Cleaning up "
             default: return "Working on "
         }
     }
@@ -127,9 +140,42 @@ Panel {
         startJob("update", ids)
     }
 
-    function startJob(kind, ids) {
-        startProc.command = ["python3", helper, "start", kind].concat(ids)
+    function startJob(kind, ids, purge) {
+        startProc.command = ["python3", helper, "start", kind].concat(ids).concat(purge ? ["--purge"] : [])
         startProc.running = true
+    }
+
+    // Remove asks first, in the row's detail panel, with the plan in front of you: what
+    // goes, which services stop, and the data it would leave or trash.
+    function showRemovePlan(id) {
+        if (root.detailOpenId === id && root.detailMode === "remove") { root.detailOpenId = ""; return }
+        root.removePlan = null
+        root.removePurge = false
+        root.detailOpenId = id
+        root.detailMode = "remove"
+        root.detailOk = true
+        root.detailText = "Looking at what it left around…"
+        planProc.command = ["python3", root.helper, "remove-plan", id]
+        planProc.running = true
+    }
+
+    function confirmRemove(id) {
+        if (root.busyId !== "" || !root.removePlan) return
+        var purge = root.removePurge && (root.removePlan.data || []).length > 0
+        root.busyId = id
+        root.lastActionKind = "remove"
+        root.actionStartSec = Date.now() / 1000
+        root.actionStatus = actionVerb("remove") + root.itemName(id) + "…"
+        startJob("remove", [id], purge)
+    }
+
+    function cleanupLeftovers(keys) {
+        if (root.busyId !== "" || keys.length === 0) return
+        root.busyId = keys[0]
+        root.lastActionKind = "cleanup"
+        root.actionStartSec = Date.now() / 1000
+        root.actionStatus = actionVerb("cleanup") + (keys.length > 1 ? keys.length + " items…" : "…")
+        startJob("cleanup", keys)
     }
 
     // job.json changed (or this instance was just created and read it): mirror a running
@@ -142,9 +188,11 @@ Panel {
             root.busyId = v.id
             root.lastActionKind = v.kind
             root.actionStartSec = v.startSec
-            root.updateQueueTotal = v.total > 1 ? v.total : 0
-            root.updateQueueDone = v.total > 1 ? Math.min(v.done + 1, v.total) : 0
-            root.actionStatus = actionVerb(v.kind) + root.itemName(v.id) + "…"
+            var queued = v.total > 1 && v.kind === "update"
+            root.updateQueueTotal = queued ? v.total : 0
+            root.updateQueueDone = queued ? Math.min(v.done + 1, v.total) : 0
+            root.actionStatus = actionVerb(v.kind) + (v.kind === "cleanup" ? (v.total > 1 ? (v.done + 1) + "/" + v.total + "…" : "…")
+                                                                           : root.itemName(v.id) + "…")
             if (fresh && v.kind === "update") {
                 root.detailOpenId = v.id
                 root.detailMode = "output"
@@ -159,7 +207,13 @@ Panel {
         root.busyId = ""
         root.lastActionKind = ""
         var results = v.results
-        if (v.total > 1) {
+        if (v.total > 1 && v.kind === "cleanup") {
+            root.updateQueueTotal = 0
+            root.updateQueueDone = 0
+            root.actionStatus = Model.queueSummary(results.map(function(r) { return {id: r.id, name: r.id, ok: !!r.ok} }), "Clean up", "cleared")
+        } else if (v.kind === "cleanup") {
+            root.actionStatus = results.length && results[0].ok ? "Cleaned up." : (results.length ? results[0].message : "")
+        } else if (v.total > 1) {
             root.queueResults = results.map(function(r) { return {id: r.id, name: root.itemName(r.id), ok: !!r.ok, message: r.message || ""} })
             root.finishUpdateQueue()
         } else {
@@ -178,8 +232,10 @@ Panel {
             if (!r.ok) root.addAppNotes = [r.message || "Could not add it."]
             if (r.ok) root.addAppFormOpen = false
         } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
-            // The row is about to disappear from the list -- nothing left to show a panel on.
+            // The row is about to disappear from the list -- nothing left to show a panel on;
+            // the footer carries what happened.
             if (root.detailOpenId === targetId) root.detailOpenId = ""
+            root.actionStatus = (r.message || "Removed.").split("\n").slice(-1)[0]
         } else if (r.ok && (kind === "hold" || kind === "unhold")) {
             // The pill says it; an output panel reading "Holding x" adds nothing.
             if (root.detailOpenId === targetId) root.detailOpenId = ""
@@ -414,6 +470,34 @@ Panel {
     }
 
     Process {
+        id: planProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                try {
+                    var r = JSON.parse(text)
+                    if (!r.ok) { root.detailText = r.message || "Cannot remove it."; return }
+                    if (root.detailOpenId === r.id) root.removePlan = r
+                } catch (e) { root.detailText = "Could not read what it would remove." }
+            }
+        }
+    }
+
+    FileView {
+        id: paletteFile
+        path: root.home + "/.local/state/omarchy/current/theme/colors.toml"
+        printErrors: false
+        onLoaded: root.palette = Model.parsePalette(text())
+        onLoadFailed: root.palette = ({})
+    }
+    // A theme switch repoints current/theme, which a file watch would not follow.
+    Connections {
+        target: Color
+        function onAccentChanged() { paletteFile.reload() }
+        function onBackgroundChanged() { paletteFile.reload() }
+    }
+
+    Process {
         id: diffProc
         stdout: StdioCollector {
             waitForEnd: true
@@ -504,70 +588,88 @@ Panel {
             font.pixelSize: Style.font.bodySmall
         }
     }
-    // The header's update-health ring: an arc over Style.normalBorderColor's
-    // track, filled with Color.accent for the done fraction. Small deliberate
-    // centerpiece rather than a plain "8/9" line -- the one bit of genuinely
-    // "at a glance" visual state this panel has, echoing cpu-pulse's own
-    // radial CpuChip without trying to be that literal animated die.
-    component HealthRing: Item {
-        id: ring
-        property int done: 0
-        property int total: 0
-        property color trackColor: Style.normalBorderColor
-        property color fillColor: Color.accent
-        // Compact mode (the bar chip's icon) drops the center label -- there's
-        // no room to draw "8/9" legibly at bar-icon size -- and draws a
-        // thinner stroke proportionate to the smaller ring.
-        property bool showLabel: true
-        property string labelText: total > 0 ? done + "/" + total : "--"
-        property real strokeWidth: showLabel ? 3 : 2.2
-        // 44px, not 36: a worst-case label like "10/10" is 5 characters, and
-        // 36px left only ~25px of clear space inside a 3.5px stroke at that
-        // size -- the label and the arc visibly collided (confirmed live,
-        // 2026-09-16 screenshot). 44px plus the narrower stroke above leaves
-        // ~35px clear, comfortable for a 9px label.
-        implicitWidth: showLabel ? 44 : 36; implicitHeight: showLabel ? 44 : 36
+    // The Dashboard's mark: a dial, as on a car's dashboard. The arc fills with the share of
+    // items that are current and the needle points at it; both wear the theme's colour for
+    // the mood (Model.gaugeTone): green all current, yellow updates waiting, red something
+    // needs a person. While a check or an action runs, the needle sweeps.
+    component Gauge: Item {
+        id: g
+        property real frac: 0
+        property color tone: Color.accent
+        property color track: Style.normalBorderColor
+        property color needle: root.ink
+        property bool working: false
+        property bool compact: false
+        // The needle eases to a new reading instead of jumping.
+        property real shown: frac
+        Behavior on shown { NumberAnimation { duration: 700; easing.type: Easing.OutBack } }
+        property real sweep: 0.15
+        SequentialAnimation on sweep {
+            running: g.working
+            loops: Animation.Infinite
+            NumberAnimation { from: 0.15; to: 0.85; duration: 850; easing.type: Easing.InOutSine }
+            NumberAnimation { from: 0.85; to: 0.15; duration: 850; easing.type: Easing.InOutSine }
+        }
+        implicitWidth: compact ? 22 : 48
+        implicitHeight: implicitWidth
         Canvas {
-            id: canvas
+            id: dial
+            // Bigger than the gauge by the glow's reach, so the glow fades out instead of
+            // being cut off square at the gauge's edges.
+            readonly property real pad: g.compact ? 3 : 5
             anchors.fill: parent
-            property real frac: ring.total > 0 ? ring.done / ring.total : 0
-            property color track: ring.trackColor
-            property color fill: ring.fillColor
-            property real stroke: ring.strokeWidth
-            onFracChanged: requestPaint()
+            anchors.margins: -pad
+            readonly property real value: Math.max(0, Math.min(1, g.working ? g.sweep : g.shown))
+            readonly property color tone: g.tone
+            readonly property color track: g.track
+            readonly property color needle: g.needle
+            onValueChanged: requestPaint()
+            onToneChanged: requestPaint()
             onTrackChanged: requestPaint()
-            onFillChanged: requestPaint()
-            onStrokeChanged: requestPaint()
+            onNeedleChanged: requestPaint()
             onWidthChanged: requestPaint()
             onHeightChanged: requestPaint()
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.reset()
-                var cx = width / 2, cy = height / 2, r = Math.min(width, height) / 2 - stroke
-                var start = -Math.PI / 2
-                ctx.lineWidth = stroke
+                var w = width - 2 * pad, h = height - 2 * pad
+                var stroke = g.compact ? Math.max(2, w * 0.12) : w * 0.085
+                // A 270° dial open at the bottom: it is 1 + sin(45°) radii tall and two
+                // wide, so the radius is whichever of those fits first.
+                var r = Math.min((w - stroke) / 2, (h - stroke) / (1 + Math.SQRT1_2))
+                var cx = width / 2, cy = pad + stroke / 2 + r + (h - stroke - r * (1 + Math.SQRT1_2)) / 2
+                var a0 = Math.PI * 0.75, span = Math.PI * 1.5
                 ctx.lineCap = "round"
+                ctx.lineWidth = stroke
                 ctx.strokeStyle = track
-                ctx.beginPath()
-                ctx.arc(cx, cy, r, 0, Math.PI * 2)
-                ctx.stroke()
-                if (frac > 0) {
-                    ctx.strokeStyle = fill
-                    ctx.beginPath()
-                    ctx.arc(cx, cy, r, start, start + Math.PI * 2 * Math.min(1, frac))
-                    ctx.stroke()
+                ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + span); ctx.stroke()
+                if (value > 0.002) {
+                    ctx.save()
+                    ctx.shadowColor = tone
+                    ctx.shadowBlur = g.compact ? 3 : 6
+                    ctx.strokeStyle = tone
+                    ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + span * value); ctx.stroke()
+                    ctx.restore()
                 }
+                if (!g.compact) {
+                    ctx.lineWidth = 1
+                    ctx.strokeStyle = track
+                    for (var i = 0; i <= 4; i++) {
+                        var t = a0 + span * i / 4
+                        ctx.beginPath()
+                        ctx.moveTo(cx + Math.cos(t) * (r - stroke * 1.9), cy + Math.sin(t) * (r - stroke * 1.9))
+                        ctx.lineTo(cx + Math.cos(t) * (r - stroke * 1.1), cy + Math.sin(t) * (r - stroke * 1.1))
+                        ctx.stroke()
+                    }
+                }
+                var a = a0 + span * value
+                var len = r - stroke * (g.compact ? 0.9 : 1.5)
+                ctx.lineWidth = g.compact ? 1.6 : 2.2
+                ctx.strokeStyle = needle
+                ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * len, cy + Math.sin(a) * len); ctx.stroke()
+                ctx.fillStyle = tone
+                ctx.beginPath(); ctx.arc(cx, cy, g.compact ? 2.1 : 3.4, 0, Math.PI * 2); ctx.fill()
             }
-        }
-        Text {
-            visible: ring.showLabel
-            anchors.centerIn: parent
-            text: ring.labelText
-            color: root.ink
-            font.family: Style.font.family
-            font.pixelSize: 9
-            font.bold: true
-            textFormat: Text.PlainText
         }
     }
     component Row_: Rectangle {
@@ -800,13 +902,13 @@ Panel {
                         onClicked: row.confirmThen("rollback", function() { root.runAction("rollback", row.modelData.id) })
                     }
                     SmallButton {
-                        text: row.confirming === "remove" ? "Confirm remove?" : (row.modelData.kind === "app" ? "Stop tracking" : "Remove")
+                        text: row.confirming === "remove" ? "Confirm remove?" : (row.modelData.kind === "app" ? "Stop tracking" : "Remove…")
                         accent: Color.urgent
                         visible: !row.isSelf
                         enabled: !row.busy && root.busyId === ""
-                        onClicked: row.confirmThen("remove", function() {
-                            root.runAction(row.modelData.kind === "app" ? "remove-app" : "remove", row.modelData.id)
-                        })
+                        onClicked: row.modelData.kind === "app"
+                                   ? row.confirmThen("remove", function() { root.runAction("remove-app", row.modelData.id) })
+                                   : root.showRemovePlan(row.modelData.id)
                     }
                 }
             }
@@ -831,8 +933,9 @@ Panel {
                             anchors.right: detailButtons.left
                             anchors.verticalCenter: parent.verticalCenter
                             elide: Text.ElideRight
-                            text: root.detailMode === "diff" ? "Changes vs upstream" : (root.detailOk ? "Output" : "Output — failed")
-                            color: root.detailMode === "output" && !root.detailOk ? Color.urgent : Util.alpha(root.ink, 0.62)
+                            text: root.detailMode === "remove" ? "Remove it?"
+                                  : root.detailMode === "diff" ? "Changes vs upstream" : (root.detailOk ? "Output" : "Output — failed")
+                            color: (root.detailMode === "output" && !root.detailOk) || root.detailMode === "remove" ? Color.urgent : Util.alpha(root.ink, 0.62)
                             font.pixelSize: Style.font.caption
                         }
                         Row {
@@ -860,7 +963,20 @@ Panel {
                                 enabled: root.busyId === ""
                                 onClicked: root.runAction("hold", row.modelData.id)
                             }
-                            SmallButton { text: "Close"; accent: Color.muted; onClicked: root.closeDetail() }
+                            SmallButton {
+                                text: (root.removePurge ? "☑" : "☐") + " Trash its data"
+                                visible: root.detailMode === "remove" && !!root.removePlan && (root.removePlan.data || []).length > 0
+                                accent: root.removePurge ? Color.urgent : Color.muted
+                                onClicked: root.removePurge = !root.removePurge
+                            }
+                            SmallButton {
+                                text: "Remove"
+                                visible: root.detailMode === "remove"
+                                accent: Color.urgent
+                                enabled: !!root.removePlan && root.busyId === ""
+                                onClicked: root.confirmRemove(row.modelData.id)
+                            }
+                            SmallButton { text: root.detailMode === "remove" ? "Cancel" : "Close"; accent: Color.muted; onClicked: root.closeDetail() }
                         }
                     }
                     Flickable {
@@ -886,6 +1002,8 @@ Panel {
                                            meta: String(Util.alpha(root.ink, 0.45)),
                                            text: String(root.ink)
                                        })
+                                     : root.detailMode === "remove" && root.removePlan
+                                     ? Model.removePlanLines(root.removePlan, root.removePurge, root.home).map(function(l) { return l.indexOf("   ") === 0 ? l : "· " + l }).join("\n")
                                      : root.detailText)
                             color: Util.alpha(root.ink, 0.85)
                             font.family: Style.font.family
@@ -913,28 +1031,35 @@ Panel {
             id: chipRow
             anchors.centerIn: parent
             spacing: 4
-            // The bar's own version of the popup header's health ring, so the
-            // chip itself answers "is anything worth a look" before it's even
-            // opened, rather than a static icon that means the same thing
-            // whether everything's current or half the list needs attention.
-            HealthRing {
-                id: barRing
+            // The gauge on the bar answers "is anything worth a look" before the panel is
+            // opened; the count beside it says how many updates are waiting.
+            Gauge {
+                id: barGauge
                 anchors.verticalCenter: parent.verticalCenter
-                implicitWidth: Style.bar.iconCanvas
-                implicitHeight: Style.bar.iconCanvas
-                showLabel: root.updatable > 0
-                labelText: String(root.updatable)
-                trackColor: Util.alpha(root.barForeground, 0.35)
-                fillColor: root.barForeground
-                done: root.health.done
-                total: root.health.total
-                property real pulse: 1.0
-                opacity: root.updatable > 0 ? pulse : 1.0
-                SequentialAnimation {
-                    running: root.updatable > 0
+                compact: true
+                implicitWidth: Style.bar.iconCanvas + 2
+                implicitHeight: Style.bar.iconCanvas + 2
+                frac: root.health.total > 0 ? root.health.done / root.health.total : 0
+                tone: root.gaugeTone
+                track: Util.alpha(root.barForeground, 0.28)
+                needle: root.barForeground
+                working: root.working
+            }
+            Text {
+                id: barCount
+                visible: root.updatable > 0
+                anchors.verticalCenter: parent.verticalCenter
+                text: String(root.updatable)
+                color: root.gaugeTone
+                font.family: Style.font.family
+                font.pixelSize: 12
+                font.bold: true
+                textFormat: Text.PlainText
+                SequentialAnimation on opacity {
+                    running: barCount.visible
                     loops: Animation.Infinite
-                    NumberAnimation { target: barRing; property: "pulse"; from: 1.0; to: 0.45; duration: 700; easing.type: Easing.InOutQuad }
-                    NumberAnimation { target: barRing; property: "pulse"; from: 0.45; to: 1.0; duration: 700; easing.type: Easing.InOutQuad }
+                    NumberAnimation { from: 1.0; to: 0.5; duration: 900; easing.type: Easing.InOutQuad }
+                    NumberAnimation { from: 0.5; to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
                 }
             }
         }
@@ -979,12 +1104,13 @@ Panel {
                     width: parent.width
                     height: Math.max(ring.implicitHeight, titleCol.implicitHeight, headerButtons.implicitHeight)
 
-                    HealthRing {
+                    Gauge {
                         id: ring
                         anchors.left: parent.left
                         anchors.verticalCenter: parent.verticalCenter
-                        done: root.health.done
-                        total: root.health.total
+                        frac: root.health.total > 0 ? root.health.done / root.health.total : 0
+                        tone: root.gaugeTone
+                        working: root.working
                     }
                     Row {
                         id: headerButtons
@@ -1096,6 +1222,72 @@ Panel {
                             Repeater {
                                 model: root.disabledOpen ? root.grouped.disabled : []
                                 Row_ {}
+                            }
+                        }
+
+                        // What removed plugins left behind (dashboard.py leftovers): omarchy's
+                        // backup folders, services still pointing at a plugin that is gone, and
+                        // data a removal kept. Clean up sends folders to the trash.
+                        Column {
+                            width: parent.width
+                            visible: root.leftovers.length > 0
+                            spacing: 6
+                            Item {
+                                width: parent.width
+                                height: leftoversLabel.implicitHeight + 4
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.leftoversOpen = !root.leftoversOpen
+                                }
+                                Label {
+                                    id: leftoversLabel
+                                    text: "LEFTOVERS  " + root.leftovers.length + "  ·  " +
+                                          Model.formatSize(root.leftovers.reduce(function(t, l) { return t + (l.size || 0) }, 0))
+                                    font.pixelSize: Style.font.caption
+                                    font.letterSpacing: 1.5
+                                    anchors.verticalCenter: parent.verticalCenter
+                                }
+                                Label {
+                                    text: root.leftoversOpen ? "hide" : "show"
+                                    anchors.right: parent.right
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    font.pixelSize: Style.font.caption
+                                }
+                            }
+                            Repeater {
+                                model: root.leftoversOpen ? root.leftovers : []
+                                Item {
+                                    required property var modelData
+                                    width: parent ? parent.width : 0
+                                    height: Math.max(leftoverText.implicitHeight, leftoverButton.implicitHeight)
+                                    Label {
+                                        id: leftoverText
+                                        anchors.left: parent.left
+                                        anchors.right: leftoverButton.left
+                                        anchors.rightMargin: 8
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        elide: Text.ElideMiddle
+                                        text: modelData.label + (modelData.size ? "  ·  " + Model.formatSize(modelData.size) : "")
+                                        font.pixelSize: Style.font.caption
+                                    }
+                                    SmallButton {
+                                        id: leftoverButton
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: root.busyId === modelData.key ? "…" : "Clean up"
+                                        accent: Color.urgent
+                                        enabled: root.busyId === ""
+                                        onClicked: root.cleanupLeftovers([modelData.key])
+                                    }
+                                }
+                            }
+                            SmallButton {
+                                visible: root.leftoversOpen && root.leftovers.length > 1
+                                text: "Clean up all (" + root.leftovers.length + ")"
+                                accent: Color.urgent
+                                enabled: root.busyId === ""
+                                onClicked: root.cleanupLeftovers(root.leftovers.map(function(l) { return l.key }))
                             }
                         }
 

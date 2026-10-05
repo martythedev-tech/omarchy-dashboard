@@ -10,6 +10,15 @@ Omarchy's own built-ins never show up here: the plugin list comes from
 `omarchy plugin list --json` filtered to `firstParty: false`, which is
 exactly the "not Omarchy's own" boundary Omarchy itself already draws.
 
+## The gauge
+
+The bar icon is a dial, like a car's dashboard: the arc fills with the share of
+plugins and apps that are current, and the needle points at it. Its colour comes
+from your theme's palette (`colors.toml`): green when everything is current,
+yellow with updates waiting (their count beside it), red when something needs a
+person -- local changes, a half-finished git operation, or an action that failed
+in the last day. While a check or an action runs, the needle sweeps.
+
 ## How it works
 
 Nothing here re-implements an update mechanism. Every action shells out to
@@ -98,11 +107,21 @@ fetch rather than the sum of them.
   50); the newest few are listed at the bottom of the panel.
 - **Update all**: appears once more than one item is updatable; updates them
   one at a time.
-- **Remove**: `omarchy plugin remove <id> --yes` for plugins, or just drops
-  an app from the tracked list. Needs a second click within 4s to confirm --
-  for a plugin without local edits this deletes its directory outright ("its
-  git repo remains upstream" is Omarchy's own justification), so don't
-  confirm one you haven't actually finished with.
+- **Remove…** (a plugin): shows what it will do before anything happens --
+  delete the folder (a git checkout; its source stays upstream), unlink it (a
+  symlink), or move it to a backup (anything else); stop and remove the
+  services that run its code (matched on the plugin's path in the unit, not
+  the unit's name); and the data folders it left in `~/.local/state`,
+  `~/.cache` and `~/.local/share`, with sizes. Data is kept unless you tick
+  **Trash its data**, and then it goes to the desktop trash, never deleted
+  outright. A folder another installed plugin also points at is never
+  offered. Then `omarchy plugin remove <id> --yes`; if that refuses, the
+  services are started again. For an app, **Stop tracking** (two clicks)
+  only forgets it here.
+- **Leftovers**: what removed plugins left behind -- omarchy's
+  `.<id>.bak.*` backup folders, services still pointing at a plugin that is
+  gone, and data a removal kept. **Clean up** sends a folder to the trash and
+  stops and removes a unit.
 - **New background services**: an update can ship a systemd user unit the plugin's
   own `install.py` would have installed (Pulse 1.3.2 added `gpu-pulse.service`), and
   `omarchy plugin update` never runs `install.py`. After a successful update the

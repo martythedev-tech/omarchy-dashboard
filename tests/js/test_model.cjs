@@ -253,4 +253,39 @@ assert.equal(ctx.jobView(done, '', '', 100).apply, false, 'an old one found on l
 assert.equal(ctx.jobView(done, '', '', 60).apply, true, 'one that only just finished (rebuilt at the end)');
 assert.equal(ctx.jobView(done, 'j1', '', 100).busy, false);
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs all pass.');
+
+// removal + leftovers
+assert.equal(ctx.historyLine({name: 'Pulse', action: 'remove', ok: true, ts: 100}, 100), 'Pulse removed · just now');
+assert.equal(ctx.historyMark({action: 'remove', ok: true}), '−');
+assert.equal(ctx.formatSize(512), '512 B');
+assert.equal(ctx.formatSize(5 * 1024 * 1024 + 300000), '5.3 MB');
+assert.equal(ctx.formatSize(23 * 1024 * 1024), '23 MB');
+var plan = {folder: {kind: 'git', path: '/home/a/.config/omarchy/plugins/nixfred.pulse'}, units: ['cpu-pulse.service'],
+            data: [{path: '/home/a/.local/state/ram-pulse', size: 5 * 1024 * 1024}], backups: []};
+assert.deepEqual(JSON.parse(JSON.stringify(ctx.removePlanLines(plan, false, '/home/a'))), [
+    'Delete ~/.config/omarchy/plugins/nixfred.pulse (its source stays upstream).',
+    'Stop and remove cpu-pulse.service.',
+    'Keep its data (Leftovers will list it) — 5.0 MB:',
+    '   ~/.local/state/ram-pulse  5.0 MB']);
+assert.equal(ctx.removePlanLines(plan, true, '/home/a')[2], 'Move its data to the trash — 5.0 MB:');
+assert.equal(ctx.removePlanLines({folder: {kind: 'link', path: '/x'}}, false, '')[0], 'Unlink /x (the folder it points to stays).');
+assert.equal(ctx.removePlanLines({folder: {kind: 'plain', path: '/x'}, backups: [{}]}, false, '')[2], '1 old backup of it stays in Leftovers.');
+
+// gauge tone + palette
+var pal = ctx.parsePalette('mode = "dark"\nred = "#f7768e"\nyellow = "#e0af68"\ngreen = "#9ece6a"\n');
+assert.equal(pal.red, '#f7768e');
+assert.equal(pal.mode, undefined);
+assert.equal(ctx.gaugeTone([], [], 0), 'idle');
+assert.equal(ctx.gaugeTone([{updateState: 'up-to-date'}], [], 0), 'calm');
+assert.equal(ctx.gaugeTone([{updateState: 'behind', versionChange: true}], [], 0), 'waiting');
+assert.equal(ctx.gaugeTone([{updateState: 'behind', versionChange: false}], [], 0), 'calm', 'same-version stays quiet');
+assert.equal(ctx.gaugeTone([{updateState: 'dirty'}], [], 0), 'attention');
+assert.equal(ctx.gaugeTone([{updateState: 'dirty', held: true}], [], 0), 'calm');
+assert.equal(ctx.gaugeTone([{updateState: 'up-to-date'}], [{ok: false, ts: 1000}], 2000), 'attention');
+assert.equal(ctx.gaugeTone([{updateState: 'up-to-date'}], [{ok: false, ts: 0}], 200000), 'calm', 'old failure forgotten');
+assert.equal(ctx.toneColor('attention', pal, {urgent: 'U'}), '#f7768e');
+assert.equal(ctx.toneColor('waiting', pal, {}), '#e0af68');
+assert.equal(ctx.toneColor('calm', {}, {accent: 'A'}), 'A');
+assert.equal(ctx.toneColor('idle', pal, {muted: 'M'}), 'M');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone all pass.');

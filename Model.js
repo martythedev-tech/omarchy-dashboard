@@ -234,7 +234,8 @@ function historyLine(e, nowSeconds) {
     var name = e.name || e.id
     var versions = e.fromVersion && e.toVersion && e.fromVersion !== e.toVersion ? ' ' + e.fromVersion + ' → ' + e.toVersion : ''
     var what
-    if (e.action === 'rollback') what = (e.ok ? 'rolled back' : 'rollback failed') + versions
+    if (e.action === 'remove') what = e.ok ? 'removed' : 'removed, with problems'
+    else if (e.action === 'rollback') what = (e.ok ? 'rolled back' : 'rollback failed') + versions
     // Same version: an app's update really did rebuild and reinstall it; a plugin's only
     // pulled commits that left the version alone (docs, tooling).
     else if (!e.ok) what = 'update failed'
@@ -246,6 +247,7 @@ function historyLine(e, nowSeconds) {
 function historyMark(e) {
     if (!e) return ''
     if (!e.ok) return '✗'
+    if (e.action === 'remove') return '−'
     return e.action === 'rollback' ? '↩' : '✓'
 }
 
@@ -270,7 +272,7 @@ function shortUrl(url) {
 }
 
 // The Update all summary, from [{id, name, ok}] in the order they ran.
-function queueSummary(results) {
+function queueSummary(results, title, verb) {
     results = results || []
     var ok = 0, failed = []
     for (var i = 0; i < results.length; i++) {
@@ -278,15 +280,15 @@ function queueSummary(results) {
         else failed.push(results[i].name || results[i].id)
     }
     var parts = []
-    if (ok) parts.push(ok + ' updated')
+    if (ok) parts.push(ok + ' ' + (verb || 'updated'))
     if (failed.length) parts.push(failed.length + ' failed (' + failed.join(', ') + ')')
-    return parts.length ? 'Update all: ' + parts.join(', ') + '.' : ''
+    return parts.length ? (title || 'Update all') + ': ' + parts.join(', ') + '.' : ''
 }
 
 // The actions that run as a job (dashboard.py JOB_KINDS): each changes a plugin's
 // directory, and the shell answers that by rebuilding this widget mid-action.
 function isJobKind(kind) {
-    return kind === 'update' || kind === 'rollback' || kind === 'remove'
+    return kind === 'update' || kind === 'rollback' || kind === 'remove' || kind === 'cleanup'
 }
 
 // What job.json means for this panel instance. busy: show it going (whichever instance
@@ -304,4 +306,80 @@ function jobView(job, seenJobId, appliedJobId, nowSeconds) {
     var apply = job.state === 'done' && job.jobId !== appliedJobId &&
                 (job.jobId === seenJobId || nowSeconds - (job.finishedTs || 0) < JOB_FRESH_SECONDS)
     return {busy: false, apply: apply, kind: job.kind || 'update', total: ids.length, results: results}
+}
+
+function formatSize(bytes) {
+    var b = Number(bytes) || 0
+    if (b < 1024) return b + ' B'
+    if (b < 1024 * 1024) return Math.round(b / 1024) + ' KB'
+    if (b < 1024 * 1024 * 1024) return (b / 1024 / 1024).toFixed(b < 10 * 1024 * 1024 ? 1 : 0) + ' MB'
+    return (b / 1024 / 1024 / 1024).toFixed(1) + ' GB'
+}
+
+function shortPath(path, home) {
+    path = String(path || '')
+    return home && path.indexOf(home + '/') === 0 ? '~' + path.slice(home.length) : path
+}
+
+// What Remove will do, as lines for the confirmation panel (dashboard.py remove-plan).
+function removePlanLines(plan, purge, home) {
+    if (!plan) return []
+    var lines = []
+    var folder = plan.folder || {}
+    var where = shortPath(folder.path, home)
+    if (folder.kind === 'link') lines.push('Unlink ' + where + ' (the folder it points to stays).')
+    else if (folder.kind === 'git') lines.push('Delete ' + where + ' (its source stays upstream).')
+    else lines.push('Move ' + where + ' to a backup (it is not a git checkout).')
+    var units = plan.units || []
+    if (units.length) lines.push('Stop and remove ' + units.join(', ') + '.')
+    var data = plan.data || []
+    if (data.length) {
+        var total = 0
+        for (var i = 0; i < data.length; i++) total += data[i].size || 0
+        lines.push((purge ? 'Move its data to the trash' : 'Keep its data (Leftovers will list it)') +
+                   ' — ' + formatSize(total) + ':')
+        for (var j = 0; j < data.length; j++) lines.push('   ' + shortPath(data[j].path, home) + '  ' + formatSize(data[j].size))
+    } else {
+        lines.push('No data folders of its own found.')
+    }
+    var backups = plan.backups || []
+    if (backups.length) lines.push(backups.length + ' old backup' + (backups.length === 1 ? '' : 's') + ' of it stay' +
+                                   (backups.length === 1 ? 's' : '') + ' in Leftovers.')
+    return lines
+}
+
+// The theme's named colours from colors.toml (`red = "#f7768e"`); {} when unreadable.
+function parsePalette(raw) {
+    var out = {}, lines = String(raw || '').split('\n')
+    for (var i = 0; i < lines.length; i++) {
+        var m = /^\s*([A-Za-z0-9_]+)\s*=\s*["']?(#[0-9A-Fa-f]{6})/.exec(lines[i])
+        if (m) out[m[1].toLowerCase()] = m[2]
+    }
+    return out
+}
+
+// The gauge's mood. attention: something needs a person (local changes, a git operation
+// half done, diverged, or a recent action that failed); waiting: updates in the badge;
+// calm: all current; idle: nothing checked yet.
+var ATTENTION_STATES = ['dirty', 'diverged', 'in-progress']
+var FAILURE_FRESH_SECONDS = 24 * 3600
+function gaugeTone(items, history, nowSeconds) {
+    items = items || []
+    if (!items.length) return 'idle'
+    for (var i = 0; i < items.length; i++) {
+        if (items[i] && !items[i].held && ATTENTION_STATES.indexOf(items[i].updateState) !== -1) return 'attention'
+    }
+    var last = (history || [])[0]
+    if (last && !last.ok && nowSeconds - (last.ts || 0) < FAILURE_FRESH_SECONDS) return 'attention'
+    return badgeCount(items) > 0 ? 'waiting' : 'calm'
+}
+
+// Theme colour for a tone, falling back to what the shell always has.
+function toneColor(tone, palette, fallback) {
+    palette = palette || {}
+    fallback = fallback || {}
+    if (tone === 'attention') return palette.red || fallback.urgent
+    if (tone === 'waiting') return palette.yellow || palette.orange || fallback.accent
+    if (tone === 'calm') return palette.green || fallback.accent
+    return fallback.muted
 }
