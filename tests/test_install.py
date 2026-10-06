@@ -44,6 +44,8 @@ class InstallTests(unittest.TestCase):
             for name in ('manifest.json', 'Panel.qml', 'Model.js', 'dashboard.py', 'README.md'):
                 self.assertTrue((dest / name).exists(), name + ' was not deployed')
             self.assertTrue((home / '.config/systemd/user/dashboard-check.service').exists())
+            self.assertIn('getent hosts', (home / '.config/systemd/user/dashboard-check.service').read_text(),
+                          'check service no longer waits for the network')
             self.assertTrue((home / '.config/systemd/user/dashboard-check.timer').exists())
             self.assertEqual(len(list((home / '.local/state/omarchy/backups').iterdir())), 1)
 
