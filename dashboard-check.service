@@ -3,4 +3,9 @@ Description=Check plugin/app updates for the Plugin Dashboard widget
 
 [Service]
 Type=oneshot
+# The timer is Persistent, so after a suspend it can fire the instant the
+# machine resumes, before Wi-Fi is back, and every check comes back
+# unreachable. Wait up to 2 min for DNS to work; user units can't order on
+# network-online.target.
+ExecStartPre=/bin/sh -c 'for i in $(seq 60); do getent hosts github.com >/dev/null && exit 0; sleep 2; done; echo "network not up after 120s" >&2; exit 1'
 ExecStart=/usr/bin/python3 %h/.config/omarchy/plugins/martythedev-tech.dashboard/dashboard.py check
