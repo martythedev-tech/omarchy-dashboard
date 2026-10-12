@@ -63,7 +63,11 @@ Panel {
     property bool leftoversOpen: false
     // The theme's named colours (colors.toml), for the gauge's mood.
     property var palette: ({})
-    readonly property string gaugeToneName: Model.gaugeTone(items, history, Date.now() / 1000)
+    // When the panel was last opened or closed: a failed action from before then has been
+    // seen, so it stops turning the gauge red. Kept in a file so a shell restart and the
+    // bars on other monitors agree.
+    property real failureSeenTs: 0
+    readonly property string gaugeToneName: Model.gaugeTone(items, history, Date.now() / 1000, failureSeenTs)
     readonly property color gaugeTone: Model.toneColor(gaugeToneName, palette,
         {urgent: String(Commons.Color.urgent), accent: String(Commons.Color.accent), muted: String(Commons.Color.muted)})
     readonly property bool working: busyId !== "" || checkProc.running
@@ -316,9 +320,17 @@ Panel {
         actionProc.running = true
     }
 
-    onOpenedChanged: if (opened) {
-        statusFile.reload()
-        if (!Model.statusFresh(root.status.ts, Date.now() / 1000, 300)) root.runCheck()
+    onOpenedChanged: {
+        root.markFailuresSeen()
+        if (opened) {
+            statusFile.reload()
+            if (!Model.statusFresh(root.status.ts, Date.now() / 1000, 300)) root.runCheck()
+        }
+    }
+
+    function markFailuresSeen(): void {
+        root.failureSeenTs = Date.now() / 1000
+        seenFile.setText(JSON.stringify({failureSeenTs: root.failureSeenTs}) + "\n")
     }
 
     // manageIpc is false so this handler can own the target (one handler per target; the
@@ -349,6 +361,16 @@ Panel {
         printErrors: false
         onFileChanged: reload()
         onLoaded: { try { root.status = JSON.parse(text()) } catch (e) {} }
+    }
+
+    FileView {
+        id: seenFile
+        path: root.stateDir + "/seen.json"
+        watchChanges: true
+        atomicWrites: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: { try { root.failureSeenTs = Number(JSON.parse(text()).failureSeenTs) || 0 } catch (e) {} }
     }
 
     FileView {

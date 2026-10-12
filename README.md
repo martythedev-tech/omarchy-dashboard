@@ -17,7 +17,7 @@ plugins and apps that are current, and the needle points at it. Its colour comes
 from your theme's palette (`colors.toml`): green when everything is current,
 yellow with updates waiting (their count beside it), red when something needs a
 person -- local changes, a half-finished git operation, or an action that failed
-in the last day. While a check or an action runs, the needle sweeps.
+in the last day that you haven't seen yet (opening the panel counts as seeing it). While a check or an action runs, the needle sweeps.
 
 ## How it works
 

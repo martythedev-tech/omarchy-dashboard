@@ -359,18 +359,18 @@ function parsePalette(raw) {
 }
 
 // The gauge's mood. attention: something needs a person (local changes, a git operation
-// half done, diverged, or a recent action that failed); waiting: updates in the badge;
-// calm: all current; idle: nothing checked yet.
+// half done, diverged, or a recent action that failed and the panel has not been opened
+// since); waiting: updates in the badge; calm: all current; idle: nothing checked yet.
 var ATTENTION_STATES = ['dirty', 'diverged', 'in-progress']
 var FAILURE_FRESH_SECONDS = 24 * 3600
-function gaugeTone(items, history, nowSeconds) {
+function gaugeTone(items, history, nowSeconds, seenTs) {
     items = items || []
     if (!items.length) return 'idle'
     for (var i = 0; i < items.length; i++) {
         if (items[i] && !items[i].held && ATTENTION_STATES.indexOf(items[i].updateState) !== -1) return 'attention'
     }
     var last = (history || [])[0]
-    if (last && !last.ok && nowSeconds - (last.ts || 0) < FAILURE_FRESH_SECONDS) return 'attention'
+    if (last && !last.ok && (last.ts || 0) > (seenTs || 0) && nowSeconds - (last.ts || 0) < FAILURE_FRESH_SECONDS) return 'attention'
     return badgeCount(items) > 0 ? 'waiting' : 'calm'
 }
 
