@@ -5,6 +5,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "Model.js" as Model
+import qs.Commons as Commons
 
 // Bar chip + popup for martythedev-tech.dashboard, following nixfred.cpu-pulse's
 // shape: one file is both the bar-widget entry point and its own popup, using
@@ -64,7 +65,7 @@ Panel {
     property var palette: ({})
     readonly property string gaugeToneName: Model.gaugeTone(items, history, Date.now() / 1000)
     readonly property color gaugeTone: Model.toneColor(gaugeToneName, palette,
-        {urgent: String(Color.urgent), accent: String(Color.accent), muted: String(Color.muted)})
+        {urgent: String(Commons.Color.urgent), accent: String(Commons.Color.accent), muted: String(Commons.Color.muted)})
     readonly property bool working: busyId !== "" || checkProc.running
     property string jobAppliedId: ""
     property var addAppNotes: []
@@ -83,7 +84,7 @@ Panel {
     // clashes with a light or differently-accented theme -- the same
     // approach nixfred.cpu-pulse (the plugin whose shape this file follows)
     // already uses throughout.
-    readonly property color ink: Color.popups.text
+    readonly property color ink: Commons.Color.popups.text
     readonly property var health: Model.healthFraction(root.items)
 
     function actionVerb(kind) {
@@ -291,16 +292,16 @@ Panel {
 
     function stripeColor(item) {
         var k = Model.stripeKey(item)
-        if (k === "behind") return Color.accent
-        if (k === "attention") return Color.urgent
+        if (k === "behind") return Commons.Color.accent
+        if (k === "attention") return Commons.Color.urgent
         if (k === "off") return Util.alpha(root.ink, 0.28)
         return Util.alpha(root.ink, 0.12)
     }
 
     function pillAccent(item) {
         var k = Model.stripeKey(item)
-        if (k === "behind") return Color.accent
-        if (k === "attention") return Color.urgent
+        if (k === "behind") return Commons.Color.accent
+        if (k === "attention") return Commons.Color.urgent
         return Util.alpha(root.ink, 0.45)
     }
 
@@ -492,7 +493,7 @@ Panel {
     }
     // A theme switch repoints current/theme, which a file watch would not follow.
     Connections {
-        target: Color
+        target: Commons.Color
         function onAccentChanged() { paletteFile.reload() }
         function onBackgroundChanged() { paletteFile.reload() }
     }
@@ -525,7 +526,7 @@ Panel {
         id: btn
         property string text: ""
         property bool enabled: true
-        property color accent: Color.accent
+        property color accent: Commons.Color.accent
         signal clicked()
         implicitWidth: caption.implicitWidth + 20
         implicitHeight: Style.spacing.controlHeight - 2
@@ -550,10 +551,10 @@ Panel {
         signal toggled()
         implicitWidth: 38; implicitHeight: 20
         radius: height / 2
-        color: !tg.enabled ? Style.normalFill : tg.checked ? Color.accent : Util.alpha(root.ink, 0.16)
+        color: !tg.enabled ? Style.normalFill : tg.checked ? Commons.Color.accent : Util.alpha(root.ink, 0.16)
         opacity: tg.enabled ? 1 : 0.5
         Rectangle {
-            width: 16; height: 16; radius: 8; color: Color.background
+            width: 16; height: 16; radius: 8; color: Commons.Color.background
             anchors.verticalCenter: parent.verticalCenter
             x: tg.checked ? parent.width - width - 2 : 2
             Behavior on x { NumberAnimation { duration: 120 } }
@@ -568,7 +569,7 @@ Panel {
         height: 30
         radius: 6
         color: Style.normalFill
-        border.color: input.activeFocus ? Color.accent : Style.normalBorderColor
+        border.color: input.activeFocus ? Commons.Color.accent : Style.normalBorderColor
         TextInput {
             id: input
             anchors.fill: parent
@@ -595,7 +596,7 @@ Panel {
     component Gauge: Item {
         id: g
         property real frac: 0
-        property color tone: Color.accent
+        property color tone: Commons.Color.accent
         property color track: Style.normalBorderColor
         property color needle: root.ink
         property bool working: false
@@ -830,7 +831,7 @@ Panel {
                     }
                     SmallButton {
                         text: "Unhold"
-                        accent: Color.muted
+                        accent: Commons.Color.muted
                         visible: !!row.modelData.held
                         enabled: !row.busy && root.busyId === ""
                         anchors.verticalCenter: parent.verticalCenter
@@ -862,13 +863,13 @@ Panel {
                     topPadding: 2
                     SmallButton {
                         text: row.detailShown && root.detailMode === "diff" ? "Hide changes" : "Changes"
-                        accent: Color.muted
+                        accent: Commons.Color.muted
                         visible: Model.canShowDiff(row.modelData)
                         onClicked: root.showDiff(row.modelData.id)
                     }
                     SmallButton {
                         text: "Hold"
-                        accent: Color.muted
+                        accent: Commons.Color.muted
                         visible: Model.canHold(row.modelData)
                         enabled: root.busyId === ""
                         onClicked: root.runAction("hold", row.modelData.id)
@@ -876,19 +877,19 @@ Panel {
                     SmallButton {
                         text: Model.shortUrl(row.info.webUrl).split("/").slice(0, 3).join("/") + " ↗"
                         visible: !!row.info.webUrl
-                        accent: Color.muted
+                        accent: Commons.Color.muted
                         onClicked: Qt.openUrlExternally(row.info.webUrl)
                     }
                     SmallButton {
                         text: "Open folder"
                         visible: !!row.info.path
-                        accent: Color.muted
+                        accent: Commons.Color.muted
                         onClicked: Quickshell.execDetached(["setsid", "uwsm-app", "--", "nautilus", "--new-window", row.info.path])
                     }
                     SmallButton {
                         text: "Terminal"
                         visible: !!row.info.path
-                        accent: Color.muted
+                        accent: Commons.Color.muted
                         onClicked: Quickshell.execDetached(["setsid", "uwsm-app", "--", "xdg-terminal-exec", "--dir=" + row.info.path])
                     }
                     // Only for a plugin the Dashboard updated in the last week and that has
@@ -896,14 +897,14 @@ Panel {
                     // since it resets the checkout.
                     SmallButton {
                         text: row.confirming === "rollback" ? "Confirm roll back?" : "Roll back to " + (row.modelData.rollback && row.modelData.rollback.toVersion ? "v" + row.modelData.rollback.toVersion : "previous")
-                        accent: Color.urgent
+                        accent: Commons.Color.urgent
                         visible: !!row.modelData.rollback && !row.modelData.held
                         enabled: !row.busy && root.busyId === ""
                         onClicked: row.confirmThen("rollback", function() { root.runAction("rollback", row.modelData.id) })
                     }
                     SmallButton {
                         text: row.confirming === "remove" ? "Confirm remove?" : (row.modelData.kind === "app" ? "Stop tracking" : "Remove…")
-                        accent: Color.urgent
+                        accent: Commons.Color.urgent
                         visible: !row.isSelf
                         enabled: !row.busy && root.busyId === ""
                         onClicked: row.modelData.kind === "app"
@@ -935,7 +936,7 @@ Panel {
                             elide: Text.ElideRight
                             text: root.detailMode === "remove" ? "Remove it?"
                                   : root.detailMode === "diff" ? "Changes vs upstream" : (root.detailOk ? "Output" : "Output — failed")
-                            color: (root.detailMode === "output" && !root.detailOk) || root.detailMode === "remove" ? Color.urgent : Util.alpha(root.ink, 0.62)
+                            color: (root.detailMode === "output" && !root.detailOk) || root.detailMode === "remove" ? Commons.Color.urgent : Util.alpha(root.ink, 0.62)
                             font.pixelSize: Style.font.caption
                         }
                         Row {
@@ -945,13 +946,13 @@ Panel {
                             SmallButton {
                                 text: "Commits"
                                 visible: root.detailMode === "diff"
-                                accent: root.diffTab === "commits" ? Color.accent : Color.muted
+                                accent: root.diffTab === "commits" ? Commons.Color.accent : Commons.Color.muted
                                 onClicked: root.diffTab = "commits"
                             }
                             SmallButton {
                                 text: "Diff"
                                 visible: root.detailMode === "diff"
-                                accent: root.diffTab === "diff" ? Color.accent : Color.muted
+                                accent: root.diffTab === "diff" ? Commons.Color.accent : Commons.Color.muted
                                 onClicked: root.diffTab = "diff"
                             }
                             // Decide after seeing what is coming: holding keeps this update out
@@ -959,24 +960,24 @@ Panel {
                             SmallButton {
                                 text: "Hold"
                                 visible: root.detailMode === "diff" && Model.canHold(row.modelData)
-                                accent: Color.muted
+                                accent: Commons.Color.muted
                                 enabled: root.busyId === ""
                                 onClicked: root.runAction("hold", row.modelData.id)
                             }
                             SmallButton {
                                 text: (root.removePurge ? "☑" : "☐") + " Trash its data"
                                 visible: root.detailMode === "remove" && !!root.removePlan && (root.removePlan.data || []).length > 0
-                                accent: root.removePurge ? Color.urgent : Color.muted
+                                accent: root.removePurge ? Commons.Color.urgent : Commons.Color.muted
                                 onClicked: root.removePurge = !root.removePurge
                             }
                             SmallButton {
                                 text: "Remove"
                                 visible: root.detailMode === "remove"
-                                accent: Color.urgent
+                                accent: Commons.Color.urgent
                                 enabled: !!root.removePlan && root.busyId === ""
                                 onClicked: root.confirmRemove(row.modelData.id)
                             }
-                            SmallButton { text: root.detailMode === "remove" ? "Cancel" : "Close"; accent: Color.muted; onClicked: root.closeDetail() }
+                            SmallButton { text: root.detailMode === "remove" ? "Cancel" : "Close"; accent: Commons.Color.muted; onClicked: root.closeDetail() }
                         }
                     }
                     Flickable {
@@ -993,12 +994,12 @@ Panel {
                                      ? Model.commitsHtml(root.detailCommits, {
                                            text: String(root.ink),
                                            meta: String(Util.alpha(root.ink, 0.5)),
-                                           head: String(Color.accent)
+                                           head: String(Commons.Color.accent)
                                        }, root.now)
                                      : root.detailMode === "diff"
                                      ? Model.diffHtml(root.detailText, {
-                                           add: String(Color.accent),
-                                           del: String(Color.urgent),
+                                           add: String(Commons.Color.accent),
+                                           del: String(Commons.Color.urgent),
                                            meta: String(Util.alpha(root.ink, 0.45)),
                                            text: String(root.ink)
                                        })
@@ -1081,7 +1082,7 @@ Panel {
             focus: true
             Keys.onEscapePressed: root.close()
             // No background rectangle here: KeyboardPanel's own `card` already
-            // paints the themed surface (Color.popups.background, Style.cornerRadius,
+            // paints the themed surface (Commons.Color.popups.background, Style.cornerRadius,
             // a themed border) behind this content -- a second hardcoded one drawn
             // on top of it was redundant and, being hardcoded, the one thing in this
             // file that could never have followed the theme anyway.
@@ -1276,7 +1277,7 @@ Panel {
                                         anchors.right: parent.right
                                         anchors.verticalCenter: parent.verticalCenter
                                         text: root.busyId === modelData.key ? "…" : "Clean up"
-                                        accent: Color.urgent
+                                        accent: Commons.Color.urgent
                                         enabled: root.busyId === ""
                                         onClicked: root.cleanupLeftovers([modelData.key])
                                     }
@@ -1285,7 +1286,7 @@ Panel {
                             SmallButton {
                                 visible: root.leftoversOpen && root.leftovers.length > 1
                                 text: "Clean up all (" + root.leftovers.length + ")"
-                                accent: Color.urgent
+                                accent: Commons.Color.urgent
                                 enabled: root.busyId === ""
                                 onClicked: root.cleanupLeftovers(root.leftovers.map(function(l) { return l.key }))
                             }
@@ -1303,7 +1304,7 @@ Panel {
 
                             SmallButton {
                                 text: root.addAppFormOpen ? "Cancel" : "+ Add app"
-                                accent: root.addAppFormOpen ? Color.urgent : Color.accent
+                                accent: root.addAppFormOpen ? Commons.Color.urgent : Commons.Color.accent
                                 onClicked: { root.addAppFormOpen = !root.addAppFormOpen; root.addAppNotes = [] }
                             }
 
@@ -1331,13 +1332,13 @@ Panel {
                                         spacing: 6
                                         SmallButton {
                                             text: "Choose…"
-                                            accent: Color.muted
+                                            accent: Commons.Color.muted
                                             enabled: !repoProc.running
                                             onClicked: { repoProc.command = ["python3", root.helper, "pick-folder"]; repoProc.running = true }
                                         }
                                         SmallButton {
                                             text: "Fill in"
-                                            accent: Color.muted
+                                            accent: Commons.Color.muted
                                             enabled: !repoProc.running && repoField.text.length > 0
                                             onClicked: { repoProc.command = ["python3", root.helper, "inspect-repo", repoField.text]; repoProc.running = true }
                                         }
@@ -1361,7 +1362,7 @@ Panel {
                                         wrapMode: Text.WordWrap
                                         text: "· " + modelData
                                         font.pixelSize: Style.font.caption
-                                        color: Color.urgent
+                                        color: Commons.Color.urgent
                                     }
                                 }
                                 SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
@@ -1402,7 +1403,7 @@ Panel {
                                     spacing: 8
                                     Text {
                                         text: Model.historyMark(modelData)
-                                        color: modelData.ok ? (modelData.action === "rollback" ? Color.urgent : Color.accent) : Color.urgent
+                                        color: modelData.ok ? (modelData.action === "rollback" ? Commons.Color.urgent : Commons.Color.accent) : Commons.Color.urgent
                                         font.family: Style.font.family
                                         font.pixelSize: Style.font.bodySmall
                                         textFormat: Text.PlainText
@@ -1451,7 +1452,7 @@ Panel {
                         anchors.right: parent.right
                         anchors.top: parent.top
                         text: "Browse plugins ↗"
-                        color: browseMouse.containsMouse ? Color.accent : Util.alpha(root.ink, 0.62)
+                        color: browseMouse.containsMouse ? Commons.Color.accent : Util.alpha(root.ink, 0.62)
                         font.family: Style.font.family
                         font.pixelSize: Style.font.caption
                         font.underline: browseMouse.containsMouse
