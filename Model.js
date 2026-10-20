@@ -2,8 +2,9 @@
 
 // True only for the one state Panel.qml's Update button ever fires on --
 // "dirty", "diverged", "no-repo" and "unreachable" all need a person, not a
-// click, because each would fail (or silently do the wrong thing) if
-// `omarchy plugin update`'s fast-forward-only merge ran anyway.
+// click. A plugin with local edits or commits is still 'behind' when they merge
+// cleanly onto the update (dashboard.py carries them over); 'dirty'/'diverged'
+// now mean they clash with it.
 //
 // 'not-installed' is the other one: an app whose repo is current but whose installed
 // package is older than what the repo builds. Its updateCmd (rebuild.sh --install)
@@ -147,9 +148,14 @@ function pillLabel(item) {
 // The "+N LOCAL" tag next to the state pill: commits this checkout carries that upstream
 // does not. CURRENT/BEHIND alone said nothing about them, so a 92-commit fork looked the
 // same as an untouched install. Not shown for 'diverged', whose pill already says it.
+// "EDITED" is the same for uncommitted edits, which an update now carries over too; not
+// shown for 'dirty', whose pill already says it.
 function localTag(item) {
-    if (!item || !(item.ahead > 0) || item.updateState === 'diverged') return ''
-    return '+' + item.ahead + ' LOCAL'
+    if (!item) return ''
+    var parts = []
+    if (item.ahead > 0 && item.updateState !== 'diverged') parts.push('+' + item.ahead + ' LOCAL')
+    if (item.edits > 0 && item.updateState !== 'dirty') parts.push('EDITED')
+    return parts.join(' · ')
 }
 
 function stripeKey(item) {

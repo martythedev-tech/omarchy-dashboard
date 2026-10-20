@@ -90,9 +90,16 @@ class PluginUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-parse', 'FETCH_HEAD'): (0, 'def456\n', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'HEAD..FETCH_HEAD'): (0, '3\n', ''),
                 ('git', '-C', d, 'status', '--porcelain'): (0, ' M some/file.qml\n', ''),
+                ('git', '-C', d, 'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '0\n', ''),
             }
-            with patch.object(dash, 'run', fake_run(table)):
-                self.assertEqual(dash.plugin_update_state(d), ('dirty', 3, '1 file(s) changed locally'))
+            with patch.object(dash, 'run', fake_run(table)), \
+                 patch.object(dash, 'local_work_carries', return_value=(False, 'some/file.qml')):
+                self.assertEqual(dash.plugin_update_state(d), ('dirty', 3, '1 file(s) changed locally'
+                                                                ' -- clashes with the update in some/file.qml'))
+            # The same edit, when it does not clash, is carried over: a plain Update.
+            with patch.object(dash, 'run', fake_run(table)), \
+                 patch.object(dash, 'local_work_carries', return_value=(True, '')):
+                self.assertEqual(dash.plugin_update_state(d), ('behind', 3, ''))
 
     def test_mid_rebase_is_in_progress_and_never_fetches(self):
         # The dirty/diverged checks below all run a git status; this one must
@@ -122,8 +129,12 @@ class PluginUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'status', '--porcelain'): (0, '', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '1\n', ''),
             }
-            with patch.object(dash, 'run', fake_run(table)):
+            with patch.object(dash, 'run', fake_run(table)), \
+                 patch.object(dash, 'local_work_carries', return_value=(False, '')):
                 self.assertEqual(dash.plugin_update_state(d), ('diverged', 2, '1 local commit(s) not upstream'))
+            with patch.object(dash, 'run', fake_run(table)), \
+                 patch.object(dash, 'local_work_carries', return_value=(True, '')):
+                self.assertEqual(dash.plugin_update_state(d), ('behind', 2, ''))
 
 
 class RepoOperationInProgressTests(unittest.TestCase):
@@ -447,7 +458,9 @@ class LocalCommitsAndInstalledVersionTests(unittest.TestCase):
         with patch.object(dash, 'plugin_update_state', return_value=('up-to-date', 0, '')), \
              patch.object(dash, 'manifest_version', return_value='0.10.6'), \
              patch.object(dash, 'run', fake_run({('git', '-C', str(dash.PLUGINS_DIR / 'omamail'),
-                                                   'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '92\n', '')})):
+                                                   'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '92\n', ''),
+                                                  ('git', '-C', str(dash.PLUGINS_DIR / 'omamail'),
+                                                   'status'): (0, '', '')})):
             item = dash.check_plugin({'id': 'omamail', 'enabled': True})
         self.assertEqual((item['updateState'], item['ahead']), ('up-to-date', 92))
 
@@ -535,6 +548,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
     def test_unknown_id_falls_through_to_omarchy_plugin_update(self):
         with patch.object(dash, 'ensure_apps_file'), \
              patch.object(dash, 'load_apps', return_value=[]), \
+             patch.object(dash, 'has_local_work', return_value=False), \
              patch.object(dash, 'run', return_value=(0, 'Updated sslvpn.', '')) as run_mock, \
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': 'sslvpn'})()
@@ -559,6 +573,7 @@ class CmdUpdateDispatchTests(unittest.TestCase):
         # Self-update is intentional: only disable/remove refuse SELF_ID.
         with patch.object(dash, 'ensure_apps_file'), \
              patch.object(dash, 'load_apps', return_value=[]), \
+             patch.object(dash, 'has_local_work', return_value=False), \
              patch.object(dash, 'run', return_value=(0, 'Updated.', '')) as run_mock, \
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': dash.SELF_ID})()
@@ -1119,14 +1134,29 @@ class CmdRollbackTests(RealRepoFixture):
             self.assertTrue(self.rollback()['ok'])
         self.assertTrue((self.units / 'manifest.json').exists())
 
-    def test_local_changes_refuse_and_touch_nothing(self):
+    def test_local_edits_ride_along_the_rollback(self):
+        (self.plugin / 'notes.txt').write_text('a\nb\nc\nd\ne\n')
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'three')
+        before = git(self.plugin, 'rev-parse', 'HEAD')
+        (self.plugin / 'notes.txt').write_text('A\nb\nc\nd\ne\n')
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'four')
+        self.record_update(before=before, after=git(self.plugin, 'rev-parse', 'HEAD'))
+        (self.plugin / 'notes.txt').write_text('A\nb\nc\nd\nE\n')  # the edit, away from the update's line
+        result = self.rollback()
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), before)
+        self.assertEqual((self.plugin / 'notes.txt').read_text(), 'a\nb\nc\nd\nE\n')
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
+
+    def test_local_edits_that_do_not_fit_the_old_version_keep_the_update(self):
         self.record_update()
-        (self.plugin / 'manifest.json').write_text('{"version": "edited"}')
+        (self.plugin / 'gpu.service').write_text('[Service]\nExecStart=/edited\n')  # file the old version lacks
         result = self.rollback()
         self.assertFalse(result['ok'])
-        self.assertIn('local changes', result['message'])
+        self.assertIn('left on the update', result['message'])
         self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.new)
-        self.assertTrue((self.units / 'gpu.service').exists())
+        self.assertIn('/edited', (self.plugin / 'gpu.service').read_text())
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
 
     def test_old_version_failing_validation_puts_the_update_back(self):
         self.record_update()
@@ -1491,6 +1521,118 @@ class WebUrlTests(unittest.TestCase):
         url = dash.web_url('https://martythedev-tech:ghp_SECRETTOKEN@github.com/martythedev-tech/omamail.git')
         self.assertEqual(url, 'https://github.com/martythedev-tech/omamail')
         self.assertNotIn('SECRET', url)
+
+
+class CarryUpdateTests(unittest.TestCase):
+    """A real upstream and a real plugin clone of it, so stash/rebase/merge-tree run for
+    real; only omarchy and the shell rescan are faked."""
+
+    def setUp(self):
+        import subprocess
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.upstream = root / 'upstream'
+        self.upstream.mkdir()
+        git(self.upstream, 'init', '-q', '-b', 'main')
+        git(self.upstream, 'config', 'user.email', 't@t'); git(self.upstream, 'config', 'user.name', 't')
+        (self.upstream / 'Bar.qml').write_text('color: Color.accent\nwidth: 10\n')
+        (self.upstream / 'Panel.qml').write_text('a\nb\nc\n')
+        git(self.upstream, 'add', '.'); git(self.upstream, 'commit', '-qm', 'one')
+        self.plugin = root / 'plugins' / 'x.plugin'
+        subprocess.run(['git', 'clone', '-q', str(self.upstream), str(self.plugin)], check=True)
+        git(self.plugin, 'config', 'user.email', 't@t'); git(self.plugin, 'config', 'user.name', 't')
+        self.old = git(self.plugin, 'rev-parse', 'HEAD')
+        self.validate_rc = 0
+        real_run = dash.run
+
+        def fake(args, cwd=None, timeout=20, **kw):
+            if args[0] == 'git':
+                return real_run(args, cwd=cwd, timeout=timeout)
+            if args[:3] == ['omarchy', 'plugin', 'validate']:
+                return (self.validate_rc, '', 'invalid manifest' if self.validate_rc else '')
+            return (0, '', '')
+        patcher = patch.object(dash, 'run', fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def upstream_commit(self, name, text):
+        (self.upstream / name).write_text(text)
+        git(self.upstream, 'commit', '-qam', 'upstream change')
+
+    def fetch(self):
+        git(self.plugin, 'fetch', '-q', 'origin', 'HEAD')
+
+    def test_an_edit_away_from_the_update_is_kept_on_top(self):
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        self.fetch()
+        self.assertEqual(dash.plugin_update_state(self.plugin), ('behind', 1, ''))
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('Kept 1 locally edited file(s)', out)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), git(self.upstream, 'rev-parse', 'HEAD'))
+        self.assertEqual((self.plugin / 'Panel.qml').read_text(), 'A\nb\nc\n')
+        self.assertIn('Commons.Color', (self.plugin / 'Bar.qml').read_text())
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
+
+    def test_an_edit_upstream_also_made_leaves_a_clean_checkout(self):
+        self.upstream_commit('Bar.qml', 'color: Commons.Color.accent\nwidth: 10\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        self.fetch()
+        self.assertEqual(dash.plugin_update_state(self.plugin)[0], 'behind')
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('none are left over', out)
+        self.assertEqual(git(self.plugin, 'status', '--porcelain'), '')
+
+    def test_a_local_commit_is_rebased_onto_the_update(self):
+        (self.plugin / 'Bar.qml').write_text('color: Color.accent\nwidth: 12\n')
+        git(self.plugin, 'commit', '-qam', 'local fix')
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        self.fetch()
+        self.assertEqual(dash.plugin_update_state(self.plugin), ('behind', 1, ''))
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('Kept 1 local commit(s)', out)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD~1'), git(self.upstream, 'rev-parse', 'HEAD'))
+        self.assertIn('width: 12', (self.plugin / 'Bar.qml').read_text())
+
+    def test_a_clashing_edit_is_dirty_and_an_update_anyway_changes_nothing(self):
+        self.upstream_commit('Bar.qml', 'color: Color.urgent\nwidth: 10\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        self.fetch()
+        self.assertEqual(dash.plugin_update_state(self.plugin),
+                         ('dirty', 1, '1 file(s) changed locally -- clashes with the update in Bar.qml'))
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertIn('Nothing changed', err)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+        self.assertEqual((self.plugin / 'Bar.qml').read_text(), 'color: Commons.Color.accent\nwidth: 10\n')
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
+
+    def test_a_clashing_local_commit_is_diverged_and_restored(self):
+        (self.plugin / 'Bar.qml').write_text('color: Color.accent\nwidth: 12\n')
+        git(self.plugin, 'commit', '-qam', 'local fix')
+        local = git(self.plugin, 'rev-parse', 'HEAD')
+        self.upstream_commit('Bar.qml', 'color: Color.accent\nwidth: 14\n')
+        self.fetch()
+        self.assertEqual(dash.plugin_update_state(self.plugin)[0], 'diverged')
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), local)
+        self.assertFalse(dash.repo_operation_in_progress(self.plugin))
+
+    def test_failed_validation_puts_back_the_old_version_and_the_edit(self):
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        self.validate_rc = 1
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertIn('invalid manifest', err)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+        self.assertIn('Commons.Color', (self.plugin / 'Bar.qml').read_text())
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
 
 
 class RepoGuessFixture(unittest.TestCase):

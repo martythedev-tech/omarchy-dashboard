@@ -16,7 +16,7 @@ The bar icon is a dial, like a car's dashboard: the arc fills with the share of
 plugins and apps that are current, and the needle points at it. Its colour comes
 from your theme's palette (`colors.toml`): green when everything is current,
 yellow with updates waiting (their count beside it), red when something needs a
-person -- local changes, a half-finished git operation, or an action that failed
+person -- local changes that clash with an update, a half-finished git operation, or an action that failed
 in the last day that you haven't seen yet (opening the panel counts as seeing it). While a check or an action runs, the needle sweeps.
 
 ## How it works
@@ -30,10 +30,16 @@ the command that already owns it:
   `omarchy plugin remove <id> --yes` for Remove. A plugin whose deployed
   directory isn't a git checkout (installed by hand rather than
   `omarchy plugin add`) shows "No update source" instead of a button,
-  because there's genuinely nothing to check. A clean checkout with local
-  commits that never made it upstream shows "diverged" rather than
-  "behind" -- offering the button there would just hand you the fast-forward
-  merge failure instead of preventing it.
+  because there's genuinely nothing to check.
+- **Plugins with local work**: `omarchy plugin update` only fast-forwards, so it
+  refuses a checkout with its own edits or commits. The Dashboard does that
+  update itself: it sets uncommitted edits aside (`git stash`), rebases local
+  commits onto upstream (one upstream already has drops out), puts the edits
+  back, and validates. Any step that fails puts the checkout back exactly as it
+  was. Each check dry-runs this first (`git merge-tree`, which touches nothing),
+  so such a plugin shows a normal Update button with an EDITED / +N LOCAL tag,
+  and only work that clashes with the update shows "dirty" or "diverged",
+  naming the files.
 - **Apps** (Flea, Howdy, and anything added via "+ Add app"): each one's
   own `updateCmd` (default `rebuild.sh --install`) in its project
   directory. The check mirrors what `rebuild.sh` itself asks -- "has the
@@ -53,7 +59,7 @@ notification via `notify-send`.
 
 ## What the row tells you
 
-Rows sort by what needs you: a stuck git operation or local changes blocking an
+Rows sort by what needs you: a stuck git operation or local changes clashing with an
 update first, then anything one click would update, then sources that could not
 be reached, then the rest (held items with the rest) -- alphabetical within each.
 
@@ -97,7 +103,8 @@ fetch rather than the sum of them.
   button. Holds live in `holds.json` in the state directory.
 - **Roll back** (plugins): for a week after the Dashboard updates a plugin, and
   as long as its checkout hasn't moved since, puts it back where the update
-  found it -- `git reset --hard` to the old commit (refused over local changes),
+  found it -- `git reset --hard` to the old commit (uncommitted edits are set aside
+  and put back on top; if they do not fit the old version, the update stays),
   validate (the update is restored if the old version no longer validates), stop
   and remove any service the update had started that the old version doesn't
   ship, the plugin's own `run.sh --ensure`, and a plugin rescan. It then holds

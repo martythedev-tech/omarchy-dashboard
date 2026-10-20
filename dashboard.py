@@ -599,14 +599,22 @@ def plugin_update_state(plugin_dir):
     if behind == 0:
         return 'up-to-date', 0, ''
     rc4, dirty, _ = run(['git', '-C', str(plugin_dir), 'status', '--porcelain'])
-    if dirty.strip():
-        lines = dirty.strip().split('\n')
-        return 'dirty', behind, f'{len(lines)} file(s) changed locally'
     rc5, ahead_count, _ = run(['git', '-C', str(plugin_dir), 'rev-list', '--count', 'FETCH_HEAD..HEAD'])
     ahead = int(ahead_count.strip()) if rc5 == 0 and ahead_count.strip().isdigit() else 0
-    if ahead > 0:
-        return 'diverged', behind, f'{ahead} local commit(s) not upstream'
-    return 'behind', behind, ''
+    if not dirty.strip() and ahead == 0:
+        return 'behind', behind, ''
+    # Local edits or commits no longer block the Update button on their own: carry_update()
+    # sets them aside, updates, and puts them back on top. Only a change that collides with
+    # the incoming one still needs a person -- 2026-10-20, six plugins sat DIRTY over a
+    # one-line Qt 6.12 colour fix, three of which upstream had since made itself.
+    carries, conflicts = local_work_carries(plugin_dir)
+    if carries:
+        return 'behind', behind, ''
+    clash = f' -- clashes with the update in {conflicts}' if conflicts else ''
+    if dirty.strip():
+        lines = dirty.strip().split('\n')
+        return 'dirty', behind, f'{len(lines)} file(s) changed locally{clash}'
+    return 'diverged', behind, f'{ahead} local commit(s) not upstream{clash}'
 
 
 def app_update_state(repo_dir, branch, remote):
@@ -656,6 +664,107 @@ def local_commit_count(repo_dir, upstream_ref):
     CURRENT, the same as an untouched checkout."""
     rc, out, _ = run(['git', '-C', str(repo_dir), 'rev-list', '--count', f'{upstream_ref}..HEAD'])
     return int(out.strip()) if rc == 0 and out.strip().isdigit() else 0
+
+
+def local_edit_count(repo_dir):
+    """Uncommitted changes to tracked files -- the ones an update has to set aside and put
+    back. Untracked files are left where they are and never counted."""
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'status', '--porcelain', '--untracked-files=no'])
+    return len(out.strip().splitlines()) if rc == 0 and out.strip() else 0
+
+
+def has_local_work(plugin_dir):
+    """Whether an update has anything of this checkout's own to carry over."""
+    return bool(local_edit_count(plugin_dir) or local_commit_count(plugin_dir, 'FETCH_HEAD'))
+
+
+def local_work_carries(plugin_dir, upstream_ref='FETCH_HEAD'):
+    """(True, '') when this checkout's own work -- local commits and uncommitted edits
+    together -- merges cleanly onto upstream_ref; (False, 'a.qml, b.qml') naming the
+    conflicting files when it does not. A dry run in git's object store (`stash create`
+    writes a commit without touching the tree or the stash list, `merge-tree` merges without
+    a checkout), so a check can ask on every pass. An edit upstream has since made itself
+    merges as clean, which is what lets such a plugin update instead of sitting DIRTY."""
+    d = str(plugin_dir)
+    rc, base, _ = run(['git', '-C', d, 'merge-base', 'HEAD', upstream_ref])
+    if rc != 0:
+        return False, ''
+    _, stash, _ = run(['git', '-C', d, 'stash', 'create'])
+    tip = stash.strip() or 'HEAD'
+    rc, out, _ = run(['git', '-C', d, 'merge-tree', '--write-tree', '--name-only',
+                      f'--merge-base={base.strip()}', tip, upstream_ref])
+    if rc == 0:
+        return True, ''
+    # Output: the tree id, the conflicted paths, a blank line, then informational messages.
+    files = []
+    for line in out.splitlines()[1:]:
+        if not line.strip():
+            break
+        files.append(line.strip())
+    return False, ', '.join(files[:3]) + (f' and {len(files) - 3} more' if len(files) > 3 else '')
+
+
+def carry_update(plugin_dir):
+    """`omarchy plugin update` for a checkout with its own work on it, which that command's
+    fast-forward-only merge refuses: set uncommitted edits aside, rebase local commits onto
+    upstream (a commit upstream already has drops out on its own), put the edits back, and
+    validate the result. Any step that fails puts the checkout back exactly as it was --
+    same HEAD, same edits -- so a refused update costs nothing. (rc, out, err) like run()."""
+    d = str(plugin_dir)
+    before = repo_head(plugin_dir)
+    rc, _, err = run(['git', '-C', d, 'fetch', '--quiet', 'origin', 'HEAD'], timeout=60)
+    if rc != 0:
+        return 1, '', 'fetch failed: ' + err.strip()
+    edits = local_edit_count(plugin_dir)
+    ahead = local_commit_count(plugin_dir, 'FETCH_HEAD')
+    stashed = False
+    if edits:
+        rc, _, err = run(['git', '-C', d, 'stash', 'push', '--quiet', '-m', 'dashboard: local edits before update'])
+        if rc != 0:
+            return 1, '', 'Could not set the local edits aside: ' + err.strip()
+        stashed = True
+
+    def restore(why):
+        run(['git', '-C', d, 'rebase', '--abort'])
+        run(['git', '-C', d, 'reset', '--hard', '--quiet', before])
+        if stashed:
+            prc, _, perr = run(['git', '-C', d, 'stash', 'pop', '--quiet'])
+            if prc != 0:
+                return 1, '', (why + '\nThe local edits could not be put back; they are kept in '
+                               f'`git -C {d} stash list`: ' + perr.strip())
+        return 1, '', why + '\nNothing changed: the plugin is still on its old version with your local changes.'
+
+    if ahead:
+        rc, out, err = run(['git', '-C', d, 'rebase', '--quiet', 'FETCH_HEAD'], timeout=60)
+        if rc != 0:
+            return restore('Your local commits clash with the update:\n' + (err or out).strip()[-1500:])
+    else:
+        rc, out, err = run(['git', '-C', d, 'merge', '--ff-only', '--quiet', 'FETCH_HEAD'])
+        if rc != 0:
+            return restore('The update could not be applied: ' + (err or out).strip())
+    if stashed:
+        # apply, not pop: the stash entry stays the exact copy restore() puts back on the old
+        # HEAD until the update has passed validation, however far it got.
+        rc, out, err = run(['git', '-C', d, 'stash', 'apply', '--quiet'])
+        if rc != 0:
+            return restore('Your local edits clash with the update:\n' + (err or out).strip()[-1500:])
+    rc, out, err = run(['omarchy', 'plugin', 'validate', d], timeout=60)
+    if rc != 0:
+        return restore('The update with your local changes on top failed validation:\n'
+                       + (err or out).strip()[-1500:])
+    if stashed:
+        run(['git', '-C', d, 'stash', 'drop', '--quiet'])
+    run(['omarchy-shell', 'shell', 'rescanPlugins'], timeout=20)
+    kept = []
+    still_ahead = local_commit_count(plugin_dir, 'FETCH_HEAD')
+    if still_ahead:
+        kept.append(f'{still_ahead} local commit(s)')
+    still_edited = local_edit_count(plugin_dir)
+    if still_edited:
+        kept.append(f'{still_edited} locally edited file(s)')
+    note = ('Kept ' + ' and '.join(kept) + ' on top.') if kept else \
+        'Your local changes are now part of the update itself, so none are left over.'
+    return 0, f'Updated {Path(d).name}. {note}', ''
 
 
 # States in which upstream was never compared, so there is no ahead count to give.
@@ -774,6 +883,7 @@ def check_plugin(p):
         'versionChange': version_change(version, incoming), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
+        'edits': local_edit_count(plugin_dir) if compared else 0,
         'info': repo_info(plugin_dir, 'origin', 'FETCH_HEAD' if compared else None),
     }
 
@@ -969,7 +1079,11 @@ def cmd_update(args):
         units_before = shipped_units(plugin_dir)
         units_installed_before = {name for name in units_before if (USER_UNIT_DIR / name).exists()}
         log_mark = shell_log_mark()
-        rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180, stream_log=STATE / 'action.log')
+        if has_local_work(plugin_dir):
+            rc, out, err = carry_update(plugin_dir)
+        else:
+            rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180,
+                               stream_log=STATE / 'action.log')
         if rc == 0 and has_ensure_bootstrap(plugin_dir):
             erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
             if erc != 0:
@@ -1085,16 +1199,34 @@ def cmd_rollback(args):
     op = repo_operation_in_progress(plugin_dir)
     if op:
         return done(False, f'A git {op} is in progress in {plugin_dir}; resolve it first.')
-    _, dirty, _ = run(['git', '-C', str(plugin_dir), 'status', '--porcelain'])
-    if dirty.strip():
-        return done(False, f'{plugin_dir} has local changes a rollback would discard; commit or stash them first.')
+    # Local edits an update carried over ride along back too: aside, reset, back on top.
+    stashed = False
+    if local_edit_count(plugin_dir):
+        rc, _, err = run(['git', '-C', str(plugin_dir), 'stash', 'push', '--quiet', '-m',
+                          'dashboard: local edits before rollback'])
+        if rc != 0:
+            return done(False, 'Could not set the local edits aside: ' + err.strip())
+        stashed = True
     log_mark = shell_log_mark()
     rc, out, err = run(['git', '-C', str(plugin_dir), 'reset', '--hard', entry['before']])
     if rc != 0:
+        if stashed:
+            run(['git', '-C', str(plugin_dir), 'stash', 'pop', '--quiet'])
         return done(False, 'git reset failed: ' + (err or out).strip())
+    if stashed:
+        rc, out, err = run(['git', '-C', str(plugin_dir), 'stash', 'pop', '--quiet'])
+        if rc != 0:
+            run(['git', '-C', str(plugin_dir), 'reset', '--hard', '--quiet', entry['after']])
+            run(['git', '-C', str(plugin_dir), 'stash', 'pop', '--quiet'])
+            return done(False, 'Your local edits do not fit the earlier version, so the plugin was left on '
+                               'the update:\n' + (err or out).strip()[-1500:])
     rc, out, err = run(['omarchy', 'plugin', 'validate', str(plugin_dir)], timeout=60)
     if rc != 0:
+        if stashed:
+            run(['git', '-C', str(plugin_dir), 'stash', 'push', '--quiet'])
         run(['git', '-C', str(plugin_dir), 'reset', '--hard', entry['after']])
+        if stashed:
+            run(['git', '-C', str(plugin_dir), 'stash', 'pop', '--quiet'])
         return done(False, 'The earlier version no longer passes validation, so the plugin was left on the '
                            'update:\n' + (err or out).strip()[-1500:])
     ok = True

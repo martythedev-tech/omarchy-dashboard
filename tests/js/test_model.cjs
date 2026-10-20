@@ -144,6 +144,10 @@ assert.equal(ctx.localTag({updateState: 'diverged', ahead: 1}), '');
 assert.equal(ctx.localTag({updateState: 'up-to-date', ahead: 0}), '');
 assert.equal(ctx.localTag({updateState: 'up-to-date'}), '');
 assert.equal(ctx.localTag(null), '');
+// Uncommitted edits an update will carry over; the DIRTY pill already says it.
+assert.equal(ctx.localTag({updateState: 'behind', ahead: 0, edits: 2}), 'EDITED');
+assert.equal(ctx.localTag({updateState: 'behind', ahead: 1, edits: 1}), '+1 LOCAL · EDITED');
+assert.equal(ctx.localTag({updateState: 'dirty', ahead: 0, edits: 1}), '');
 // holds: out of the badge, ring and Update all; pill and stripe go quiet
 assert.equal(ctx.canUpdate({updateState: 'behind', held: true}), false);
 assert.equal(ctx.canHold({updateState: 'behind'}), true);
