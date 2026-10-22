@@ -43,6 +43,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -608,8 +609,11 @@ def plugin_update_state(plugin_dir):
     # the incoming one still needs a person -- 2026-10-20, six plugins sat DIRTY over a
     # one-line Qt 6.12 colour fix, three of which upstream had since made itself.
     carries, conflicts = local_work_carries(plugin_dir)
-    if carries:
+    _, untracked_clash = untracked_in_update(plugin_dir)
+    if carries and not untracked_clash:
         return 'behind', behind, ''
+    if untracked_clash:
+        conflicts = ', '.join(([conflicts] if conflicts else []) + untracked_clash[:3])
     clash = f' -- clashes with the update in {conflicts}' if conflicts else ''
     if dirty.strip():
         lines = dirty.strip().split('\n')
@@ -673,9 +677,31 @@ def local_edit_count(repo_dir):
     return len(out.strip().splitlines()) if rc == 0 and out.strip() else 0
 
 
+def untracked_in_update(plugin_dir, upstream_ref='FETCH_HEAD'):
+    """Untracked files the update adds at the same path, as (same, differ): those already
+    byte-identical to the update's copy, and those that are not. A merge refuses to
+    overwrite either kind, and neither stash nor merge-tree sees them. The usual source of
+    the first kind is a new file written into the installed copy, pushed from there, and
+    now coming back as part of the update -- 2026-10-22, Touchpad Glance's
+    touchpad-typing-guard failed its update that way."""
+    d = str(plugin_dir)
+    rc, out, _ = run(['git', '-C', d, 'ls-files', '--others', '--exclude-standard', '-z'])
+    if rc != 0:
+        return [], []
+    same, differ = [], []
+    for path in filter(None, out.split('\0')):
+        rc, theirs, _ = run(['git', '-C', d, 'rev-parse', '--verify', '--quiet', f'{upstream_ref}:{path}'])
+        if rc != 0:
+            continue
+        rc, ours, _ = run(['git', '-C', d, 'hash-object', '--', path])
+        (same if rc == 0 and ours.strip() == theirs.strip() else differ).append(path)
+    return same, differ
+
+
 def has_local_work(plugin_dir):
     """Whether an update has anything of this checkout's own to carry over."""
-    return bool(local_edit_count(plugin_dir) or local_commit_count(plugin_dir, 'FETCH_HEAD'))
+    return bool(local_edit_count(plugin_dir) or local_commit_count(plugin_dir, 'FETCH_HEAD')
+                or any(untracked_in_update(plugin_dir)))
 
 
 def local_work_carries(plugin_dir, upstream_ref='FETCH_HEAD'):
@@ -724,15 +750,39 @@ def carry_update(plugin_dir):
             return 1, '', 'Could not set the local edits aside: ' + err.strip()
         stashed = True
 
+    # Untracked files the update adds would stop the merge. One identical to the update's
+    # copy is moved into the git dir for the merge (which writes the same bytes back) and
+    # dropped once the update has passed; restore() moves it back. One that differs is a
+    # clash like any other.
+    _, gitdir, _ = run(['git', '-C', d, 'rev-parse', '--absolute-git-dir'])
+    parking = Path(gitdir.strip()) / 'dashboard-parked'
+    parked = []
+
+    def unpark():
+        for path in parked:
+            dest = Path(d) / path
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(parking / path, dest)
+        shutil.rmtree(parking, ignore_errors=True)
+
     def restore(why):
         run(['git', '-C', d, 'rebase', '--abort'])
         run(['git', '-C', d, 'reset', '--hard', '--quiet', before])
+        unpark()
         if stashed:
             prc, _, perr = run(['git', '-C', d, 'stash', 'pop', '--quiet'])
             if prc != 0:
                 return 1, '', (why + '\nThe local edits could not be put back; they are kept in '
                                f'`git -C {d} stash list`: ' + perr.strip())
         return 1, '', why + '\nNothing changed: the plugin is still on its old version with your local changes.'
+
+    same, differ = untracked_in_update(plugin_dir)
+    if differ:
+        return restore('New files here clash with files the update adds: ' + ', '.join(differ[:5]))
+    for path in same:
+        (parking / path).parent.mkdir(parents=True, exist_ok=True)
+        os.replace(Path(d) / path, parking / path)
+        parked.append(path)
 
     if ahead:
         rc, out, err = run(['git', '-C', d, 'rebase', '--quiet', 'FETCH_HEAD'], timeout=60)
@@ -754,6 +804,7 @@ def carry_update(plugin_dir):
                        + (err or out).strip()[-1500:])
     if stashed:
         run(['git', '-C', d, 'stash', 'drop', '--quiet'])
+    shutil.rmtree(parking, ignore_errors=True)
     run(['omarchy-shell', 'shell', 'rescanPlugins'], timeout=20)
     kept = []
     still_ahead = local_commit_count(plugin_dir, 'FETCH_HEAD')

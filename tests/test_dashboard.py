@@ -91,6 +91,7 @@ class PluginUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-list', '--count', 'HEAD..FETCH_HEAD'): (0, '3\n', ''),
                 ('git', '-C', d, 'status', '--porcelain'): (0, ' M some/file.qml\n', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '0\n', ''),
+                ('git', '-C', d, 'ls-files', '--others'): (0, '', ''),
             }
             with patch.object(dash, 'run', fake_run(table)), \
                  patch.object(dash, 'local_work_carries', return_value=(False, 'some/file.qml')):
@@ -128,6 +129,7 @@ class PluginUpdateStateTests(unittest.TestCase):
                 ('git', '-C', d, 'rev-list', '--count', 'HEAD..FETCH_HEAD'): (0, '2\n', ''),
                 ('git', '-C', d, 'status', '--porcelain'): (0, '', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'FETCH_HEAD..HEAD'): (0, '1\n', ''),
+                ('git', '-C', d, 'ls-files', '--others'): (0, '', ''),
             }
             with patch.object(dash, 'run', fake_run(table)), \
                  patch.object(dash, 'local_work_carries', return_value=(False, '')):
@@ -1633,6 +1635,68 @@ class CarryUpdateTests(unittest.TestCase):
         self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
         self.assertIn('Commons.Color', (self.plugin / 'Bar.qml').read_text())
         self.assertEqual(git(self.plugin, 'stash', 'list'), '')
+
+    def upstream_add(self, name, text):
+        (self.upstream / name).write_text(text)
+        git(self.upstream, 'add', name)
+        git(self.upstream, 'commit', '-qm', 'upstream adds ' + name)
+
+    def test_a_new_file_the_update_also_adds_identically_no_longer_blocks_it(self):
+        # 2026-10-22: an edit plus a new file, both pushed from the installed copy, came
+        # back as the update and the merge refused to overwrite the untracked file.
+        (self.plugin / 'Panel.qml').write_text('A\nb\nc\n')
+        (self.plugin / 'guard').write_text('#!/bin/sh\n')
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        self.upstream_add('guard', '#!/bin/sh\n')
+        self.fetch()
+        self.assertEqual(dash.plugin_update_state(self.plugin)[0], 'behind')
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('none are left over', out)
+        self.assertEqual(git(self.plugin, 'status', '--porcelain'), '')
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), git(self.upstream, 'rev-parse', 'HEAD'))
+        self.assertFalse((self.plugin / '.git' / 'dashboard-parked').exists())
+
+    def test_a_new_file_alone_routes_the_update_through_the_carry(self):
+        (self.plugin / 'guard').write_text('#!/bin/sh\n')
+        self.upstream_add('guard', '#!/bin/sh\n')
+        self.fetch()
+        self.assertTrue(dash.has_local_work(self.plugin))
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(git(self.plugin, 'status', '--porcelain'), '')
+
+    def test_a_different_new_file_at_the_same_path_is_dirty_and_kept(self):
+        (self.plugin / 'guard').write_text('mine\n')
+        self.upstream_add('guard', 'theirs\n')
+        self.fetch()
+        state, _, why = dash.plugin_update_state(self.plugin)
+        self.assertEqual(state, 'dirty')
+        self.assertIn('guard', why)
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertIn('Nothing changed', err)
+        self.assertEqual((self.plugin / 'guard').read_text(), 'mine\n')
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+
+    def test_a_parked_file_is_put_back_when_validation_fails(self):
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        (self.plugin / 'guard').write_text('#!/bin/sh\n')
+        self.upstream_add('guard', '#!/bin/sh\n')
+        self.validate_rc = 1
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+        self.assertEqual((self.plugin / 'guard').read_text(), '#!/bin/sh\n')
+        self.assertIn('Commons.Color', (self.plugin / 'Bar.qml').read_text())
+        self.assertFalse((self.plugin / '.git' / 'dashboard-parked').exists())
+
+    def test_an_unrelated_untracked_file_is_left_alone(self):
+        (self.plugin / 'notes.md').write_text('mine\n')
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        self.fetch()
+        self.assertFalse(dash.has_local_work(self.plugin))
+        self.assertEqual(dash.plugin_update_state(self.plugin)[0], 'behind')
 
 
 class RepoGuessFixture(unittest.TestCase):
