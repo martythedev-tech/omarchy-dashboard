@@ -295,4 +295,34 @@ assert.equal(ctx.toneColor('waiting', pal, {}), '#e0af68');
 assert.equal(ctx.toneColor('calm', {}, {accent: 'A'}), 'A');
 assert.equal(ctx.toneColor('idle', pal, {muted: 'M'}), 'M');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone all pass.');
+// Discover
+var cat = [
+    {id: 'a.weather', name: 'Weather', description: 'Forecast in the bar', author: 'acme', category: 'Widgets', kind: 'Bar widget', tags: ['rain'], repo: 'https://github.com/acme/weather', stars: 5, added: '2026-09-01', installable: true, verification: 'verified'},
+    {id: 'b.clock', name: 'clock', description: 'A clock', author: 'bob', category: 'Widgets', kind: 'Bar widget', tags: [], repo: 'https://github.com/bob/clock', stars: 50, added: '2026-08-01', installable: true, verification: 'update-unverified'},
+    {id: 'c.suite', name: 'Suite', description: 'Whole shell with weather', author: 'cy', category: 'Desktop', kind: 'Suite', tags: [], repo: 'https://github.com/cy/suite', stars: 9, added: '2026-10-01', installable: false, verification: 'unverified', note: 'Own installer.'},
+];
+var idx = ctx.discoverIndex(cat);
+// Array.from: arrays made inside the vm context never deepEqual this realm's.
+function ids(list) { return Array.from(list, function(p) { return p.id }) }
+assert.deepEqual(ids(ctx.discoverList(cat, idx, '', {})), ['b.clock', 'c.suite', 'a.weather'], 'popular first');
+assert.deepEqual(ids(ctx.discoverList(cat, idx, '', {sort: 'new'})), ['c.suite', 'a.weather', 'b.clock'], 'newest first');
+assert.deepEqual(ids(ctx.discoverList(cat, idx, 'WEATHER', {})), ['c.suite', 'a.weather'], 'case-insensitive, description counts');
+assert.deepEqual(ids(ctx.discoverList(cat, idx, 'weather', {installableOnly: true})), ['a.weather']);
+assert.deepEqual(ids(ctx.discoverList(cat, idx, 'acme rain', {})), ['a.weather'], 'every word must match');
+assert.deepEqual(ids(ctx.discoverList(cat, null, 'clock', {})), ['b.clock'], 'works without an index');
+var keys = ctx.installedKeys([{id: 'a.weather', kind: 'plugin'}, {id: 'mine', kind: 'plugin', info: {webUrl: 'https://github.com/Bob/clock'}}, {id: 'c.suite', kind: 'app'}]);
+assert.equal(ctx.discoverInstalled(cat[0], keys), true, 'by id');
+assert.equal(ctx.discoverInstalled(cat[1], keys), true, 'by repo, a renamed fork');
+assert.equal(ctx.discoverInstalled(cat[2], keys), false, 'apps do not count');
+assert.equal(ctx.discoverPill(cat[0], true), 'INSTALLED');
+assert.equal(ctx.discoverPill(cat[0], false), 'VERIFIED');
+assert.equal(ctx.discoverPill(cat[1], false), 'UPDATE UNVERIFIED');
+assert.equal(ctx.discoverPill(cat[2], false), 'MANUAL SETUP');
+assert.equal(ctx.discoverMeta(cat[0]), '★ 5 · acme · Widgets');
+var rows = ctx.discoverInfoRows(cat[2], 0);
+assert.equal(rows[rows.length - 1].join('|'), 'Install|Own installer.');
+assert.equal(ctx.historyLine({name: 'Weather', action: 'install', ok: true, toVersion: '1.0.0', ts: 100}, 110), 'Weather installed 1.0.0 · just now');
+assert.equal(ctx.historyMark({action: 'install', ok: true}), '+');
+assert.equal(ctx.isJobKind('install'), true);
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover all pass.');
