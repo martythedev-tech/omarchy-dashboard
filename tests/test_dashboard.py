@@ -2710,3 +2710,24 @@ class PackageAppTests(unittest.TestCase):
     def test_terminal_ids_picks_out_package_apps(self):
         items = [{'id': 'brave', 'source': 'package'}, {'id': 'flea'}, {'id': 'x.plugin'}]
         self.assertEqual(dash.terminal_ids(items, ['flea', 'brave', 'x.plugin']), ['brave'])
+
+
+class SeedAppsTests(unittest.TestCase):
+    def test_only_apps_whose_checkout_exists_are_seeded(self):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / 'flea' / '.git').mkdir(parents=True)
+            seeds = [{'id': 'flea', 'repoDir': str(Path(d) / 'flea')}, {'id': 'howdy', 'repoDir': str(Path(d) / 'howdy')}]
+            apps_path = Path(d) / 'state' / 'apps.json'
+            with patch.object(dash, 'DEFAULT_APPS', seeds), patch.object(dash, 'APPS_PATH', apps_path), \
+                 patch.object(dash, 'STATE', apps_path.parent):
+                self.assertEqual([a['id'] for a in dash.load_apps()], ['flea'])
+                dash.ensure_apps_file()
+                self.assertEqual([a['id'] for a in json.loads(apps_path.read_text())], ['flea'])
+
+    def test_someone_else_starts_with_no_apps(self):
+        with tempfile.TemporaryDirectory() as d:
+            apps_path = Path(d) / 'apps.json'
+            with patch.object(dash, 'DEFAULT_APPS', [{'id': 'flea', 'repoDir': str(Path(d) / 'nope')}]), \
+                 patch.object(dash, 'APPS_PATH', apps_path), patch.object(dash, 'STATE', Path(d)):
+                dash.ensure_apps_file()
+                self.assertEqual(json.loads(apps_path.read_text()), [])
