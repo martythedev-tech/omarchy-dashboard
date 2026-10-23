@@ -2538,6 +2538,50 @@ def cmd_pick_folder(args):
     print(json.dumps({'ok': fields is not None, 'fields': fields or {'repoDir': path}, 'notes': notes}))
 
 
+def shell_cache_dir():
+    return Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'quickshell'
+
+
+def clear_shell_cache():
+    """Removes the shell's compiled QML and pipeline caches, so a restart compiles every
+    plugin from its files again: what fixes a plugin still running old code after its files
+    changed. Both are rebuilt on the next start; nothing else in the cache is touched."""
+    cache = shell_cache_dir()
+    for path in [cache / 'qmlcache', *cache.glob('qtpipelinecache-*')]:
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def cmd_restart_shell(args):
+    """Restart shell: clears the compiled-QML cache and runs omarchy-restart-shell. The
+    restart kills the panel that asked for it, so the work runs in its own transient unit
+    (`--now` is that unit), and a failure is reported as a notification. Refused while a
+    Dashboard job runs: the update's load check reads the shell's log, and a restart in
+    the middle would read as the plugin failing to load."""
+    if args.now:
+        clear_shell_cache()
+        rc, out, err = run(['omarchy-restart-shell'], timeout=120)
+        if rc != 0:
+            lines = (err or out).strip().splitlines()
+            run(['notify-send', '--app-name=Plugin Dashboard', '--icon=dialog-error', 'Shell not restarted',
+                 lines[-1] if lines else 'omarchy-restart-shell failed.'], timeout=5)
+        return
+    reap_stale_job()
+    if job_active(load_job()):
+        print(json.dumps({'ok': False, 'message': 'An update is still running; restart once it is done.'}))
+        return
+    worker = [sys.executable, str(Path(__file__).resolve()), 'restart-shell', '--now']
+    rc, _, _ = run(['systemd-run', '--user', '--collect', '--quiet',
+                    f'--unit=dashboard-restart-shell-{int(time.time())}', *worker], timeout=15)
+    if rc != 0:
+        try:
+            subprocess.Popen(worker, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError as e:
+            print(json.dumps({'ok': False, 'message': f'Could not start the restart: {e}'}))
+            return
+    print(json.dumps({'ok': True, 'message': 'Restarting the shell…'}))
+
+
 def cmd_remove_app(args):
     ensure_apps_file()
     apps = load_apps()
@@ -2579,6 +2623,7 @@ def main():
     sub.add_parser('remove-plan').add_argument('id')
     sub.add_parser('cleanup').add_argument('id')
     sub.add_parser('run-job').add_argument('job_id')
+    sub.add_parser('restart-shell').add_argument('--now', action='store_true')
     args = parser.parse_args()
     handlers = {
         'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
@@ -2588,6 +2633,7 @@ def main():
         'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup, 'catalog': cmd_catalog,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
         'inspect-package': cmd_inspect_package, 'terminal-update': cmd_terminal_update,
+        'restart-shell': cmd_restart_shell,
         'open-terminal-update': lambda a: print(json.dumps({'ok': open_terminal_update(a.ids)})),
     }
     handlers[args.command](args)

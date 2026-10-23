@@ -802,6 +802,63 @@ class AddAndRemoveAppTests(unittest.TestCase):
         self.assertFalse(payload['ok'])
 
 
+class RestartShellTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        for target, value in (('STATE', self.root / 'state'),):
+            p = patch.object(dash, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.dict(dash.os.environ, {'XDG_CACHE_HOME': str(self.root / 'cache')})
+        p.start()
+        self.addCleanup(p.stop)
+        self.calls = []
+
+    def _run(self, rc=0, err=''):
+        def fake(args, **kw):
+            self.calls.append(list(args))
+            return (rc, '', err)
+        return patch.object(dash, 'run', fake)
+
+    def output(self, now=False):
+        buf = __import__('io').StringIO()
+        with __import__('contextlib').redirect_stdout(buf):
+            dash.cmd_restart_shell(type('A', (), {'now': now})())
+        return json.loads(buf.getvalue()) if buf.getvalue() else None
+
+    def test_clears_only_the_compiled_caches_then_restarts(self):
+        cache = self.root / 'cache' / 'quickshell'
+        for name in ('qmlcache', 'qtpipelinecache-arm64', 'crashes', 'qtshadercache-arm64'):
+            (cache / name).mkdir(parents=True)
+            (cache / name / 'f').write_text('x')
+        with self._run():
+            self.assertIsNone(self.output(now=True))
+        self.assertEqual(sorted(p.name for p in cache.iterdir()), ['crashes', 'qtshadercache-arm64'])
+        self.assertEqual(self.calls, [['omarchy-restart-shell']])
+
+    def test_a_failed_restart_is_a_notification(self):
+        with self._run(rc=1, err='Refusing to restart Omarchy shell while the session is locked.\n'):
+            self.output(now=True)
+        self.assertEqual(self.calls[-1][0], 'notify-send')
+        self.assertIn('Refusing to restart Omarchy shell while the session is locked.', self.calls[-1])
+
+    def test_starts_in_its_own_unit(self):
+        with self._run():
+            r = self.output()
+        self.assertTrue(r['ok'])
+        self.assertEqual(self.calls[0][:2], ['systemd-run', '--user'])
+        self.assertEqual(self.calls[0][-2:], ['restart-shell', '--now'])
+
+    def test_refused_while_a_job_runs(self):
+        with patch.object(dash, 'job_active', return_value=True), patch.object(dash, 'reap_stale_job'), self._run():
+            r = self.output()
+        self.assertFalse(r['ok'])
+        self.assertIn('still running', r['message'])
+        self.assertEqual(self.calls, [])
+
+
 if __name__ == '__main__':
     unittest.main()
 
