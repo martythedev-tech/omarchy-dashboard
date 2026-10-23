@@ -82,6 +82,24 @@ Panel {
     property real now: Date.now() / 1000
     property real elapsedNow: Date.now() / 1000
 
+    // Which list the panel shows: what is installed, or Discover -- the official plugin
+    // catalog (dashboard.py catalog), read only once Discover is first opened, since it is
+    // a few MB.
+    property string view: "installed"
+    property bool catalogWanted: false
+    property var catalog: ({})
+    readonly property var catalogPlugins: catalog.plugins || []
+    property var catalogIndex: []
+    property string catalogError: ""
+    property string discoverQuery: ""
+    property bool discoverInstallableOnly: true
+    property string discoverSort: "popular"
+    property var discoverResults: []
+    // The Discover row expanded, and the one whose Install is waiting for its confirmation.
+    property string discoverOpenId: ""
+    property string installConfirmId: ""
+    readonly property var installedKeys: Model.installedKeys(items)
+
     // Every color in this file reads through here rather than a fixed hex
     // palette, so the panel actually follows the user's chosen Omarchy theme
     // (colors.toml/shell.toml) instead of a hardcoded dark-slate look that
@@ -102,6 +120,7 @@ Panel {
             case "hold": return "Holding "
             case "unhold": return "Unholding "
             case "cleanup": return "Cleaning up "
+            case "install": return "Installing "
             default: return "Working on "
         }
     }
@@ -119,7 +138,7 @@ Panel {
         root.lastActionKind = kind
         root.actionStartSec = Date.now() / 1000
         actionStatus = actionVerb(kind) + id + "…"
-        if (kind === "update") {
+        if (kind === "update" || kind === "install") {
             root.detailOpenId = id
             root.detailMode = "output"
             root.detailOk = true
@@ -198,7 +217,7 @@ Panel {
             root.updateQueueDone = queued ? Math.min(v.done + 1, v.total) : 0
             root.actionStatus = actionVerb(v.kind) + (v.kind === "cleanup" ? (v.total > 1 ? (v.done + 1) + "/" + v.total + "…" : "…")
                                                                            : root.itemName(v.id) + "…")
-            if (fresh && v.kind === "update") {
+            if (fresh && (v.kind === "update" || v.kind === "install")) {
                 root.detailOpenId = v.id
                 root.detailMode = "output"
                 root.detailOk = true
@@ -233,6 +252,9 @@ Panel {
     // where the row itself already says it.
     function applyActionResult(kind, targetId, r) {
         root.actionStatus = r.ok ? "Done." : "Failed."
+        // A new plugin is shown where it now lives, with what installing it said; a failed
+        // install, on its Discover row.
+        if (kind === "install") root.showView(r.ok ? "installed" : "discover")
         if (kind === "add-app") {
             if (!r.ok) root.addAppNotes = [r.message || "Could not add it."]
             if (r.ok) root.addAppFormOpen = false
@@ -258,7 +280,43 @@ Panel {
 
     function itemName(id) {
         for (var i = 0; i < root.items.length; i++) if (root.items[i].id === id) return root.items[i].name
+        for (var j = 0; j < root.catalogPlugins.length; j++) if (root.catalogPlugins[j].id === id) return root.catalogPlugins[j].name
         return id
+    }
+
+    function showView(which) {
+        root.view = which
+        if (which !== "discover") return
+        root.catalogWanted = true
+        if (!Model.statusFresh(root.catalog.ts, Date.now() / 1000, 6 * 3600)) root.runCatalog(false)
+    }
+
+    function runCatalog(force) {
+        if (catalogProc.running) return
+        root.catalogError = ""
+        catalogProc.command = ["python3", root.helper, "catalog"].concat(force ? ["--force"] : [])
+        catalogProc.running = true
+    }
+
+    function refilterDiscover() {
+        root.discoverResults = Model.discoverList(root.catalogPlugins, root.catalogIndex, root.discoverQuery,
+                                                  {installableOnly: root.discoverInstallableOnly, sort: root.discoverSort})
+    }
+
+    // Install runs as a job like an update: adding a plugin makes the shell rebuild every
+    // plugin widget, this one included.
+    function runInstall(id) {
+        if (root.busyId !== "") return
+        root.installConfirmId = ""
+        root.busyId = id
+        root.lastActionKind = "install"
+        root.actionStartSec = Date.now() / 1000
+        root.actionStatus = actionVerb("install") + root.itemName(id) + "…"
+        root.detailOpenId = id
+        root.detailMode = "output"
+        root.detailOk = true
+        root.detailText = ""
+        startJob("install", [id])
     }
 
     // After the last item of an Update all: one line saying how it went, and the first
@@ -323,6 +381,7 @@ Panel {
     onOpenedChanged: {
         root.markFailuresSeen()
         if (opened) {
+            if (root.view === "discover") root.showView("discover")
             statusFile.reload()
             if (!Model.statusFresh(root.status.ts, Date.now() / 1000, 300)) root.runCheck()
         }
@@ -345,6 +404,7 @@ Panel {
         function show(): void { root.open() }
         function hide(): void { root.close() }
         function toggle(): void { root.toggle() }
+        function discover(): void { root.showView("discover"); root.open() }
         function check(): string { root.runCheck(true); return "ok" }
         function count(): string { return String(root.updatable) }
         function update(id: string): string {
@@ -364,6 +424,39 @@ Panel {
     }
 
     FileView {
+        id: catalogFile
+        path: root.catalogWanted ? root.stateDir + "/catalog.json" : ""
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            try {
+                var c = JSON.parse(text())
+                root.catalog = c
+                root.catalogIndex = Model.discoverIndex(c.plugins || [])
+                if (c.error && !catalogProc.running) root.catalogError = c.error
+                root.refilterDiscover()
+            } catch (e) {}
+        }
+    }
+
+    Process {
+        id: catalogProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var r = null
+                try { r = JSON.parse(text) } catch (e) {}
+                root.catalogError = r && r.ok ? "" : ((r && r.message) || "Could not load the plugin catalog.")
+                catalogFile.reload()
+            }
+        }
+    }
+
+    // Typing filters after a pause, not on every key: the catalog has thousands of entries.
+    Timer { id: discoverDebounce; interval: 180; onTriggered: root.refilterDiscover() }
+
+    FileView {
         id: seenFile
         path: root.stateDir + "/seen.json"
         watchChanges: true
@@ -380,7 +473,7 @@ Panel {
         printErrors: false
         onFileChanged: reload()
         onLoaded: {
-            if (root.lastActionKind === "update" && root.busyId !== "") {
+            if ((root.lastActionKind === "update" || root.lastActionKind === "install") && root.busyId !== "") {
                 root.detailOpenId = root.busyId
                 root.detailMode = "output"
                 root.detailText = text()
@@ -1040,6 +1133,232 @@ Panel {
         }
     }
 
+    // A catalog entry in Discover: name, who and how liked, what it does, and Install when
+    // `omarchy plugin add` can install it alone (the repo link otherwise). Install asks
+    // first, in the row, with what installing a plugin means.
+    component DiscoverRow: Rectangle {
+        id: drow
+        required property var modelData
+        width: ListView.view ? ListView.view.width : 0
+        readonly property bool isInstalled: Model.discoverInstalled(drow.modelData, root.installedKeys)
+        readonly property bool open: root.discoverOpenId === drow.modelData.id
+        readonly property bool busy: root.busyId === drow.modelData.id
+        readonly property bool confirming: root.installConfirmId === drow.modelData.id
+        readonly property bool outputShown: root.detailOpenId === drow.modelData.id && root.detailMode === "output"
+        readonly property color pillColor: drow.isInstalled || drow.modelData.verification === "verified" && drow.modelData.installable
+                                           ? Commons.Color.accent : Util.alpha(root.ink, 0.45)
+        height: dcontent.implicitHeight + 12
+        radius: 10
+        color: dMouse.containsMouse ? Style.hoverFill : Style.normalFill
+        border.color: Style.normalBorderColor
+
+        MouseArea { id: dMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
+
+        Rectangle {
+            width: 4
+            height: parent.height
+            radius: 2
+            color: drow.isInstalled ? Commons.Color.accent : Util.alpha(root.ink, 0.12)
+        }
+
+        Column {
+            id: dcontent
+            width: parent.width - 28
+            x: 16; y: 6
+            spacing: 6
+
+            Item {
+                width: parent.width
+                height: Math.max(dNameCol.implicitHeight, dActions.implicitHeight, dPill.implicitHeight)
+
+                Column {
+                    id: dNameCol
+                    anchors.left: parent.left
+                    anchors.right: dPill.left
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    Row {
+                        width: parent.width
+                        spacing: 6
+                        Heading { id: dName; text: drow.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - 16) }
+                        Text {
+                            text: drow.open ? "▾" : "▸"
+                            anchors.verticalCenter: dName.verticalCenter
+                            color: Util.alpha(root.ink, 0.45)
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.caption
+                        }
+                    }
+                    Label {
+                        width: parent.width
+                        elide: Text.ElideRight
+                        text: drow.busy ? (Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s") : Model.discoverMeta(drow.modelData)
+                        font.pixelSize: Style.font.caption
+                    }
+                }
+                MouseArea {
+                    anchors.fill: dNameCol
+                    cursorShape: Qt.PointingHandCursor
+                    onClicked: root.discoverOpenId = drow.open ? "" : drow.modelData.id
+                }
+                Rectangle {
+                    id: dPill
+                    anchors.right: dActions.left
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    implicitWidth: dPillText.implicitWidth + 12
+                    implicitHeight: 18
+                    radius: 9
+                    color: Util.alpha(drow.pillColor, 0.18)
+                    border.color: drow.pillColor
+                    Text {
+                        id: dPillText
+                        anchors.centerIn: parent
+                        text: drow.busy ? "INSTALLING" : Model.discoverPill(drow.modelData, drow.isInstalled)
+                        color: drow.pillColor
+                        font.family: Style.font.family
+                        font.pixelSize: 9
+                        font.bold: true
+                        textFormat: Text.PlainText
+                    }
+                }
+                Row {
+                    id: dActions
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 6
+                    SmallButton {
+                        text: drow.busy ? "…" : "Install…"
+                        visible: drow.modelData.installable && !drow.isInstalled
+                        enabled: !drow.busy && root.busyId === ""
+                        anchors.verticalCenter: parent.verticalCenter
+                        onClicked: { root.installConfirmId = drow.confirming ? "" : drow.modelData.id; root.discoverOpenId = drow.modelData.id }
+                    }
+                }
+            }
+
+            Label {
+                width: parent.width
+                visible: text !== ""
+                text: drow.modelData.description
+                wrapMode: Text.WordWrap
+                maximumLineCount: drow.open ? 12 : 2
+                elide: Text.ElideRight
+                font.pixelSize: Style.font.caption
+                color: Util.alpha(root.ink, 0.75)
+            }
+
+            Column {
+                visible: drow.open
+                width: parent.width
+                spacing: 4
+                Repeater {
+                    model: drow.open ? Model.discoverInfoRows(drow.modelData, root.now) : []
+                    Row {
+                        required property var modelData
+                        width: parent ? parent.width : 0
+                        spacing: 8
+                        Label { text: modelData[0]; width: 64; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.45) }
+                        Label { text: modelData[1]; width: parent.width - 72; wrapMode: Text.Wrap; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.8) }
+                    }
+                }
+                Flow {
+                    width: parent.width
+                    spacing: 6
+                    topPadding: 2
+                    SmallButton {
+                        text: Model.shortUrl(drow.modelData.repo) + " ↗"
+                        visible: !!drow.modelData.repo
+                        accent: Commons.Color.muted
+                        onClicked: Qt.openUrlExternally(drow.modelData.repo)
+                    }
+                    SmallButton {
+                        text: "Show in list"
+                        visible: drow.isInstalled
+                        accent: Commons.Color.muted
+                        onClicked: { root.infoOpenId = drow.modelData.id; root.showView("installed") }
+                    }
+                }
+            }
+
+            // The same warning `omarchy plugin add` gives before it clones anything.
+            Rectangle {
+                visible: drow.confirming
+                width: parent.width
+                height: visible ? confirmCol.implicitHeight + 16 : 0
+                radius: 8
+                color: Util.alpha(Commons.Color.urgent, 0.08)
+                border.color: Util.alpha(Commons.Color.urgent, 0.5)
+                Column {
+                    id: confirmCol
+                    width: parent.width - 16
+                    x: 8; y: 8
+                    spacing: 6
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        color: Util.alpha(root.ink, 0.85)
+                        text: "Plugins run as unsandboxed code inside your shell; install only ones you trust. "
+                              + "This installs what " + Model.shortUrl(drow.modelData.repo) + " has now"
+                              + (drow.modelData.verification === "verified" ? ", which the catalog has checked." : ", which the catalog has not checked.")
+                              + " It is turned on in the bar where it asks to go."
+                    }
+                    Row {
+                        spacing: 6
+                        SmallButton {
+                            text: "Install"
+                            enabled: root.busyId === ""
+                            onClicked: root.runInstall(drow.modelData.id)
+                        }
+                        SmallButton { text: "Cancel"; accent: Commons.Color.muted; onClicked: root.installConfirmId = "" }
+                    }
+                }
+            }
+
+            Rectangle {
+                visible: drow.outputShown || (drow.busy && root.detailText !== "")
+                width: parent.width
+                height: visible ? Math.min(outText.implicitHeight, 160) + 36 : 0
+                radius: 8
+                color: Style.normalFill
+                border.color: Style.normalBorderColor
+                clip: true
+                Item {
+                    id: outHead
+                    x: 8; y: 6
+                    width: parent.width - 16
+                    height: outClose.implicitHeight
+                    Label {
+                        anchors.left: parent.left
+                        anchors.verticalCenter: parent.verticalCenter
+                        text: root.detailOk ? "Output" : "Output — failed"
+                        color: root.detailOk ? Util.alpha(root.ink, 0.62) : Commons.Color.urgent
+                        font.pixelSize: Style.font.caption
+                    }
+                    SmallButton { id: outClose; anchors.right: parent.right; text: "Close"; accent: Commons.Color.muted; onClicked: root.closeDetail() }
+                }
+                Flickable {
+                    x: 8; y: outHead.y + outHead.height + 4
+                    width: parent.width - 16
+                    height: parent.height - y - 6
+                    contentWidth: width
+                    contentHeight: outText.implicitHeight
+                    clip: true
+                    Text {
+                        id: outText
+                        width: parent.width
+                        text: root.detailText
+                        color: Util.alpha(root.ink, 0.85)
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.caption
+                        wrapMode: Text.WrapAnywhere
+                        textFormat: Text.PlainText
+                    }
+                }
+            }
+        }
+    }
+
     WidgetButton {
         id: button
         anchors.fill: parent
@@ -1142,16 +1461,17 @@ Panel {
                         spacing: 8
                         SmallButton {
                             text: root.updateQueueTotal > 0 ? ("Updating " + root.updateQueueDone + "/" + root.updateQueueTotal + "…") : "Update all (" + root.updatableAll + ")"
-                            visible: root.updatableAll > 1 || root.updateQueueTotal > 0
+                            visible: root.view === "installed" && (root.updatableAll > 1 || root.updateQueueTotal > 0)
                             enabled: root.updateQueueTotal === 0 && root.busyId === "" && !checkProc.running
                             anchors.verticalCenter: parent.verticalCenter
                             onClicked: root.runUpdateAll()
                         }
                         SmallButton {
-                            text: checkProc.running ? "…" : "Refresh"
-                            enabled: !checkProc.running
+                            readonly property bool running: root.view === "discover" ? catalogProc.running : checkProc.running
+                            text: running ? "…" : "Refresh"
+                            enabled: !running
                             anchors.verticalCenter: parent.verticalCenter
-                            onClicked: root.runCheck(true)
+                            onClicked: root.view === "discover" ? root.runCatalog(true) : root.runCheck(true)
                         }
                     }
                     Column {
@@ -1164,12 +1484,15 @@ Panel {
                         spacing: 3
                         Heading {
                             width: parent.width
-                            text: "Plugins"; font.pixelSize: Style.font.heading
+                            text: root.view === "discover" ? "Discover" : "Plugins"; font.pixelSize: Style.font.heading
                             elide: Text.ElideRight
                         }
                         Label {
                             width: parent.width
-                            text: root.health.total > 0 ? (root.health.done + " of " + root.health.total + " current") : "Third-party plugins and apps"
+                            text: root.view === "discover"
+                                  ? (root.catalogPlugins.length > 0 ? root.catalogPlugins.length + " in the catalog · " + Model.relativeAge(root.catalog.ts, root.now)
+                                                                    : "The official plugin catalog")
+                                  : root.health.total > 0 ? (root.health.done + " of " + root.health.total + " current") : "Third-party plugins and apps"
                             font.pixelSize: Style.font.caption
                             elide: Text.ElideRight
                         }
@@ -1180,8 +1503,80 @@ Panel {
                 // pushing the APPS section (and the footer) off the bottom of
                 // the screen -- KeyboardPanel clamps the popup's own height to
                 // the screen, but content inside it isn't clipped on its own.
+                Row {
+                    spacing: 6
+                    SmallButton {
+                        text: "Installed"
+                        accent: root.view === "installed" ? Commons.Color.accent : Commons.Color.muted
+                        onClicked: root.showView("installed")
+                    }
+                    SmallButton {
+                        text: "Discover"
+                        accent: root.view === "discover" ? Commons.Color.accent : Commons.Color.muted
+                        onClicked: root.showView("discover")
+                    }
+                }
+
+                // Discover: the catalog, searched and sorted here; a ListView, since it has
+                // thousands of entries and only a screenful are ever drawn.
+                Column {
+                    width: parent.width
+                    visible: root.view === "discover"
+                    spacing: 8
+                    Item {
+                        width: parent.width
+                        height: searchField.height
+                        FieldInput {
+                            id: searchField
+                            anchors.left: parent.left
+                            anchors.right: discoverFilters.left
+                            anchors.rightMargin: 6
+                            placeholder: "Search plugins"
+                            onTextChanged: { root.discoverQuery = text; discoverDebounce.restart() }
+                        }
+                        Row {
+                            id: discoverFilters
+                            anchors.right: parent.right
+                            anchors.verticalCenter: parent.verticalCenter
+                            spacing: 6
+                            SmallButton {
+                                text: (root.discoverInstallableOnly ? "☑" : "☐") + " Installable"
+                                accent: Commons.Color.muted
+                                onClicked: { root.discoverInstallableOnly = !root.discoverInstallableOnly; root.refilterDiscover() }
+                            }
+                            SmallButton {
+                                text: root.discoverSort === "new" ? "Newest" : "Popular"
+                                accent: Commons.Color.muted
+                                onClicked: { root.discoverSort = root.discoverSort === "new" ? "popular" : "new"; root.refilterDiscover() }
+                            }
+                        }
+                    }
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Style.font.caption
+                        color: root.catalogError ? Commons.Color.urgent : Util.alpha(root.ink, 0.62)
+                        text: root.catalogError
+                              || (root.catalogPlugins.length === 0 ? (catalogProc.running ? "Loading the plugin catalog…" : "")
+                                  : root.discoverResults.length + (root.discoverResults.length === 1 ? " plugin" : " plugins")
+                                    + (root.discoverQuery ? " match" + (root.discoverResults.length === 1 ? "es" : "") : ""))
+                    }
+                    ListView {
+                        id: discoverList
+                        width: parent.width
+                        height: Math.min(contentHeight, Style.space(420))
+                        clip: true
+                        spacing: 8
+                        boundsBehavior: Flickable.StopAtBounds
+                        model: root.view === "discover" ? root.discoverResults : []
+                        delegate: DiscoverRow {}
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    }
+                }
+
                 Flickable {
                     id: listScroll
+                    visible: root.view === "installed"
                     width: parent.width
                     height: Math.min(listColumn.implicitHeight, Style.space(420))
                     contentWidth: width
@@ -1450,44 +1845,14 @@ Panel {
                 }
 
                 Rectangle { width: parent.width; height: 1; color: Style.normalBorderColor }
-                Item {
+                Label {
+                    id: footerStatus
                     width: parent.width
-                    height: Math.max(footerStatus.implicitHeight, browseLink.implicitHeight)
-                    Label {
-                        id: footerStatus
-                        anchors.left: parent.left
-                        anchors.right: browseLink.left
-                        anchors.rightMargin: 12
-                        anchors.top: parent.top
-                        wrapMode: Text.WordWrap
-                        font.pixelSize: Style.font.caption
-                        text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
-                              (checkProc.running ? "Checking sources…" :
-                               "Last checked " + Model.relativeAge(root.status.ts, root.now))
-                    }
-                    // omarchyplugins.com is Omarchy's own community plugin directory (documented
-                    // in its shell-plugins manual). This panel only manages what is installed, so
-                    // a link out is the whole "discovery" story -- a quiet one, in the footer,
-                    // rather than a button wedged into the PLUGINS heading.
-                    Text {
-                        id: browseLink
-                        anchors.right: parent.right
-                        anchors.top: parent.top
-                        text: "Browse plugins ↗"
-                        color: browseMouse.containsMouse ? Commons.Color.accent : Util.alpha(root.ink, 0.62)
-                        font.family: Style.font.family
-                        font.pixelSize: Style.font.caption
-                        font.underline: browseMouse.containsMouse
-                        textFormat: Text.PlainText
-                        MouseArea {
-                            id: browseMouse
-                            anchors.fill: parent
-                            anchors.margins: -4
-                            hoverEnabled: true
-                            cursorShape: Qt.PointingHandCursor
-                            onClicked: Qt.openUrlExternally("https://omarchyplugins.com")
-                        }
-                    }
+                    wrapMode: Text.WordWrap
+                    font.pixelSize: Style.font.caption
+                    text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
+                          (checkProc.running ? "Checking sources…" :
+                           "Last checked " + Model.relativeAge(root.status.ts, root.now))
                 }
             }
         }

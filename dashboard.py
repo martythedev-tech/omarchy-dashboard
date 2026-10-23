@@ -35,6 +35,9 @@ a plugin's code restarts the services it ships (restart_updated_units).
 The fourth (2026-10-05, 1.9.0): Remove also stops and removes the plugin's services and,
 if asked, trashes its data folders (cmd_remove); `omarchy plugin remove` touches only the
 plugin's own folder. Leftovers lists what removals left behind.
+
+The fifth (2026-10-23, 1.11.0): Discover browses the official plugin catalog and installs
+from it through `omarchy plugin add` (cmd_catalog, cmd_install).
 """
 import argparse
 import contextlib
@@ -47,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -100,7 +104,7 @@ _NOT_CODE = re.compile(r'(^|/)(docs|tests)/|\.(md|txt|png|jpe?g|gif|svg|webp)$|(
 # started dies with it (QProcess kills its child on destruction): 2026-10-05, three updates
 # from the panel landed but none reached history. So these run as a job in their own
 # transient user unit, and the panel follows job.json instead of a process's output.
-JOB_KINDS = ('update', 'rollback', 'remove', 'cleanup')
+JOB_KINDS = ('update', 'rollback', 'remove', 'cleanup', 'install')
 # A job that is 'starting' this long without its worker having taken it never will.
 JOB_START_GRACE_SECONDS = 60
 
@@ -188,11 +192,11 @@ def _read_json(path, default):
         return default
 
 
-def _write_json(path, data):
+def _write_json(path, data, compact=False):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix('.tmp')
-    tmp.write_text(json.dumps(data, indent=2) + '\n')
+    tmp.write_text((json.dumps(data, separators=(',', ':')) if compact else json.dumps(data, indent=2)) + '\n')
     tmp.replace(path)
 
 
@@ -1643,6 +1647,200 @@ def cmd_cleanup(args):
     check_all()
 
 
+# Discover: the official plugin catalog (what plugins.omarchy.org lists), cached here
+# trimmed down -- the feed itself is ~15 MB, mostly verification bookkeeping the panel has
+# no use for.
+CATALOG_URL = 'https://plugins.omarchy.org/catalog.json'
+CATALOG_MAX_BYTES = 64 * 1024 * 1024
+CATALOG_CACHE_SECONDS = 6 * 3600
+_CATALOG_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z')
+# Only plain GitHub repos: this URL is handed to `git clone`.
+_CATALOG_REPO = re.compile(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9._-]*\Z')
+# How long a just-added plugin may take to show up in the shell's registry before enabling it.
+INSTALL_DISCOVER_SECONDS = 5
+
+
+def catalog_path():
+    return STATE / 'catalog.json'
+
+
+def _clean(value, limit):
+    return ''.join(c for c in str(value or '') if c.isprintable())[:limit].strip()
+
+
+def catalog_repo(value):
+    """The entry's GitHub repo without a trailing slash or .git, or '' if it is not one."""
+    url = str(value or '').strip().rstrip('/')
+    url = url[:-4] if url.endswith('.git') else url
+    return url if _CATALOG_REPO.fullmatch(url) else ''
+
+
+def normalize_catalog(data):
+    """The catalog's community plugins, trimmed to what the panel shows. Omarchy's own
+    built-ins are left out (the Dashboard never lists those), and so is any entry without
+    a usable id; one bad entry does not cost the rest. `installable` is the catalog's own
+    say-so that `omarchy plugin add` handles it alone -- a suite or a monorepo has its own
+    installer, which `note` points at."""
+    if not isinstance(data, dict) or not isinstance(data.get('plugins'), list):
+        raise ValueError('not a plugin catalog')
+    plugins, seen = [], set()
+    for e in data['plugins']:
+        if not isinstance(e, dict) or e.get('sourceType') != 'community':
+            continue
+        plugin_id = str(e.get('id') or '')
+        if not _CATALOG_ID.fullmatch(plugin_id) or plugin_id in seen:
+            continue
+        seen.add(plugin_id)
+        repo = catalog_repo(e.get('repo'))
+        installable = (e.get('repositoryLayout') == 'root-plugin' and e.get('installAvailable') is True
+                       and e.get('status') == 'Available' and bool(repo))
+        if e.get('verificationStatus') == 'verified' and e.get('verificationCoverage') == 'snapshot-verified':
+            verification = 'verified'
+        elif e.get('verificationCoverage') == 'update-unverified':
+            verification = 'update-unverified'
+        else:
+            verification = 'unverified'
+        stars = e.get('stars')
+        plugins.append({
+            'id': plugin_id, 'name': _clean(e.get('name'), 120) or plugin_id,
+            'description': _clean(e.get('description'), 600), 'author': _clean(e.get('author'), 80),
+            'version': _clean(e.get('version'), 40), 'category': _clean(e.get('category'), 40),
+            'kind': _clean(e.get('kind'), 40),
+            'tags': [_clean(t, 40) for t in (e.get('tags') or [])[:8] if isinstance(t, str)],
+            'repo': repo, 'stars': stars if isinstance(stars, int) and stars >= 0 else 0,
+            'added': _clean(e.get('addedAt'), 30), 'updated': _clean(e.get('repositoryUpdatedAt'), 30),
+            'status': _clean(e.get('status'), 40), 'installable': installable,
+            'note': '' if installable else (_clean(e.get('installNote'), 300)
+                                            or 'Not installable from here; see its repository.'),
+            'verification': verification,
+        })
+    return plugins
+
+
+def fetch_catalog():
+    req = urllib.request.Request(CATALOG_URL, headers={'User-Agent': 'omarchy-plugin-dashboard',
+                                                       'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        if not resp.geturl().startswith('https://plugins.omarchy.org/'):
+            raise ValueError('the catalog redirected somewhere else')
+        payload = resp.read(CATALOG_MAX_BYTES + 1)
+    if len(payload) > CATALOG_MAX_BYTES:
+        raise ValueError('the catalog is larger than expected')
+    data = json.loads(payload)
+    return {'generatedAt': _clean(data.get('generatedAt') if isinstance(data, dict) else '', 40),
+            'plugins': normalize_catalog(data)}
+
+
+def cmd_catalog(args):
+    """Refreshes catalog.json (the panel reads it) unless it is younger than
+    CATALOG_CACHE_SECONDS. A failed fetch keeps the old list and records why on it."""
+    cached = _read_json(catalog_path(), {})
+    if not getattr(args, 'force', False) and status_is_fresh(cached, max_age=CATALOG_CACHE_SECONDS) \
+            and not cached.get('error'):
+        print(json.dumps({'ok': True, 'ts': cached['ts'], 'count': len(cached.get('plugins', []))}))
+        return
+    try:
+        fresh = fetch_catalog()
+    except (OSError, ValueError) as e:
+        message = f'Could not load the plugin catalog: {e}'
+        if cached:
+            cached.update(error=message, errorTs=time.time())
+            _write_json(catalog_path(), cached, compact=True)
+        print(json.dumps({'ok': False, 'message': message}))
+        return
+    fresh['ts'] = time.time()
+    _write_json(catalog_path(), fresh, compact=True)
+    print(json.dumps({'ok': True, 'ts': fresh['ts'], 'count': len(fresh['plugins'])}))
+
+
+def registry_has(plugin_id, wait=INSTALL_DISCOVER_SECONDS):
+    """Whether the shell's registry lists this plugin yet; it rescans in the background."""
+    deadline = time.time() + wait
+    while True:
+        rc, out, _ = run(['omarchy', 'plugin', 'list', '--json'])
+        try:
+            if rc == 0 and any(p.get('id') == plugin_id for p in json.loads(out)):
+                return True
+        except (ValueError, AttributeError, TypeError):
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+def cmd_install(args):
+    """Installs a catalog plugin: `omarchy plugin add` (clone, validate, refuse an id that is
+    taken), then `omarchy plugin enable` at its manifest's own bar section. The repo comes
+    from the cached catalog, never from the caller, and no command the catalog carries is
+    run. A plugin that replaces the whole bar is added but left off. Like an update, it
+    then reads the shell's log for whether the new plugin loaded."""
+    entry = next((p for p in _read_json(catalog_path(), {}).get('plugins', [])
+                  if isinstance(p, dict) and p.get('id') == args.id), None)
+    if not entry:
+        print(json.dumps({'ok': False, 'message': f'{args.id} is not in the plugin catalog; refresh Discover.'}))
+        return
+    repo = catalog_repo(entry.get('repo'))
+    if not entry.get('installable') or not repo:
+        print(json.dumps({'ok': False, 'message': entry.get('note') or 'The catalog does not offer it for install.'}))
+        return
+    if (PLUGINS_DIR / args.id).exists() or (PLUGINS_DIR / args.id).is_symlink():
+        print(json.dumps({'ok': False, 'message': f'{entry["name"]} is already installed.'}))
+        return
+    log_mark = shell_log_mark()
+    rc, out, err = run(['omarchy', 'plugin', 'add', repo + '.git', '--yes'], timeout=300,
+                       stream_log=STATE / 'action.log')
+    # omarchy installs under the id in the repo's manifest, which the catalog's id should
+    # match but is not guaranteed to.
+    m = re.search(r'^Added (\S+) into ', out or '', re.M)
+    plugin_id = m.group(1) if m else args.id
+    plugin_dir = PLUGINS_DIR / plugin_id
+    if rc != 0 or not plugin_dir.is_dir():
+        message = '\n'.join(t for t in ((out or '').strip(), (err or '').strip()) if t)[-4000:] \
+            or 'omarchy plugin add failed.'
+        append_history({'ts': time.time(), 'id': plugin_id, 'name': entry['name'], 'kind': 'plugin',
+                        'action': 'install', 'ok': False, 'before': '', 'after': '', 'fromVersion': '',
+                        'toVersion': '', 'unitsInstalled': [],
+                        'message': (message.splitlines() or [''])[-1][:200]})
+        print(json.dumps({'ok': False, 'message': message}))
+        check_all()
+        return
+    messages, ok = [(out or '').strip()], True
+    try:
+        kinds = json.loads((plugin_dir / 'manifest.json').read_text()).get('kinds') or []
+    except (OSError, ValueError, AttributeError):
+        kinds = []
+    if 'bar' in kinds:
+        messages.append('It replaces the whole bar, so it is left off; turn it on from the list when you want it.')
+    elif not registry_has(plugin_id):
+        ok = False
+        messages.append(f'Installed, but the shell did not pick it up to turn on; try `omarchy plugin enable {plugin_id}`.')
+    else:
+        erc, eout, eerr = run(['omarchy', 'plugin', 'enable', plugin_id], timeout=60)
+        if erc != 0:
+            ok = False
+            messages.append('Installed, but turning it on failed:\n' + (eerr or eout).strip())
+        elif (eout or '').strip():
+            messages.append(eout.strip())
+    # omarchy plugin add clones and enables; services the plugin's own installer would set
+    # up are not, so say so rather than leave it half working without a word.
+    units = sorted(shipped_units(plugin_dir))
+    if units:
+        messages.append('It ships background services (' + ', '.join(units) + ') that installing a plugin '
+                        'does not set up; its README says how.')
+    if ok:
+        load_ok, load_text = check_plugin_loaded(plugin_id, plugin_dir, log_mark)
+        if load_text:
+            messages.append(load_text)
+        ok = load_ok
+    message = '\n'.join(t for t in messages if t)
+    append_history({'ts': time.time(), 'id': plugin_id, 'name': entry['name'], 'kind': 'plugin',
+                    'action': 'install', 'ok': ok, 'before': '', 'after': repo_head(plugin_dir),
+                    'fromVersion': '', 'toVersion': manifest_version(plugin_id), 'unitsInstalled': [],
+                    'message': '' if ok else (message.splitlines() or [''])[-1][:200]})
+    print(json.dumps({'ok': ok, 'message': message, 'id': plugin_id}))
+    check_all()
+
+
 def job_path():
     return STATE / 'job.json'
 
@@ -1708,7 +1906,8 @@ def new_job(kind, ids, options=None):
 def run_job_item(kind, item_id, options=None):
     """One item of a job through the same command the panel used to run directly; its
     printed JSON result is what the job records."""
-    handler = {'update': cmd_update, 'rollback': cmd_rollback, 'remove': cmd_remove, 'cleanup': cmd_cleanup}[kind]
+    handler = {'update': cmd_update, 'rollback': cmd_rollback, 'remove': cmd_remove, 'cleanup': cmd_cleanup,
+               'install': cmd_install}[kind]
     buf = io.StringIO()
     try:
         with contextlib.redirect_stdout(buf):
@@ -1925,6 +2124,7 @@ def main():
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('check').add_argument('--force', action='store_true')
+    sub.add_parser('catalog').add_argument('--force', action='store_true')
     for name in ('enable', 'disable', 'update', 'remove', 'diff', 'remove-app', 'rollback', 'unhold'):
         p = sub.add_parser(name)
         p.add_argument('id')
@@ -1952,7 +2152,7 @@ def main():
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
         'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
         'await-notification': cmd_await_notification, 'start': cmd_start, 'run-job': cmd_run_job,
-        'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup,
+        'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup, 'catalog': cmd_catalog,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
     }
     handlers[args.command](args)

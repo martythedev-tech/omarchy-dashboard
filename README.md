@@ -68,8 +68,8 @@ button -- **Update** when there is one, **Unhold** when held. Click the row's
 name to expand it: its full status, the branch it is on, when upstream last
 committed, and every other action -- **Changes**, **Hold**, a link to its
 source (the GitHub repo, or the AUR package page for an app), **Open folder**,
-**Terminal**, then **Roll back** and **Remove** last. **Browse plugins ↗** (the
-omarchyplugins.com directory) is in the footer.
+**Terminal**, then **Roll back** and **Remove** last. New plugins are found in the
+**Discover** tab (below).
 
 **Same-version commits are quiet.** For anything behind, the check reads the
 version the incoming commits would install (the plugin's `manifest.json`, or an
@@ -176,12 +176,40 @@ The notification is waited on by a small
 transient user unit (`dashboard-notify-*`), which goes away once it is clicked,
 dismissed, or an hour has passed.
 
+## Discover
+
+The **Discover** tab (beside **Installed** under the header) lists the official plugin
+catalog -- what plugins.omarchy.org and omarchyplugins.com list -- searchable, popular
+(GitHub stars) or newest first. Omarchy's own built-ins are left out, as everywhere else
+here. A plugin already installed (by id, or a fork of the same repo under another id) says
+INSTALLED, with **Show in list**.
+
+**Install…** appears only for entries the catalog itself says `omarchy plugin add` installs
+alone; suites, monorepos and anything with its own installer say MANUAL SETUP and link to
+their repo instead (untick **Installable** to see them). Install asks first, in the row, with
+the warning `omarchy plugin add` gives: plugins run unsandboxed inside the shell, and what
+lands is the repo's current code, which the catalog may or may not have checked (VERIFIED /
+UPDATE UNVERIFIED / UNVERIFIED). Then, as a job like an update:
+
+- `omarchy plugin add <repo>.git --yes` -- clone, validate, refuse an id already taken. The
+  repo comes from the cached catalog, not from the panel, and the catalog's own
+  `installCommand` is never run.
+- `omarchy plugin enable <id>`, so it lands where its manifest asks to sit in the bar. A
+  plugin that replaces the whole bar is installed but left off.
+- If it ships systemd units, it says so: installing a plugin does not set those up.
+- The same load check as an update: the shell's log decides whether it actually loaded.
+
+The catalog is about 15 MB; `dashboard.py catalog` keeps a trimmed copy (~3 MB,
+`catalog.json` in the state folder) and refetches it when it is older than 6 hours or on
+**Refresh**. A failed fetch keeps the old list and says why. Installs show under Recent.
+
 ## Keyboard and scripts
 
 The panel answers the shell's IPC:
 
 ```bash
 omarchy-shell martythedev-tech.dashboard toggle   # open, close, show, hide too
+omarchy-shell martythedev-tech.dashboard discover # open on the Discover tab
 omarchy-shell martythedev-tech.dashboard check    # force a check now
 omarchy-shell martythedev-tech.dashboard count    # updates waiting, e.g. for a script
 omarchy-shell martythedev-tech.dashboard update <plugin-or-app-id>   # as if Update was clicked
@@ -241,6 +269,7 @@ backed up under `~/.local/state/omarchy/backups/dashboard-TIMESTAMP/`.
 
 ```bash
 python3 dashboard.py check                     # one-shot, prints the status JSON
+python3 dashboard.py catalog --force           # refetch the plugin catalog
 systemctl --user status dashboard-check.timer
 journalctl --user -u dashboard-check.service
 python3 -m unittest discover -s tests -v

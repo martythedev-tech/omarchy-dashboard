@@ -241,6 +241,7 @@ function historyLine(e, nowSeconds) {
     var versions = e.fromVersion && e.toVersion && e.fromVersion !== e.toVersion ? ' ' + e.fromVersion + ' → ' + e.toVersion : ''
     var what
     if (e.action === 'remove') what = e.ok ? 'removed' : 'removed, with problems'
+    else if (e.action === 'install') what = e.ok ? 'installed' + (e.toVersion ? ' ' + e.toVersion : '') : 'install failed'
     else if (e.action === 'rollback') what = (e.ok ? 'rolled back' : 'rollback failed') + versions
     // Same version: an app's update really did rebuild and reinstall it; a plugin's only
     // pulled commits that left the version alone (docs, tooling).
@@ -254,6 +255,7 @@ function historyMark(e) {
     if (!e) return ''
     if (!e.ok) return '✗'
     if (e.action === 'remove') return '−'
+    if (e.action === 'install') return '+'
     return e.action === 'rollback' ? '↩' : '✓'
 }
 
@@ -294,7 +296,7 @@ function queueSummary(results, title, verb) {
 // The actions that run as a job (dashboard.py JOB_KINDS): each changes a plugin's
 // directory, and the shell answers that by rebuilding this widget mid-action.
 function isJobKind(kind) {
-    return kind === 'update' || kind === 'rollback' || kind === 'remove' || kind === 'cleanup'
+    return kind === 'update' || kind === 'rollback' || kind === 'remove' || kind === 'cleanup' || kind === 'install'
 }
 
 // What job.json means for this panel instance. busy: show it going (whichever instance
@@ -388,4 +390,101 @@ function toneColor(tone, palette, fallback) {
     if (tone === 'waiting') return palette.yellow || palette.orange || fallback.accent
     if (tone === 'calm') return palette.green || fallback.accent
     return fallback.muted
+}
+
+// Discover (dashboard.py catalog). What counts as already installed: a plugin here under
+// the catalog's id, or one whose source is the catalog entry's repo (a fork renamed).
+function normRepo(url) {
+    return String(url || '').toLowerCase().replace(/\.git$/, '').replace(/\/+$/, '')
+}
+
+function installedKeys(items) {
+    var ids = {}, urls = {}
+    for (var i = 0; i < (items || []).length; i++) {
+        var it = items[i]
+        if (!it || it.kind === 'app') continue
+        ids[it.id] = true
+        var url = it.info && it.info.webUrl
+        if (url) urls[normRepo(url)] = true
+    }
+    return {ids: ids, urls: urls}
+}
+
+function discoverInstalled(entry, keys) {
+    if (!entry || !keys) return false
+    return !!(keys.ids[entry.id] || (entry.repo && keys.urls[normRepo(entry.repo)]))
+}
+
+// One lowercase string per entry to search in, built once per catalog load rather than on
+// every keystroke.
+function discoverIndex(plugins) {
+    var out = []
+    for (var i = 0; i < (plugins || []).length; i++) {
+        var p = plugins[i]
+        out.push([p.name, p.id, p.description, p.author, p.category, p.kind, (p.tags || []).join(' ')].join(' ').toLowerCase())
+    }
+    return out
+}
+
+// The entries every word of the query appears in, popular (stars) or newest (listed) first.
+// installableOnly drops what `omarchy plugin add` cannot install on its own.
+function discoverList(plugins, index, query, opts) {
+    plugins = plugins || []
+    opts = opts || {}
+    var words = String(query || '').toLowerCase().split(/\s+/).filter(function(w) { return w.length > 0 })
+    var out = []
+    for (var i = 0; i < plugins.length; i++) {
+        var p = plugins[i]
+        if (opts.installableOnly && !p.installable) continue
+        var hay = index && index[i] !== undefined ? index[i] : discoverIndex([p])[0]
+        var all = true
+        for (var w = 0; w < words.length; w++) if (hay.indexOf(words[w]) === -1) { all = false; break }
+        if (all) out.push(p)
+    }
+    function byName(a, b) { var x = a.name.toLowerCase(), y = b.name.toLowerCase(); return x < y ? -1 : x > y ? 1 : 0 }
+    if (opts.sort === 'new') out.sort(function(a, b) { return a.added < b.added ? 1 : a.added > b.added ? -1 : byName(a, b) })
+    else out.sort(function(a, b) { return (b.stars || 0) - (a.stars || 0) || byName(a, b) })
+    return out
+}
+
+function discoverPill(entry, installed) {
+    if (!entry) return ''
+    if (installed) return 'INSTALLED'
+    if (!entry.installable) return 'MANUAL SETUP'
+    if (entry.verification === 'verified') return 'VERIFIED'
+    if (entry.verification === 'update-unverified') return 'UPDATE UNVERIFIED'
+    return 'UNVERIFIED'
+}
+
+// The line under the name: how liked, who, what -- stars first, so a long author name is
+// what gets cut off, not them.
+function discoverMeta(entry) {
+    if (!entry) return ''
+    var parts = []
+    if (entry.stars) parts.push('★ ' + entry.stars)
+    if (entry.author) parts.push(entry.author)
+    if (entry.category) parts.push(entry.category)
+    return parts.join(' · ')
+}
+
+function isoSeconds(text) {
+    var t = Date.parse(text || '')
+    return isNaN(t) ? 0 : t / 1000
+}
+
+// The expanded Discover row's facts, as [label, value] pairs.
+function discoverInfoRows(entry, nowSeconds) {
+    if (!entry) return []
+    var rows = []
+    if (entry.version) rows.push(['Version', entry.version])
+    if (entry.kind) rows.push(['Kind', entry.kind])
+    var updated = isoSeconds(entry.updated)
+    if (updated) rows.push(['Updated', relativeAge(updated, nowSeconds)])
+    if (entry.added) rows.push(['Listed', entry.added.slice(0, 10)])
+    var check = entry.verification === 'verified' ? 'the catalog checked its current code'
+              : entry.verification === 'update-unverified' ? 'changed since the catalog last checked it'
+              : 'not checked by the catalog'
+    rows.push(['Checked', check])
+    if (!entry.installable && entry.note) rows.push(['Install', entry.note])
+    return rows
 }
