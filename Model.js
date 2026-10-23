@@ -298,12 +298,42 @@ function infoRows(item, nowSeconds, home) {
         rows.push(['From', info.repo === 'AUR' ? 'the AUR' : 'the ' + info.repo + ' repo'])
         rows.push(['Updates', item.updateVia === 'system' ? 'with the system (omarchy update), in a terminal' : 'yay -S, in a terminal'])
     }
+    if (item.shortcut) rows.push(['Shortcut', item.shortcut])
     var market = marketLine(item)
     if (market) rows.push(['Checked', market])
     if (info.branch) rows.push(['Branch', info.branch])
     if (info.upstreamTs) rows.push(['Upstream', 'last commit ' + relativeAge(info.upstreamTs, nowSeconds)])
     if (info.path) rows.push(['Folder', home && info.path.indexOf(home + '/') === 0 ? '~' + info.path.slice(home.length) : info.path])
     return rows
+}
+
+// Keyboard shortcuts. A plugin can have one when the shell can open something of it:
+// a bar widget's popup, a panel or an overlay (dashboard.py SHORTCUT_KINDS).
+function canShortcut(item) {
+    if (!item || item.kind === 'app' || item.enabled === false) return false
+    var kinds = item.kinds || []
+    return kinds.indexOf('bar-widget') >= 0 || kinds.indexOf('panel') >= 0 || kinds.indexOf('overlay') >= 0
+}
+
+// A key press, as Qt reports it, turned into a combination: {combo} when complete,
+// {held} while only modifiers are down, {error} for a key a shortcut cannot use. Qt's
+// key and modifier values are spelled out so this needs no Qt object (and can be tested).
+function comboFromKey(key, modifiers) {
+    var mods = []
+    if (modifiers & 0x10000000) mods.push('SUPER')
+    if (modifiers & 0x04000000) mods.push('CTRL')
+    if (modifiers & 0x08000000) mods.push('ALT')
+    if (modifiers & 0x02000000) mods.push('SHIFT')
+    var name = ''
+    if (key >= 0x41 && key <= 0x5a) name = String.fromCharCode(key)
+    else if (key >= 0x30 && key <= 0x39) name = String.fromCharCode(key)
+    else if (key >= 0x01000030 && key <= 0x0100003b) name = 'F' + (key - 0x01000030 + 1)
+    else if ((key >= 0x01000020 && key <= 0x01000023) || key === 0x01000053 || key === 0x01000054)
+        return { held: mods.join(' + ') }
+    if (!name) return { error: 'Use a letter, a digit or F1-F12.' }
+    if (mods.indexOf('SUPER') < 0 && mods.indexOf('CTRL') < 0 && mods.indexOf('ALT') < 0)
+        return { error: 'Hold Super, Ctrl or Alt with it.' }
+    return { combo: mods.concat([name]).join(' + ') }
 }
 
 // The marketplace badge: about the update when one is waiting (that is the decision in
@@ -583,4 +613,44 @@ function installedSummary(items) {
                  plugins + (plugins === 1 ? ' plugin' : ' plugins')]
     if (apps) parts.push(apps + (apps === 1 ? ' app' : ' apps'))
     return parts.join(' · ')
+}
+
+// The bar layout editor. Sections in bar order; the two outer-center ones only when they
+// hold something (Omarchy's default bar leaves them empty), and never the tray's drawer,
+// which the tray itself draws.
+function barSections(layout) {
+    layout = layout || {}
+    var out = ['left']
+    if ((layout.centerBegin || []).length) out.push('centerBegin')
+    out.push('center')
+    if ((layout.centerEnd || []).length) out.push('centerEnd')
+    out.push('right')
+    return out
+}
+
+function barSectionLabel(section) {
+    return { left: 'LEFT', centerBegin: 'CENTER START', center: 'CENTER', centerEnd: 'CENTER END', right: 'RIGHT' }[section] || section.toUpperCase()
+}
+
+// The placement `omarchy-shell shell moveBarWidget` takes for one step: up or down within
+// the section, or into the neighbouring section -- at its end going left, at its start
+// going right, so a widget walks across the bar in order. null when there is no step.
+// The index is where it lands once taken out of its old place (the shell removes first).
+function barMove(layout, sections, section, index, dir) {
+    var list = (layout || {})[section] || []
+    if (index < 0 || index >= list.length) return null
+    var place = { fromSection: section, fromIndex: index }
+    if (dir === 'up' || dir === 'down') {
+        var to = dir === 'up' ? index - 1 : index + 1
+        if (to < 0 || to >= list.length) return null
+        place.section = section
+        place.index = to
+        return place
+    }
+    var si = sections.indexOf(section)
+    var ti = dir === 'left' ? si - 1 : si + 1
+    if (si < 0 || ti < 0 || ti >= sections.length) return null
+    place.section = sections[ti]
+    place.index = dir === 'left' ? ((layout || {})[sections[ti]] || []).length : 0
+    return place
 }

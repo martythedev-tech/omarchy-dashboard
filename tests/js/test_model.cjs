@@ -382,4 +382,33 @@ assert.equal(ctx.inUpdateAll(mk({kind: 'app', updateState: 'behind'}, undefined)
 assert.equal(ctx.inUpdateAll(mk({updateState: 'behind', held: true}, {incoming: 'verified'}), 'verified'), false, 'held stays out');
 assert.equal(ctx.inUpdateAll(mk({}, {incoming: 'verified'}), 'all'), false, 'nothing to update');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles, marketplace verification, Update all scope all pass.');
+// Keyboard shortcuts.
+var META = 0x10000000, CTRL = 0x04000000, ALT = 0x08000000, SHIFT = 0x02000000;
+assert.equal(ctx.comboFromKey(0x50, META | ALT).combo, 'SUPER + ALT + P');
+assert.equal(ctx.comboFromKey(0x31, CTRL | SHIFT).combo, 'CTRL + SHIFT + 1');
+assert.equal(ctx.comboFromKey(0x01000034, ALT).combo, 'ALT + F5');
+assert.equal(ctx.comboFromKey(0x01000023, META | ALT).held, 'SUPER + ALT', 'a modifier alone is not a combination yet');
+assert.ok(ctx.comboFromKey(0x50, SHIFT).error, 'shift alone is typing');
+assert.ok(ctx.comboFromKey(0x2c, META).error, 'comma is not offered');
+assert.equal(ctx.canShortcut({kind: 'plugin', kinds: ['service', 'overlay']}), true);
+assert.equal(ctx.canShortcut({kind: 'plugin', kinds: ['service']}), false, 'nothing to open');
+assert.equal(ctx.canShortcut({kind: 'plugin', enabled: false, kinds: ['bar-widget']}), false, 'not while off');
+assert.equal(ctx.canShortcut({kind: 'app'}), false);
+
+// Bar layout.
+var bar = {left: [{id: 'a'}, {id: 'b'}], centerBegin: [], center: [], centerEnd: [{id: 'x'}], right: [{id: 'c'}], tray: [{id: 't'}]};
+var secs = ctx.barSections(bar);
+assert.deepEqual(Array.from(secs), ['left', 'center', 'centerEnd', 'right'], 'empty outer centers and the tray drawer left out');
+assert.equal(ctx.barSectionLabel('centerEnd'), 'CENTER END');
+function place(p) { return p ? [p.fromSection, p.fromIndex, p.section, p.index].join(' ') : null; }
+assert.equal(place(ctx.barMove(bar, secs, 'left', 1, 'up')), 'left 1 left 0');
+assert.equal(place(ctx.barMove(bar, secs, 'left', 0, 'down')), 'left 0 left 1');
+assert.equal(ctx.barMove(bar, secs, 'left', 0, 'up'), null, 'already first');
+assert.equal(ctx.barMove(bar, secs, 'left', 1, 'down'), null, 'already last');
+assert.equal(ctx.barMove(bar, secs, 'left', 0, 'left'), null, 'no section further left');
+assert.equal(place(ctx.barMove(bar, secs, 'left', 1, 'right')), 'left 1 center 0', 'enters the next section at its start');
+assert.equal(place(ctx.barMove(bar, secs, 'right', 0, 'left')), 'right 0 centerEnd 1', 'enters the previous one at its end');
+assert.equal(ctx.barMove(bar, secs, 'right', 0, 'right'), null);
+assert.equal(ctx.barMove(bar, secs, 'left', 5, 'up'), null, 'no such entry');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles, marketplace verification, Update all scope, shortcuts, bar layout all pass.');

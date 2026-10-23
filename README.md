@@ -5,7 +5,8 @@ itself -- plus the apps you choose to track, with a badge for how many have a
 real update waiting, an enable/disable switch per plugin, a diff preview, and
 an Update button once a check against the actual upstream (git, the package
 repos, the AUR) confirms there's something to pull. A **Discover** tab browses
-and installs plugins from the official catalog.
+and installs plugins from the official catalog, and a **Bar** tab rearranges the bar.
+Any plugin with a popup can get its own keyboard shortcut.
 
 Apps come in two kinds (see [Apps](#apps)): an **installed package** you want
 reminding about, like Brave (`brave-bin`), and a **source repo** you build
@@ -164,7 +165,8 @@ button -- **Update** (**Update system…** / **Update…** for a package app) wh
 one, **Unhold** when held. Click the row's name to expand it: its full status, the branch
 it is on (or, for a package app, where it comes from), when upstream last committed, and
 every other action that applies -- **Changes**, **Hold**, a link to its source (the
-GitHub repo, or the AUR page), **Open folder**, **Terminal**, then **Roll back** and
+GitHub repo, or the AUR page), **Shortcut…** (see [Keyboard shortcuts](#keyboard-shortcuts)),
+**Marketplace ↗** for a listed plugin, **Open folder**, **Terminal**, then **Roll back** and
 **Remove…** (**Stop tracking** for an app) last. New plugins are found in the
 **Discover** tab (below).
 
@@ -372,6 +374,51 @@ Installs show under Recent.
 Opening a row shows the catalog's screenshot of the plugin (its 720 px card image, fetched
 from plugins.omarchy.org only when the row is opened).
 
+## Bar
+
+The **Bar** tab lists every widget on the bar, Omarchy's own included, section by section
+(LEFT, CENTER, RIGHT; CENTER START and CENTER END too when they hold something), with
+third-party ones tagged `plugin`. Hover a widget for its arrows: **↑ ↓** move it within its
+section, **← →** into the neighbouring one (at its end going left, at its start going
+right, so a widget walks across the bar in order). The bar redraws as you go.
+
+Each step is the shell's own `omarchy-shell shell moveBarWidget` -- the call `omarchy plugin`
+uses -- so the shell writes `shell.json` itself and a widget keeps its settings. The tab
+reads the shell's effective layout (`listShellConfig`) and follows `shell.json`, so a change
+made elsewhere shows up here too. Turning a widget off is still the Installed tab's switch;
+the tray's drawer is left to the tray.
+
+## Keyboard shortcuts
+
+A plugin that has a popup, a panel or an overlay can have a key combination that opens it:
+open its row and choose **Shortcut…**, then press the keys (Super, Ctrl or Alt, plus a
+letter, a digit or F1-F12; Esc cancels). It is saved at once, and the row says it
+(**Shortcut: SUPER + ALT + P**, and a Shortcut line). **Remove shortcut** takes it away.
+
+- It is written to `~/.config/hypr/bindings.lua` as a marked block of its own, the way
+  `flea --default` writes one, and Hyprland is reloaded:
+
+  ```lua
+  -- plugin-dashboard shortcut: nixfred.pulse begin. Written by the Plugin Dashboard; removing the shortcut there removes the block whole.
+  o.bind("SUPER + ALT + P", "Pulse (Plugin Dashboard)", "omarchy-shell shell toggle nixfred.pulse")
+  -- plugin-dashboard shortcut: nixfred.pulse end
+  ```
+
+  Changing or removing it replaces or removes that block whole; nothing else in the file is
+  touched. Removing the plugin removes its shortcut too.
+- A combination already bound is refused, naming what has it (checked against Hyprland's
+  live bindings). Omarchy binds digits by key position, which Hyprland does not report as a
+  key, so a digit next to such a binding is refused as "cannot tell" -- use a letter or an F
+  key. A combination Hyprland already owns never reaches the panel at all, so if pressing
+  one does nothing, it is taken.
+- Nothing is written while Hyprland already reports config errors, and if the reload reports
+  one, the old file goes back.
+- Shortcuts you wrote yourself (like the `SUPER + ALT + U` example below) are left alone and
+  are not shown on the row.
+
+From a terminal: `dashboard.py shortcut <plugin-id> "SUPER + ALT + P"`, or without the
+combination to remove it.
+
 ## Keyboard and scripts
 
 The panel answers the shell's IPC:
@@ -379,6 +426,7 @@ The panel answers the shell's IPC:
 ```bash
 omarchy-shell martythedev-tech.dashboard toggle   # open, close, show, hide too
 omarchy-shell martythedev-tech.dashboard discover # open on the Discover tab
+omarchy-shell martythedev-tech.dashboard bar      # open on the Bar tab
 omarchy-shell martythedev-tech.dashboard check    # force a check now
 omarchy-shell martythedev-tech.dashboard count    # updates waiting, e.g. for a script
 omarchy-shell martythedev-tech.dashboard update <plugin-or-app-id>   # as if Update was clicked (a package app opens its terminal)
