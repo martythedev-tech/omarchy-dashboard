@@ -1267,10 +1267,19 @@ def check_all():
     apps = load_apps()
     pkg_ctx = package_context(apps)
     with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
+        catalog_job = pool.submit(refresh_catalog)
         jobs = [pool.submit(check_plugin, p) for p in discover_plugins()] + \
                [pool.submit(check_package_app, a, pkg_ctx) if is_package_app(a) else pool.submit(check_app, a)
                 for a in apps]
         items = [job.result() for job in jobs]
+        catalog, catalog_error = catalog_job.result()
+    index = catalog_index(catalog)
+    # 'market' is None for a plugin the marketplace does not list, and left out altogether
+    # when the catalog could not be read -- then nobody knows.
+    if catalog:
+        for item in items:
+            if item.get('kind') == 'plugin':
+                item['market'] = market_status(item, index)
     holds = load_holds()
     history = load_history()
     now = time.time()
@@ -1286,6 +1295,8 @@ def check_all():
         'items': items,
         'updatable': sum(1 for i in items if alerts(i)),
         'leftovers': leftovers(),
+        # False when the catalog could not be read at all: then "not listed" means "unknown".
+        'catalogOk': bool(catalog), 'catalogError': catalog_error,
         # Plugin entries were recorded under their id (cmd_update knows no display name), so
         # Recent read "com.omastorm.radar updated"; show the name the rows use instead.
         'history': [dict({k: e.get(k) for k in ('id', 'name', 'kind', 'source', 'action', 'ok', 'fromVersion',
@@ -1891,11 +1902,15 @@ def cmd_cleanup(args):
 CATALOG_URL = 'https://plugins.omarchy.org/catalog.json'
 CATALOG_MAX_BYTES = 64 * 1024 * 1024
 CATALOG_CACHE_SECONDS = 6 * 3600
+# Bumped when normalize_catalog keeps something new, so an older cache is refetched
+# rather than read as "no data" (2: verifiedCommit).
+CATALOG_SCHEMA = 2
 _CATALOG_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z')
 # Only plain GitHub repos: this URL is handed to `git clone`.
 _CATALOG_REPO = re.compile(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9._-]*\Z')
 # Preview images are the catalog's own (relative to its site); only plain image paths there.
 CATALOG_SITE = 'https://plugins.omarchy.org/'
+_COMMIT = re.compile(r'[0-9a-f]{40}')
 _CATALOG_PREVIEW = re.compile(r'assets/img/plugins/[A-Za-z0-9._-]+\.(?:webp|png|jpe?g)\Z')
 # How long a just-added plugin may take to show up in the shell's registry before enabling it.
 INSTALL_DISCOVER_SECONDS = 5
@@ -1941,6 +1956,11 @@ def normalize_catalog(data):
             verification = 'update-unverified'
         else:
             verification = 'unverified'
+        # The commit the marketplace's security baseline passed. When upstream has moved on
+        # since ('update-unverified'), this is the older snapshot that was checked.
+        checked = str(e.get('verificationCommit') or '').lower()
+        if e.get('verificationSnapshotStatus') != 'verified' or not _COMMIT.fullmatch(checked):
+            checked = ''
         stars = e.get('stars')
         thumb = str(e.get('previewThumbnail') or '')
         width, height = e.get('previewThumbnailWidth'), e.get('previewThumbnailHeight')
@@ -1955,7 +1975,7 @@ def normalize_catalog(data):
             'status': _clean(e.get('status'), 40), 'installable': installable,
             'note': '' if installable else (_clean(e.get('installNote'), 300)
                                             or 'Not installable from here; see its repository.'),
-            'verification': verification,
+            'verification': verification, 'verifiedCommit': checked,
             # The card-sized thumbnail (720 px wide, ~30 KB), not the full detail image.
             'preview': CATALOG_SITE + thumb if _CATALOG_PREVIEW.fullmatch(thumb) else '',
             'previewAspect': round(width / height, 3) if isinstance(width, int) and isinstance(height, int)
@@ -1978,14 +1998,14 @@ def fetch_catalog():
             'plugins': normalize_catalog(data)}
 
 
-def cmd_catalog(args):
-    """Refreshes catalog.json (the panel reads it) unless it is younger than
-    CATALOG_CACHE_SECONDS. A failed fetch keeps the old list and records why on it."""
+def refresh_catalog(force=False):
+    """(catalog, error): catalog.json (the panel reads it), refetched unless it is younger
+    than CATALOG_CACHE_SECONDS. A failed fetch keeps the old list, records why on it, and
+    returns it -- or {} when there never was one."""
     cached = _read_json(catalog_path(), {})
-    if not getattr(args, 'force', False) and status_is_fresh(cached, max_age=CATALOG_CACHE_SECONDS) \
-            and not cached.get('error'):
-        print(json.dumps({'ok': True, 'ts': cached['ts'], 'count': len(cached.get('plugins', []))}))
-        return
+    if not force and status_is_fresh(cached, max_age=CATALOG_CACHE_SECONDS) and not cached.get('error') \
+            and cached.get('schema') == CATALOG_SCHEMA:
+        return cached, ''
     try:
         fresh = fetch_catalog()
     except (OSError, ValueError) as e:
@@ -1993,11 +2013,65 @@ def cmd_catalog(args):
         if cached:
             cached.update(error=message, errorTs=time.time())
             _write_json(catalog_path(), cached, compact=True)
-        print(json.dumps({'ok': False, 'message': message}))
-        return
+        return cached, message
     fresh['ts'] = time.time()
+    fresh['schema'] = CATALOG_SCHEMA
     _write_json(catalog_path(), fresh, compact=True)
-    print(json.dumps({'ok': True, 'ts': fresh['ts'], 'count': len(fresh['plugins'])}))
+    return fresh, ''
+
+
+def cmd_catalog(args):
+    catalog, error = refresh_catalog(getattr(args, 'force', False))
+    if error:
+        print(json.dumps({'ok': False, 'message': error}))
+    else:
+        print(json.dumps({'ok': True, 'ts': catalog['ts'], 'count': len(catalog.get('plugins', []))}))
+
+
+def catalog_index(catalog):
+    """{'ids': {id: entry}, 'repos': {lowercased repo url: entry}} for finding an installed
+    plugin in the catalog: by its id, or else by where it was cloned from (a plugin whose
+    manifest id differs from its listing still matches)."""
+    ids, repos = {}, {}
+    for e in (catalog or {}).get('plugins') or []:
+        ids[e.get('id')] = e
+        if e.get('repo'):
+            repos[e['repo'].lower()] = e
+    return {'ids': ids, 'repos': repos}
+
+
+def market_status(item, index):
+    """What the marketplace says about the code this plugin runs -- and, when it is behind,
+    about the code an update would bring -- or None when it is not listed. A commit is
+    'verified' only if it is the exact one the marketplace's security baseline checked;
+    anything else, including a newer upstream commit or local commits of your own, is
+    'unverified'. Uncommitted edits are not covered either way; the row says EDITED."""
+    entry = index['ids'].get(item['id'])
+    path = (item.get('info') or {}).get('path') or ''
+    if entry is None:
+        entry = index['repos'].get(((item.get('info') or {}).get('webUrl') or '').lower())
+    if entry is None:
+        return None
+    checked = entry.get('verifiedCommit') or ''
+
+    def commit(ref):
+        rc, out, _ = run(['git', '-C', path, 'rev-parse', '--verify', '--quiet', ref + '^{commit}'])
+        return out.strip() if rc == 0 else ''
+
+    def verdict(sha):
+        return 'verified' if sha and checked and sha == checked else 'unverified'
+
+    head = commit('HEAD') if path else ''
+    result = {'id': entry['id'], 'url': CATALOG_SITE + 'plugin.html?id=' + entry['id'],
+              'checked': checked[:7], 'installed': verdict(head), 'incoming': '', 'sinceChecked': -1}
+    if item.get('updateState') == 'behind':
+        result['incoming'] = verdict(commit('FETCH_HEAD'))
+    # How far past the checked commit you are, when that commit is in the checkout.
+    if head and checked and head != checked:
+        rc, out, _ = run(['git', '-C', path, 'rev-list', '--count', checked + '..HEAD'])
+        if rc == 0 and out.strip().isdigit():
+            result['sinceChecked'] = int(out.strip())
+    return result
 
 
 def registry_has(plugin_id, wait=INSTALL_DISCOVER_SECONDS):

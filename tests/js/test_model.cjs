@@ -352,4 +352,24 @@ assert.equal(ctx.installedSummary([{kind: 'plugin', updateState: 'up-to-date'}, 
              'All current · 2 plugins · 1 app');
 assert.equal(ctx.installedSummary([{kind: 'plugin', updateState: 'behind', versionChange: true}]), '1 update waiting · 1 plugin');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles all pass.');
+// Marketplace verification.
+var mk = function(over, market) { return Object.assign({kind: 'plugin', updateState: 'up-to-date', edits: 0}, over, {market: market}); };
+assert.equal(ctx.marketPill(mk({}, null)), '', 'unlisted: no badge');
+assert.equal(ctx.marketPill(mk({}, undefined)), '', 'catalog unknown: no badge');
+assert.equal(ctx.marketPill(mk({}, {installed: 'verified', incoming: ''})), 'VERIFIED');
+assert.equal(ctx.marketPill(mk({}, {installed: 'unverified', incoming: ''})), 'UNVERIFIED');
+assert.equal(ctx.marketPill(mk({updateState: 'behind'}, {installed: 'unverified', incoming: 'verified'})), 'UPDATE VERIFIED', 'behind: about the update');
+assert.equal(ctx.marketPill(mk({updateState: 'behind'}, {installed: 'verified', incoming: 'unverified'})), 'UPDATE UNVERIFIED');
+assert.equal(ctx.marketLine(mk({}, undefined)), '', 'nothing said when the catalog could not be read');
+assert.equal(ctx.marketLine(mk({}, null)), 'Not listed in the marketplace');
+assert.equal(ctx.marketLine(mk({kind: 'app'}, null)), '', 'apps are not in the marketplace');
+assert.equal(ctx.marketLine(mk({edits: 2}, {installed: 'verified', checked: 'abc1234'})),
+             'Verified: this is the commit its security check passed (abc1234), but your uncommitted edits are not covered');
+assert.equal(ctx.marketLine(mk({}, {installed: 'unverified', checked: 'abc1234', sinceChecked: 14})),
+             'Unverified: 14 commits past the one its security check passed (abc1234)');
+assert.equal(ctx.marketLine(mk({}, {installed: 'unverified', checked: '', sinceChecked: -1})),
+             'Unverified: its security check has not passed any commit');
+assert.equal(ctx.marketLine(mk({updateState: 'behind'}, {installed: 'unverified', checked: 'abc1234', sinceChecked: -1, incoming: 'verified'})),
+             'Unverified: not the commit its security check passed (abc1234). The update is the verified commit.');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles, marketplace verification all pass.');
