@@ -146,12 +146,13 @@ Rows sort by what needs you: a stuck git operation or local changes clashing wit
 update first, then anything one click would update, then sources that could not
 be reached, then the rest (held items with the rest) -- alphabetical within each.
 
-A row itself carries only its state pill, its on/off switch and at most one
-button -- **Update** when there is one, **Unhold** when held. Click the row's
-name to expand it: its full status, the branch it is on, when upstream last
-committed, and every other action -- **Changes**, **Hold**, a link to its
-source (the GitHub repo, or the AUR package page for an app), **Open folder**,
-**Terminal**, then **Roll back** and **Remove** last. New plugins are found in the
+A row itself carries only its state pill, its on/off switch (plugins) and at most one
+button -- **Update** (**Update system…** / **Update…** for a package app) when there is
+one, **Unhold** when held. Click the row's name to expand it: its full status, the branch
+it is on (or, for a package app, where it comes from), when upstream last committed, and
+every other action that applies -- **Changes**, **Hold**, a link to its source (the
+GitHub repo, or the AUR page), **Open folder**, **Terminal**, then **Roll back** and
+**Remove…** (**Stop tracking** for an app) last. New plugins are found in the
 **Discover** tab (below).
 
 **Same-version commits are quiet.** For anything behind, the check reads the
@@ -166,9 +167,17 @@ catch: a plugin that changes code without bumping its version is quiet too.
 **Update all** ends with a one-line summary ("2 updated, 1 failed (Flea).") and
 leaves the first failure's output open.
 
-- **+N LOCAL**: the checkout carries N commits upstream does not have -- a fork you
-  maintain, or a local fix you are holding. Shown next to CURRENT or BEHIND so it is not
-  mistaken for an untouched install.
+The state pill:
+
+- **CURRENT**: nothing waiting.
+- **BEHIND N**: N upstream commits would come in; **Update** brings them.
+- **DIRTY** / **DIVERGED**: local edits or commits clash with the update; the expanded row
+  names the files. Update yourself.
+- **GIT**: a rebase, merge, cherry-pick or bisect is half done in the checkout. Finish or
+  abort it.
+- **OFFLINE**: the source could not be reached this check.
+- **HELD**: you held this update (see Hold below). **OFF**: a plugin you turned off.
+- **WORKING**: an action on it is running.
 - **NOT INSTALLED** (source apps): the repo is current but the installed package is older
   than the version its `.SRCINFO` builds -- an update whose build or install step never
   ran. Update runs the app's `updateCmd`, which builds and installs it.
@@ -176,6 +185,14 @@ leaves the first failure's output open.
 - **NO SOURCE**: nothing to check against -- a plugin that is not a git checkout, a `-git`
   package, or a package that is in neither the repos nor the AUR. The expanded row says
   which.
+
+Beside it, in a muted outline:
+
+- **+N LOCAL**: the checkout carries N commits upstream does not have -- a fork you
+  maintain, or a local fix you are holding. Shown next to CURRENT or BEHIND so it is not
+  mistaken for an untouched install.
+- **EDITED**: the checkout has uncommitted edits; an update carries them over (see Plugins
+  with local work above).
 
 Checks run side by side, so a full check takes about as long as the slowest single
 fetch rather than the sum of them.
@@ -185,8 +202,8 @@ fetch rather than the sum of them.
 - **Changes**: for anything `behind` or `diverged`, lists the commits the
   update brings (and, for a plugin, the local ones upstream lacks), with a Diff
   tab for the full `git diff` against the fetched upstream.
-- **Hold**: from the Changes view, keeps an update you don't want yet out of
-  the badge, Update all and notifications; the row shows HELD and an Unhold
+- **Hold**: from the expanded row or the Changes view, keeps an update you don't want yet
+  out of the badge, Update all and notifications; the row shows HELD and an Unhold
   button. Holds live in `holds.json` in the state directory.
 - **Roll back** (plugins): for a week after the Dashboard updates a plugin, and
   as long as its checkout hasn't moved since, puts it back where the update
@@ -195,12 +212,12 @@ fetch rather than the sum of them.
   validate (the update is restored if the old version no longer validates), stop
   and remove any service the update had started that the old version doesn't
   ship, the plugin's own `run.sh --ensure`, and a plugin rescan. It then holds
-  the plugin, so the same update isn't offered straight back. Apps are rebuilt
-  from source, so they have no Roll back.
-- **Recent**: every update and rollback is recorded in `history.json` (last
-  50); the newest few are listed at the bottom of the panel.
+  the plugin, so the same update isn't offered straight back. Apps have no Roll
+  back: a source app is rebuilt from source, and a package app is updated by the system.
+- **Recent**: every update, rollback, install and removal is recorded in
+  `history.json` (last 50); the newest few are listed at the bottom of the panel.
 - **Update all**: appears once more than one item is updatable; updates them
-  one at a time.
+  one at a time (package apps together, in one terminal -- see [Apps](#apps)).
 - **Remove…** (a plugin): shows what it will do before anything happens --
   delete the folder (a git checkout; its source stays upstream), unlink it (a
   symlink), or move it to a backup (anything else); stop and remove the
@@ -243,13 +260,14 @@ Messages the plugin was already logging before the update are not counted.
 
 ## Updates run outside the panel
 
-Updating, rolling back or removing a plugin changes its folder, and the shell
+Updating, rolling back, installing or removing a plugin changes the plugins folder, and the shell
 answers any change there by rebuilding every plugin widget -- this one too,
 mid-update. So the panel doesn't run these itself: it hands them to a
 transient user unit (`dashboard-job-*`) and follows `job.json` in the state
 folder. A panel rebuilt halfway through still shows the job going and how it
 ended, and the history entry, the load check and Roll back all still happen.
-Only one job runs at a time.
+Only one job runs at a time. Package apps are the exception: their update needs sudo, so it
+runs in a terminal instead (see [Apps](#apps)).
 
 When an update changes a plugin's code (not just docs, tests or images), the
 services it ships that are running are restarted, so they run the new code.
@@ -258,7 +276,8 @@ services it ships that are running are restarted, so they run the new code.
 
 The "update available" notification has **Update** and **Open** buttons. Update
 updates the items it named that are still updatable and not held, then says how
-that went; Open opens the panel. It runs as a job like any other, so an open panel shows it going.
+that went; Open opens the panel. It runs as a job like any other, so an open panel shows it
+going -- except package apps, which get a terminal.
 The notification is waited on by a small
 transient user unit (`dashboard-notify-*`), which goes away once it is clicked,
 dismissed, or an hour has passed.
@@ -302,7 +321,7 @@ omarchy-shell martythedev-tech.dashboard toggle   # open, close, show, hide too
 omarchy-shell martythedev-tech.dashboard discover # open on the Discover tab
 omarchy-shell martythedev-tech.dashboard check    # force a check now
 omarchy-shell martythedev-tech.dashboard count    # updates waiting, e.g. for a script
-omarchy-shell martythedev-tech.dashboard update <plugin-or-app-id>   # as if Update was clicked
+omarchy-shell martythedev-tech.dashboard update <plugin-or-app-id>   # as if Update was clicked (a package app opens its terminal)
 ```
 
 For a key, add to `~/.config/hypr/bindings.lua`:
@@ -324,15 +343,20 @@ python3 install.py
 
 Installs under `~/.config/omarchy/plugins/martythedev-tech.dashboard`,
 appends to the far-right bar, installs and enables
-`dashboard-check.timer`, and runs one check immediately so the panel has
-real data the first time you open it. Existing files and bar layout are
-backed up under `~/.local/state/omarchy/backups/dashboard-TIMESTAMP/`.
+`dashboard-check.timer` (a check every 5 hours, and after boot), and runs one check
+immediately so the panel has real data the first time you open it. Existing files and bar
+layout are backed up under `~/.local/state/omarchy/backups/dashboard-TIMESTAMP/`.
+
+`omarchy plugin add https://github.com/martythedev-tech/omarchy-dashboard.git --enable`
+works too, but installs no timer: checks then happen only when the panel opens, and there
+are no update notifications in between.
 
 ## Diagnosis
 
 ```bash
 python3 dashboard.py check                     # one-shot, prints the status JSON
 python3 dashboard.py catalog --force           # refetch the plugin catalog
+python3 dashboard.py inspect-package brave     # what Add app would make of a package
 systemctl --user status dashboard-check.timer
 journalctl --user -u dashboard-check.service
 python3 -m unittest discover -s tests -v

@@ -2,8 +2,8 @@
 """Dashboard: every third-party/own Omarchy plugin plus tracked local apps,
 checked against their real upstream. No bespoke update logic of its own --
 every action shells out to the command that already owns it (`omarchy plugin
-enable/disable/update/remove` for plugins, each app's own rebuild.sh for
-apps) and this script's only job is deciding when an Update button should
+enable/disable/update/remove` for plugins, each source app's own rebuild.sh,
+`omarchy update` or `yay -S` for package apps) and this script's only job is deciding when an Update button should
 show and reporting what that command did.
 
 One exception: a plugin whose own run.sh implements `--ensure` (2026-09-12,
@@ -38,6 +38,10 @@ plugin's own folder. Leftovers lists what removals left behind.
 
 The fifth (2026-10-23, 1.11.0): Discover browses the official plugin catalog and installs
 from it through `omarchy plugin add` (cmd_catalog, cmd_install).
+
+The sixth (2026-10-23, 1.12.0): package apps (pacman/AUR, e.g. brave-bin) update in a
+terminal, where sudo can ask (cmd_terminal_update); a source app can be pulled before its
+update command runs (pull_upstream), and is checked again afterwards.
 """
 import argparse
 import contextlib
