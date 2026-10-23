@@ -1,10 +1,15 @@
 # Plugin Dashboard
 
 A bar chip for every third-party and custom Omarchy plugin -- including
-itself -- plus tracked local apps like Flea and Howdy, with a badge for how
-many have a real update waiting, an enable/disable switch per plugin, a diff
-preview, and an Update button once a check against the actual upstream (git,
-AUR) confirms there's something to pull.
+itself -- plus the apps you choose to track, with a badge for how many have a
+real update waiting, an enable/disable switch per plugin, a diff preview, and
+an Update button once a check against the actual upstream (git, the package
+repos, the AUR) confirms there's something to pull. A **Discover** tab browses
+and installs plugins from the official catalog.
+
+Apps come in two kinds (see [Apps](#apps)): an **installed package** you want
+reminding about, like Brave (`brave-bin`), and a **source repo** you build
+yourself, like Flea or Howdy.
 
 Omarchy's own built-ins never show up here: the plugin list comes from
 `omarchy plugin list --json` filtered to `firstParty: false`, which is
@@ -40,22 +45,100 @@ the command that already owns it:
   so such a plugin shows a normal Update button with an EDITED / +N LOCAL tag,
   and only work that clashes with the update shows "dirty" or "diverged",
   naming the files.
-- **Apps** (Flea, Howdy, and anything added via "+ Add app"): each one's
-  own `updateCmd` (default `rebuild.sh --install`) in its project
-  directory. The check mirrors what `rebuild.sh` itself asks -- "has the
-  tracked branch (AUR) moved past what we've merged" -- not "is the
-  checked-out branch different from origin," which would always be true
-  for something like Flea's `aarch64-local`, deliberately ahead of the AUR
-  branch it tracks.
+- **Apps**: an installed package updates the way the system does (`omarchy update`, or
+  `yay -S` for an AUR package), in a terminal; a source repo runs its own `updateCmd`
+  (default `rebuild.sh --install`). The whole story is under [Apps](#apps).
 
-`dashboard.py check` does the checking (git fetch + compare per item,
-`pacman -Q` for app versions) and writes
+`dashboard.py check` does the checking (git fetch + compare per plugin and
+source app, `checkupdates` and the AUR for package apps, `pacman -Q` for
+installed versions) and writes
 `~/.local/state/omarchy/plugins/martythedev-tech.dashboard/status.json`,
 which the panel reads. It runs on a timer (`dashboard-check.timer`, every
 few hours) and once synchronously whenever the panel opens, so opening it
 never shows data older than that. Any item that just became updatable since
 the last check (not one that's been sitting there) fires a desktop
 notification via `notify-send`.
+
+## Apps
+
+The **APPS** section tracks things that are not plugins. Add one with **+ Add app** at the
+bottom of it, then pick what kind it is.
+
+| | Installed package | Source repo |
+|---|---|---|
+| For | anything installed with pacman or yay, e.g. Brave (`brave-bin`) | a git checkout you build and install yourself, e.g. Flea, Howdy |
+| Add it with | **Installed package**: type the package name, **Fill in** | **Source repo**: **Choose…** the folder (or type it), **Fill in** |
+| Checked against | the package repos (`checkupdates`), or the AUR | its git upstream (`git fetch`) |
+| Update button | **Update system…** (repo package) or **Update…** (AUR) | **Update** |
+| What Update runs | `omarchy update`, or `yay -S <pkg>`, in a terminal | its update command, in the background |
+| Row says | `· package` | `· app` |
+
+### When does the Update button appear?
+
+Only when an update is actually waiting. A current app shows CURRENT and no button -- there
+is nothing to run. When a new version lands, the next check (every few hours, and whenever
+the panel opens) turns the row to UPDATE (BEHIND for a source repo), adds it to the bar badge, sends a notification
+with an **Update** button, and the row gets its own button. To update the system at any
+other time, run `omarchy update` yourself (Omarchy's own update icon in the bar runs it too,
+but appears only when a new Omarchy release is out).
+
+### Installed packages
+
+Type the package name and press **Fill in**: it names the app and says where the package
+comes from and how it will update. The name people type is often not the package's
+(`brave` is `brave-bin`); a name another package provides is tracked as that package, and
+one that is not installed gets suggestions.
+
+- *From a package repo* (omarchy, extra, ...): checked with `checkupdates`, which refreshes
+  a private copy of the sync databases (no root; the system's are untouched). Its update is
+  **Update system…**: `omarchy update` in a terminal -- the whole system, because Arch does
+  not support upgrading one repo package on its own.
+- *From the AUR*: checked against the AUR's version; **Update…** runs `yay -S <pkg>` in a
+  terminal.
+- A `-git` (or other VCS) package shows NO SOURCE: the AUR's version only moves when its
+  PKGBUILD does, not when the source does.
+
+These updates open a terminal because they need sudo. The terminal records the result
+under Recent and rechecks when it is done. **Update all** and the notification's **Update**
+open one terminal for every package app and run everything else as usual. A package app
+has no Changes view (there is no checkout to diff) and no Roll back.
+
+### Source repos
+
+Pick **Source repo**, then **Choose…** (the desktop's folder chooser) or type a path and
+press **Fill in**. That reads the repo and fills the rest -- name and id from the folder,
+the package name from `.SRCINFO`, the upstream branch and remote from git, and
+`./rebuild.sh --install` if the repo has an executable `rebuild.sh` -- and says what it
+could not work out.
+
+- The check asks "has the tracked branch's upstream moved past what we've merged" -- not
+  "is the checked-out branch different from origin," which would always be true for a
+  checkout like Flea's `aarch64-local`, deliberately ahead of the AUR branch it tracks.
+- The update command must build *and install*. A `rebuild.sh` brings upstream in itself.
+  For anything else (say `make install`), **Pull upstream first** is ticked: the Dashboard
+  fast-forwards the checked-out branch to upstream before running the command. It never
+  merges: local commits upstream lacks make it stop and say so.
+- After the command, the app is checked again. If the checkout still lacks upstream's
+  commits, or the installed package is older than what the repo builds, the update is
+  reported as failed with that reason -- an exit code 0 alone is not trusted.
+- **Changes** shows the incoming commits and diff, as for a plugin.
+
+### Removing and editing
+
+**Stop tracking** (in the expanded row, two clicks) only forgets an app here; it never
+touches the repo or the package. Apps live in
+`~/.local/state/omarchy/plugins/martythedev-tech.dashboard/apps.json` (seeded on first run
+with Flea and Howdy), which can be hand-edited:
+
+```json
+[
+  {"id": "brave-bin", "name": "Brave", "source": "package", "pkgName": "brave-bin"},
+  {"id": "flea", "name": "Flea", "repoDir": "/home/you/Projects/flea", "pkgName": "flea",
+   "branch": "master", "remote": "origin", "updateCmd": ["./rebuild.sh", "--install"]},
+  {"id": "tool", "name": "Tool", "repoDir": "/home/you/Projects/tool", "pkgName": "tool",
+   "branch": "main", "remote": "origin", "updateCmd": ["make", "install"], "pullFirst": true}
+]
+```
 
 ## What the row tells you
 
@@ -86,9 +169,13 @@ leaves the first failure's output open.
 - **+N LOCAL**: the checkout carries N commits upstream does not have -- a fork you
   maintain, or a local fix you are holding. Shown next to CURRENT or BEHIND so it is not
   mistaken for an untouched install.
-- **NOT INSTALLED** (apps): the repo is current but the installed package is older than
-  the version its `.SRCINFO` builds -- an update whose build or install step never ran.
-  Update runs the app's `updateCmd`, which builds and installs it.
+- **NOT INSTALLED** (source apps): the repo is current but the installed package is older
+  than the version its `.SRCINFO` builds -- an update whose build or install step never
+  ran. Update runs the app's `updateCmd`, which builds and installs it.
+- **UPDATE** (package apps): a newer version of the package is out; the row says which.
+- **NO SOURCE**: nothing to check against -- a plugin that is not a git checkout, a `-git`
+  package, or a package that is in neither the repos nor the AUR. The expanded row says
+  which.
 
 Checks run side by side, so a full check takes about as long as the slowest single
 fetch rather than the sum of them.
@@ -124,7 +211,7 @@ fetch rather than the sum of them.
   outright. A folder another installed plugin also points at is never
   offered. Then `omarchy plugin remove <id> --yes`; if that refuses, the
   services are started again. For an app, **Stop tracking** (two clicks)
-  only forgets it here.
+  only forgets it here (see [Apps](#apps)).
 - **Leftovers**: what removed plugins left behind -- omarchy's
   `.<id>.bak.*` backup folders, services still pointing at a plugin that is
   gone, and data a removal kept. **Clean up** sends a folder to the trash and
@@ -226,58 +313,6 @@ o.bind("SUPER + ALT + U", "Plugin Dashboard", "omarchy-shell martythedev-tech.da
 
 Use the command, not `{ panel = "martythedev-tech.dashboard" }`: that form calls the
 shell's generic `shell toggle`, which did not open this bar widget's popup when tried.
-
-## Tracked apps
-
-"+ Add app" in the panel tracks two kinds of app.
-
-**An installed package** (Brave's `brave-bin`, anything from pacman or the AUR): pick
-**Installed package**, type the package name and press **Fill in**; it names the app and
-says where the package comes from and how it will update.
-
-- *From a package repo* (omarchy, extra, ...): checked with `checkupdates`, which refreshes
-  a private copy of the sync databases (no root, the system's are untouched). Its update is
-  **Update system…**: `omarchy update` in a terminal -- the whole system, because Arch does
-  not support upgrading one repo package on its own.
-- *From the AUR*: checked against the AUR's version; **Update…** runs `yay -S <pkg>` in a
-  terminal.
-- A `-git` (or other VCS) package shows "No update source": the AUR's version only moves
-  when its PKGBUILD does, not when the source does.
-
-Both update in a terminal because they need sudo; the terminal records the result under
-Recent and rechecks when it is done. Update all and the notification's Update button open
-one terminal for all package apps and run everything else as usual.
-
-**A source repo you build yourself** (Flea, Howdy): pick **Source repo**, then **Choose…**
-(the desktop's folder chooser) or type a path and press **Fill in**. That reads the repo and
-fills the rest -- name and id from the folder, the package name from `.SRCINFO`, the upstream
-branch and remote from git, and `./rebuild.sh --install` if the repo has an executable
-`rebuild.sh` -- and says what it could not work out.
-
-- The update command must build *and install*. A `rebuild.sh` brings upstream in itself.
-  For anything else (say `make install`), **Pull upstream first** is ticked: the Dashboard
-  fast-forwards the checked-out branch to upstream before running the command. It never
-  merges: local commits upstream lacks make it stop and say so.
-- After the command, the app is checked again. If the checkout still lacks upstream's
-  commits, or the installed package is older than what the repo builds, the update is
-  reported as failed with that reason -- an exit code 0 alone is not trusted.
-
-Remove either kind via its **Stop tracking** button -- that only forgets it here, it never
-touches the repo or package.
-
-Under the hood, apps live in a small file,
-`~/.local/state/omarchy/plugins/martythedev-tech.dashboard/apps.json`,
-seeded on first run with Flea and Howdy, and can still be hand-edited:
-
-```json
-[
-  {"id": "flea", "name": "Flea", "repoDir": "/home/you/Projects/flea", "pkgName": "flea",
-   "branch": "master", "remote": "origin", "updateCmd": ["./rebuild.sh", "--install"]},
-  {"id": "tool", "name": "Tool", "repoDir": "/home/you/Projects/tool", "pkgName": "tool",
-   "branch": "main", "remote": "origin", "updateCmd": ["make", "install"], "pullFirst": true},
-  {"id": "brave-bin", "name": "Brave", "source": "package", "pkgName": "brave-bin"}
-]
-```
 
 ## Install
 
