@@ -314,6 +314,24 @@ def manifest_version(plugin_id):
         return ''
 
 
+def manifest_description(plugin_id):
+    path = PLUGINS_DIR / plugin_id / 'manifest.json'
+    try:
+        return str(json.loads(path.read_text()).get('description') or '')[:300]
+    except (OSError, ValueError):
+        return ''
+
+
+def pkg_description(pkg_name):
+    """The installed package's one-line description, or '' (the row's second line)."""
+    rc, out, _ = run(['pacman', '-Qi', pkg_name])
+    for line in out.splitlines() if rc == 0 else []:
+        key, _, value = line.partition(':')
+        if key.strip() == 'Description':
+            return value.strip()[:300]
+    return ''
+
+
 def has_ensure_bootstrap(plugin_dir):
     """Whether this plugin owns a run.sh implementing `--ensure` -- the convention a
     plugin uses to fetch/swap a native binary it pins separately from its git content
@@ -951,6 +969,7 @@ def check_plugin(p):
     incoming = upstream_version(plugin_dir, 'FETCH_HEAD', 'plugin') if state == 'behind' else ''
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
+        'description': manifest_description(pid),
         'version': version, 'upstreamVersion': incoming,
         'versionChange': version_change(version, incoming), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
@@ -977,6 +996,7 @@ def check_app(a):
     incoming = upstream_version(a['repoDir'], f'{remote}/{branch}', 'app') if state == 'behind' else ''
     return {
         'id': a['id'], 'kind': 'app', 'name': a.get('name', a['id']),
+        'description': a.get('description') or (pkg_description(a.get('pkgName', a['id'])) if version else ''),
         'version': version, 'upstreamVersion': incoming,
         'versionChange': version_change(version, incoming),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
@@ -1083,6 +1103,7 @@ def check_package_app(a, ctx):
             state, incoming = 'behind', aur[pkg]
     return {
         'id': a['id'], 'kind': 'app', 'source': 'package', 'name': a.get('name', a['id']),
+        'description': a.get('description') or (pkg_description(pkg) if version else ''),
         'version': version, 'upstreamVersion': incoming,
         'versionChange': version_change(version, incoming),
         'updateState': state, 'behind': 1 if state == 'behind' else 0, 'reason': reason, 'ahead': 0,

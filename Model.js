@@ -509,3 +509,35 @@ function discoverInfoRows(entry, nowSeconds) {
     if (!entry.installable && entry.note) rows.push(['Install', entry.note])
     return rows
 }
+
+// The row's icon tile: a letter, since plugin manifests carry no icon. "Omarchy Doctor"
+// and "Omarchy Multiroom Speakers" would both be "O", so a leading "Omarchy" is skipped.
+function tileLetter(name) {
+    var words = String(name || '').trim().split(/\s+/)
+    if (words.length > 1 && /^omarchy$/i.test(words[0])) words.shift()
+    var ch = (words[0] || '?').charAt(0)
+    return ch ? ch.toUpperCase() : '?'
+}
+
+// A stable pick from n colors for a name, so a plugin keeps its tile color across checks.
+function tileIndex(name, n) {
+    var s = String(name || ''), h = 0
+    for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0
+    return n > 0 ? Math.abs(h) % n : 0
+}
+
+// The header's second line on Installed: counts, then what needs doing.
+function installedSummary(items) {
+    var plugins = 0, apps = 0, waiting = 0
+    for (var i = 0; i < (items || []).length; i++) {
+        var it = items[i]
+        if (it.kind === 'app') apps++
+        else plugins++
+        if (stripeKey(it) === 'behind') waiting++
+    }
+    // Updates first: with Update all beside it the line is short, and the counts can elide.
+    var parts = [waiting ? waiting + (waiting === 1 ? ' update waiting' : ' updates waiting') : 'All current',
+                 plugins + (plugins === 1 ? ' plugin' : ' plugins')]
+    if (apps) parts.push(apps + (apps === 1 ? ' app' : ' apps'))
+    return parts.join(' · ')
+}

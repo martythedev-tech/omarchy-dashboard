@@ -379,9 +379,11 @@ Panel {
 
     function pillAccent(item) {
         var k = Model.stripeKey(item)
-        if (k === "behind") return Commons.Color.accent
+        if (k === "behind") return root.paletteColor("yellow", Commons.Color.accent)
         if (k === "attention") return Commons.Color.urgent
-        return Util.alpha(root.ink, 0.45)
+        if (k === "off") return Util.alpha(root.ink, 0.45)
+        if (item && (item.updateState === "no-repo" || item.updateState === "unreachable")) return Util.alpha(root.ink, 0.45)
+        return root.paletteColor("green", Util.alpha(root.ink, 0.45))
     }
 
     function submitAddApp() {
@@ -443,6 +445,33 @@ Panel {
         printErrors: false
         onFileChanged: reload()
         onLoaded: { try { root.status = JSON.parse(text()) } catch (e) {} }
+    }
+
+    // The theme's named colors (red, green, ...), which Commons.Color does not expose: the
+    // tiles and badges take their colors from here so they follow the theme.
+    property var themePalette: ({})
+    FileView {
+        path: Commons.Color.currentThemePath + "/colors.toml"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            var pal = {}
+            var lines = text().split("\n")
+            for (var i = 0; i < lines.length; i++) {
+                var m = lines[i].match(/^\s*([a-z_]+)\s*=\s*"(#[0-9a-fA-F]{6})"/)
+                if (m) pal[m[1]] = m[2]
+            }
+            root.themePalette = pal
+        }
+    }
+    function paletteColor(name, fallback) {
+        return root.themePalette[name] ? root.themePalette[name] : fallback
+    }
+    function tileColor(name) {
+        var keys = ["blue", "magenta", "green", "cyan", "yellow", "orange", "red"]
+        var have = keys.filter(function(k) { return !!root.themePalette[k] })
+        return have.length ? root.themePalette[have[Model.tileIndex(name, have.length)]] : Commons.Color.accent
     }
 
     FileView {
@@ -868,6 +897,33 @@ Panel {
             }
         }
     }
+    // A plugin's icon: a rounded square in a theme color with its letter, and a dot on
+    // the corner when it wants something (an update, or attention).
+    component Tile: Rectangle {
+        id: tile
+        property string name: ""
+        property color dot: "transparent"
+        property bool dim: false
+        width: 32; height: 32
+        radius: 8
+        color: Util.alpha(root.tileColor(tile.name), tile.dim ? 0.35 : 0.9)
+        Text {
+            anchors.centerIn: parent
+            text: Model.tileLetter(tile.name)
+            color: Commons.Color.background
+            font.family: Style.font.family
+            font.pixelSize: 15
+            font.bold: true
+        }
+        Rectangle {
+            visible: tile.dot.a > 0
+            x: -3; y: -3
+            width: 10; height: 10; radius: 5
+            color: tile.dot
+            border.width: 2
+            border.color: Commons.Color.popups.background
+        }
+    }
     component Row_: Rectangle {
         id: row
         required property var modelData
@@ -880,10 +936,9 @@ Panel {
         readonly property color accentNow: root.pillAccent(row.modelData)
         // Which destructive button is waiting for its second click ("remove"/"rollback"), if any.
         property string confirming: ""
-        height: content.implicitHeight + 12
-        radius: 10
-        color: rowMouse.containsMouse ? Style.hoverFill : Style.normalFill
-        border.color: Style.normalBorderColor
+        height: content.implicitHeight + 20
+        radius: 8
+        color: rowMouse.containsMouse ? Style.hoverFill : "transparent"
         Behavior on color { ColorAnimation { duration: 80 } }
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
@@ -901,16 +956,25 @@ Panel {
         }
 
         Rectangle {
-            width: 4
-            height: parent.height
-            radius: 2
-            color: root.stripeColor(row.modelData)
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left; anchors.right: parent.right
+            anchors.leftMargin: 8; anchors.rightMargin: 8
+            height: 1
+            color: Style.normalBorderColor
+        }
+
+        Tile {
+            x: 8; y: 12
+            name: row.modelData.name
+            dim: Model.stripeKey(row.modelData) === "off"
+            dot: Model.stripeKey(row.modelData) === "behind" || Model.stripeKey(row.modelData) === "attention"
+                 ? root.pillAccent(row.modelData) : "transparent"
         }
 
         Column {
             id: content
-            width: parent.width - 28
-            x: 16; y: 6
+            width: parent.width - 60
+            x: 52; y: 10
             spacing: 6
 
             Item {
@@ -921,12 +985,69 @@ Panel {
                     id: nameCol
                     anchors.left: parent.left
                     anchors.verticalCenter: parent.verticalCenter
-                    anchors.right: localPill.visible ? localPill.left : pillBox.left
-                    anchors.rightMargin: 8
+                    anchors.right: actionsRow.left
+                    anchors.rightMargin: 10
                     Row {
                         width: parent.width
                         spacing: 6
-                        Heading { id: nameText; text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - 16) }
+                        Heading { id: nameText; text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - (pillBox.visible ? pillBox.width + 6 : 0) - (localPill.visible ? localPill.width + 6 : 0) - 22) }
+                        // Only when there is something to say: CURRENT on every row was a column
+                        // of green that drowned out the one row that needed you.
+                        Rectangle {
+                            id: pillBox
+                            visible: row.busy || (pillText.text !== "" && pillText.text !== "CURRENT")
+                            anchors.verticalCenter: nameText.verticalCenter
+                            implicitWidth: pillText.implicitWidth + 12
+                            implicitHeight: 18
+                            radius: 9
+                            color: Util.alpha(row.accentNow, 0.16)
+                            Text {
+                                id: pillText
+                                anchors.centerIn: parent
+                                text: row.busy ? "WORKING" : Model.pillLabel(row.modelData)
+                                color: row.accentNow
+                                font.family: Style.font.family
+                                font.pixelSize: 9
+                                font.bold: true
+                                textFormat: Text.PlainText
+                            }
+                        }
+                        // Muted on purpose: local commits are information (a fork, a held fix),
+                        // not a problem -- the state pill beside it carries any urgency.
+                        Rectangle {
+                            id: localPill
+                            readonly property string label: Model.localTag(row.modelData)
+                            visible: label !== "" && !row.busy
+                            anchors.verticalCenter: nameText.verticalCenter
+                            implicitWidth: localPillText.implicitWidth + 12
+                            implicitHeight: 18
+                            radius: 9
+                            color: "transparent"
+                            border.color: Util.alpha(root.ink, 0.3)
+                            Text {
+                                id: localPillText
+                                anchors.centerIn: parent
+                                text: localPill.label
+                                color: Util.alpha(root.ink, 0.62)
+                                font.family: Style.font.family
+                                font.pixelSize: 9
+                                font.bold: true
+                                textFormat: Text.PlainText
+                            }
+                        }
+                        // The first thing to give way when the line is full: name and pills stay whole.
+                        Text {
+                            id: versionText
+                            width: Math.max(0, Math.min(implicitWidth, parent.width - nameText.width - (pillBox.visible ? pillBox.width + 6 : 0) - (localPill.visible ? localPill.width + 6 : 0) - 28))
+                            visible: width > 24
+                            elide: Text.ElideRight
+                            text: (row.modelData.version ? "v" + row.modelData.version : "")
+                                  + (row.modelData.kind === "app" ? (row.modelData.version ? " · " : "") + (row.modelData.source === "package" ? "package" : "app") : "")
+                            anchors.verticalCenter: nameText.verticalCenter
+                            color: Util.alpha(root.ink, 0.45)
+                            font.family: Style.font.family
+                            font.pixelSize: Style.font.caption
+                        }
                         Text {
                             text: row.infoShown ? "▾" : "▸"
                             anchors.verticalCenter: nameText.verticalCenter
@@ -937,15 +1058,24 @@ Panel {
                     }
                     Label {
                         width: parent.width
+                        visible: text !== ""
                         elide: Text.ElideRight
-                        text: row.busy
+                        text: row.modelData.description || ""
+                        color: Util.alpha(root.ink, 0.62)
+                        font.pixelSize: Style.font.caption
+                    }
+                    Label {
+                        readonly property string extra: row.busy
                               ? (Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s")
-                              : ((row.modelData.version ? "v" + row.modelData.version : "no version")
-                                 + (row.modelData.kind === "app" ? (row.modelData.source === "package" ? " · package" : " · app") : "")
-                                 + (row.isSelf ? " · this widget" : "")
-                                 + (row.modelData.held ? " · held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "")
-                                 + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : "")
-                                 + (!row.modelData.held && row.modelData.updateState === "behind" ? " · " + Model.behindLabel(row.modelData) : ""))
+                              : [row.modelData.held ? "held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "",
+                                 !row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? row.modelData.reason : "",
+                                 !row.modelData.held && row.modelData.updateState === "behind" ? Model.behindLabel(row.modelData) : ""]
+                                .filter(function(t) { return t !== "" }).join(" · ")
+                        width: parent.width
+                        visible: extra !== ""
+                        elide: Text.ElideRight
+                        text: extra
+                        color: row.busy || row.modelData.updateState === "behind" ? root.pillAccent(row.modelData) : Util.alpha(root.ink, 0.45)
                         font.pixelSize: Style.font.caption
                     }
                 }
@@ -954,52 +1084,6 @@ Panel {
                     anchors.fill: nameCol
                     cursorShape: Qt.PointingHandCursor
                     onClicked: root.infoOpenId = row.infoShown ? "" : row.modelData.id
-                }
-                // Muted on purpose: local commits are information (a fork, a held fix),
-                // not a problem -- the state pill beside it carries any urgency.
-                Rectangle {
-                    id: localPill
-                    readonly property string label: Model.localTag(row.modelData)
-                    visible: label !== "" && !row.busy
-                    anchors.right: pillBox.left
-                    anchors.rightMargin: 6
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: localPillText.implicitWidth + 12
-                    implicitHeight: 18
-                    radius: 9
-                    color: "transparent"
-                    border.color: Util.alpha(root.ink, 0.3)
-                    Text {
-                        id: localPillText
-                        anchors.centerIn: parent
-                        text: localPill.label
-                        color: Util.alpha(root.ink, 0.62)
-                        font.family: Style.font.family
-                        font.pixelSize: 9
-                        font.bold: true
-                        textFormat: Text.PlainText
-                    }
-                }
-                Rectangle {
-                    id: pillBox
-                    anchors.right: actionsRow.left
-                    anchors.rightMargin: 8
-                    anchors.verticalCenter: parent.verticalCenter
-                    implicitWidth: pillText.implicitWidth + 12
-                    implicitHeight: 18
-                    radius: 9
-                    color: Util.alpha(row.accentNow, 0.18)
-                    border.color: row.accentNow
-                    Text {
-                        id: pillText
-                        anchors.centerIn: parent
-                        text: row.busy ? "WORKING" : Model.pillLabel(row.modelData)
-                        color: row.accentNow
-                        font.family: Style.font.family
-                        font.pixelSize: 9
-                        font.bold: true
-                        textFormat: Text.PlainText
-                    }
                 }
                 Row {
                     id: actionsRow
@@ -1226,25 +1310,30 @@ Panel {
         readonly property bool confirming: root.installConfirmId === drow.modelData.id
         readonly property bool outputShown: root.detailOpenId === drow.modelData.id && root.detailMode === "output"
         readonly property color pillColor: drow.isInstalled || drow.modelData.verification === "verified" && drow.modelData.installable
-                                           ? Commons.Color.accent : Util.alpha(root.ink, 0.45)
-        height: dcontent.implicitHeight + 12
-        radius: 10
-        color: dMouse.containsMouse ? Style.hoverFill : Style.normalFill
-        border.color: Style.normalBorderColor
+                                           ? root.paletteColor("green", Commons.Color.accent) : Util.alpha(root.ink, 0.45)
+        height: dcontent.implicitHeight + 20
+        radius: 8
+        color: dMouse.containsMouse ? Style.hoverFill : "transparent"
 
         MouseArea { id: dMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
 
         Rectangle {
-            width: 4
-            height: parent.height
-            radius: 2
-            color: drow.isInstalled ? Commons.Color.accent : Util.alpha(root.ink, 0.12)
+            anchors.bottom: parent.bottom
+            anchors.left: parent.left; anchors.right: parent.right
+            anchors.leftMargin: 8; anchors.rightMargin: 8
+            height: 1
+            color: Style.normalBorderColor
+        }
+
+        Tile {
+            x: 8; y: 12
+            name: drow.modelData.name
         }
 
         Column {
             id: dcontent
-            width: parent.width - 28
-            x: 16; y: 6
+            width: parent.width - 60
+            x: 52; y: 10
             spacing: 6
 
             Item {
@@ -1289,8 +1378,7 @@ Panel {
                     implicitWidth: dPillText.implicitWidth + 12
                     implicitHeight: 18
                     radius: 9
-                    color: Util.alpha(drow.pillColor, 0.18)
-                    border.color: drow.pillColor
+                    color: Util.alpha(drow.pillColor, 0.16)
                     Text {
                         id: dPillText
                         anchors.centerIn: parent
@@ -1597,7 +1685,7 @@ Panel {
                             text: root.view === "discover"
                                   ? (root.catalogPlugins.length > 0 ? root.catalogPlugins.length + " in the catalog · " + Model.relativeAge(root.catalog.ts, root.now)
                                                                     : "The official plugin catalog")
-                                  : root.health.total > 0 ? (root.health.done + " of " + root.health.total + " current") : "Third-party plugins and apps"
+                                  : root.items.length > 0 ? Model.installedSummary(root.items) : "Third-party plugins and apps"
                             font.pixelSize: Style.font.caption
                             elide: Text.ElideRight
                         }
@@ -1671,7 +1759,7 @@ Panel {
                         width: parent.width
                         height: Math.min(contentHeight, Style.space(420))
                         clip: true
-                        spacing: 8
+                        spacing: 2
                         boundsBehavior: Flickable.StopAtBounds
                         model: root.view === "discover" ? root.discoverResults : []
                         delegate: DiscoverRow {}
@@ -1700,7 +1788,7 @@ Panel {
                         Column {
                             width: parent.width
                             visible: root.grouped.plugins.length > 0
-                            spacing: 8
+                            spacing: 2
                             Item {
                                 width: parent.width
                                 height: pluginsLabel.implicitHeight
@@ -1719,7 +1807,7 @@ Panel {
                         Column {
                             width: parent.width
                             visible: root.grouped.disabled.length > 0
-                            spacing: 8
+                            spacing: 2
                             Item {
                                 width: parent.width
                                 height: disabledLabel.implicitHeight + 4
@@ -1817,7 +1905,7 @@ Panel {
                         Column {
                             width: parent.width
                             visible: root.grouped.apps.length > 0 || root.addAppFormOpen
-                            spacing: 8
+                            spacing: 2
                             Label { text: "APPS"; font.pixelSize: Style.font.caption; font.letterSpacing: 1.5 }
                             Repeater {
                                 model: root.grouped.apps

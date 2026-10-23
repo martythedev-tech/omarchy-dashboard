@@ -341,4 +341,15 @@ assert.equal(ctx.historyLine({name: 'Weather', action: 'install', ok: true, toVe
 assert.equal(ctx.historyMark({action: 'install', ok: true}), '+');
 assert.equal(ctx.isJobKind('install'), true);
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover all pass.');
+// Row tiles and the Installed header line.
+assert.equal(ctx.tileLetter('Omarchy Doctor'), 'D', 'a leading Omarchy is skipped');
+assert.equal(ctx.tileLetter('Omarchy'), 'O', 'unless it is the whole name');
+assert.equal(ctx.tileLetter('radio atlas'), 'R');
+assert.equal(ctx.tileLetter(''), '?');
+assert.equal(ctx.tileIndex('Pulse', 7), ctx.tileIndex('Pulse', 7), 'stable');
+assert.ok(ctx.tileIndex('Pulse', 7) >= 0 && ctx.tileIndex('Pulse', 7) < 7);
+assert.equal(ctx.installedSummary([{kind: 'plugin', updateState: 'up-to-date'}, {kind: 'plugin', enabled: false}, {kind: 'app', updateState: 'up-to-date'}]),
+             'All current · 2 plugins · 1 app');
+assert.equal(ctx.installedSummary([{kind: 'plugin', updateState: 'behind', versionChange: true}]), '1 update waiting · 1 plugin');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles all pass.');

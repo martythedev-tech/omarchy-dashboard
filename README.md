@@ -81,7 +81,7 @@ bottom of it, then pick what kind it is.
 
 ### When does the Update button appear?
 
-Only when an update is actually waiting. A current app shows CURRENT and no button -- there
+Only when an update is actually waiting. A current app shows no pill and no button -- there
 is nothing to run. When a new version lands, the next check (every few hours, and whenever
 the panel opens) turns the row to UPDATE (BEHIND for a source repo), adds it to the bar badge, sends a notification
 with an **Update** button, and the row gets its own button. To update the system at any
@@ -153,6 +153,12 @@ Rows sort by what needs you: a stuck git operation or local changes clashing wit
 update first, then anything one click would update, then sources that could not
 be reached, then the rest (held items with the rest) -- alphabetical within each.
 
+Each row starts with a tile: the plugin's letter on a color taken from your theme's palette
+(a leading "Omarchy" is skipped, so Omarchy Doctor is **D**), faded when the plugin is off,
+with a dot on its corner when the row wants something -- yellow for an update, red for a
+problem. Beside it: the name, its state pill, the version, and one line of description (the
+plugin's `manifest.json`, or the package's own description for an app).
+
 A row itself carries only its state pill, its on/off switch (plugins) and at most one
 button -- **Update** (**Update system…** / **Update…** for a package app) when there is
 one, **Unhold** when held. Click the row's name to expand it: its full status, the branch
@@ -174,11 +180,10 @@ catch: a plugin that changes code without bumping its version is quiet too.
 **Update all** ends with a one-line summary ("2 updated, 1 failed (Flea).") and
 leaves the first failure's output open.
 
-The state pill:
+The state pill, next to the name -- none at all when nothing is waiting:
 
-- **CURRENT**: nothing waiting.
-- **BEHIND N**: N upstream commits would come in; **Update** brings them.
-- **DIRTY** / **DIVERGED**: local edits or commits clash with the update; the expanded row
+- **BEHIND N** (yellow): N upstream commits would come in; **Update** brings them.
+- **DIRTY** / **DIVERGED** (red): local edits or commits clash with the update; the expanded row
   names the files. Update yourself.
 - **GIT**: a rebase, merge, cherry-pick or bisect is half done in the checkout. Finish or
   abort it.
@@ -196,7 +201,7 @@ The state pill:
 Beside it, in a muted outline:
 
 - **+N LOCAL**: the checkout carries N commits upstream does not have -- a fork you
-  maintain, or a local fix you are holding. Shown next to CURRENT or BEHIND so it is not
+  maintain, or a local fix you are holding. Shown on a current row too, so it is not
   mistaken for an untouched install.
 - **EDITED**: the checkout has uncommitted edits; an update carries them over (see Plugins
   with local work above).
