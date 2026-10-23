@@ -45,6 +45,7 @@ update command runs (pull_upstream), and is checked again afterwards.
 """
 import argparse
 import contextlib
+import fcntl
 import hashlib
 import io
 import json
@@ -59,6 +60,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SELF_ID = 'martythedev-tech.dashboard'
+BINDINGS_PATH = Path.home() / '.config/hypr/bindings.lua'
 PLUGINS_DIR = Path.home() / '.config/omarchy/plugins'
 STATE = Path(os.environ.get('XDG_STATE_HOME') or str(Path.home() / '.local/state')) / 'omarchy/plugins' / SELF_ID
 STATUS_PATH = STATE / 'status.json'
@@ -991,6 +993,7 @@ def check_plugin(p):
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
         'description': manifest_description(pid),
+        'kinds': [k for k in (p.get('kinds') or []) if isinstance(k, str)],
         'version': version, 'upstreamVersion': incoming,
         'versionChange': version_change(version, incoming), 'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
@@ -1311,10 +1314,13 @@ def check_all():
                 item['market'] = market_status(item, index)
     holds = load_holds()
     history = load_history()
+    shortcuts = read_shortcuts()
     now = time.time()
     display_names = {i['id']: i.get('name') for i in items}
     for item in items:
         item['held'] = item['id'] in holds
+        if item.get('kind') == 'plugin':
+            item['shortcut'] = shortcuts.get(item['id'], '')
         item['holdReason'] = holds.get(item['id'], {}).get('reason', '')
         candidate = rollback_candidate(item['id'], history, now) if item.get('kind') == 'plugin' else None
         item['rollback'] = ({'to': candidate['before'][:7], 'toVersion': candidate.get('fromVersion', ''),
@@ -1858,6 +1864,10 @@ def cmd_remove(args):
     holds = load_holds()
     if holds.pop(args.id, None) is not None:
         save_holds(holds)
+    if ok and args.id in read_shortcuts():
+        result = set_shortcut(args.id, '', '')
+        if not result['ok']:
+            messages.append('Its keyboard shortcut is still in bindings.lua: ' + result['message'])
     append_history({
         'ts': time.time(), 'id': args.id, 'name': plan['name'], 'kind': 'plugin', 'action': 'remove',
         'ok': ok, 'before': '', 'after': '', 'fromVersion': '', 'toVersion': '', 'unitsInstalled': [],
@@ -2538,6 +2548,163 @@ def cmd_pick_folder(args):
     print(json.dumps({'ok': fields is not None, 'fields': fields or {'repoDir': path}, 'notes': notes}))
 
 
+# Per-plugin keyboard shortcuts: a key combination that opens a plugin's popup, written to
+# Hyprland's bindings.lua as a marked block the Dashboard owns (the way `flea --default`
+# writes its own), so it can be changed or removed whole without touching anything else.
+SHORTCUT_MODS = {'SUPER': 64, 'CTRL': 4, 'ALT': 8, 'SHIFT': 1}
+SHORTCUT_KEY = re.compile(r'[A-Z0-9]|F(?:[1-9]|1[0-2])\Z')
+SHORTCUT_KINDS = ('bar-widget', 'panel', 'overlay')   # what `omarchy-shell shell toggle` opens
+_SHORTCUT_BLOCK = re.compile(r'\n?^-- plugin-dashboard shortcut: (?P<id>\S+) begin\.[^\n]*\n'
+                             r'(?P<body>.*?)^-- plugin-dashboard shortcut: (?P=id) end\n?', re.M | re.S)
+
+
+def normalize_combo(value):
+    """("SUPER + ALT + P", modmask, "P") for a combination, or ValueError saying why not.
+    One key, at least one of Super/Ctrl/Alt (Shift alone is typing), in a fixed order."""
+    parts = [p.strip().upper().replace('CONTROL', 'CTRL').replace('META', 'SUPER')
+             for p in str(value or '').split('+') if p.strip()]
+    mods = [p for p in parts if p in SHORTCUT_MODS]
+    keys = [p for p in parts if p not in SHORTCUT_MODS]
+    if len(keys) != 1 or len(set(parts)) != len(parts) or not SHORTCUT_KEY.fullmatch(keys[0]):
+        raise ValueError('Use a letter, a digit or F1-F12 with modifiers.')
+    if not set(mods) & {'SUPER', 'CTRL', 'ALT'}:
+        raise ValueError('Include Super, Ctrl or Alt.')
+    ordered = [m for m in SHORTCUT_MODS if m in mods]
+    return ' + '.join(ordered + keys), sum(SHORTCUT_MODS[m] for m in ordered), keys[0]
+
+
+def shortcut_description(name):
+    return f'{name} (Plugin Dashboard)'
+
+
+def shortcut_block(plugin_id, name, combo):
+    def lua(text):
+        return '"' + text.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    return (f'-- plugin-dashboard shortcut: {plugin_id} begin. Written by the Plugin Dashboard; '
+            f'removing the shortcut there removes the block whole.\n'
+            f'o.bind({lua(combo)}, {lua(shortcut_description(name))}, {lua("omarchy-shell shell toggle " + plugin_id)})\n'
+            f'-- plugin-dashboard shortcut: {plugin_id} end\n')
+
+
+def read_shortcuts(raw=None):
+    """{plugin id: combination} for the Dashboard's own blocks in bindings.lua."""
+    if raw is None:
+        try:
+            raw = BINDINGS_PATH.read_text()
+        except OSError:
+            return {}
+    found = {}
+    for m in _SHORTCUT_BLOCK.finditer(raw):
+        bind = re.search(r'o\.bind\("([^"\n]+)"', m.group('body'))
+        if bind:
+            found[m.group('id')] = bind.group(1)
+    return found
+
+
+def shortcut_conflict(binds, combo, own_description):
+    """Why this combination is not free, or ''. Compares with Hyprland's live bindings: the
+    same modifiers (Caps and Num Lock aside) and key. A binding by keycode ("code:10")
+    lists no key at all, so for a digit -- Omarchy binds digits that way -- whether it is
+    taken cannot be told, and that is said instead of guessed."""
+    _, mask, key = normalize_combo(combo)
+    for b in binds if isinstance(binds, list) else []:
+        if not isinstance(b, dict) or b.get('submap') or b.get('mouse'):
+            continue
+        if int(b.get('modmask') or 0) & ~(2 | 16) != mask:
+            continue
+        bound = str(b.get('key') or '').upper()
+        what = b.get('description') or 'another binding'
+        if bound == key:
+            if b.get('description') == own_description:
+                continue
+            return f'{combo} is already used for {what}.'
+        if (not bound or b.get('catch_all')) and not key.isalpha() and not key.startswith('F'):
+            return f'Cannot tell whether {combo} is free ({what} is bound by key position). Try a letter or an F key.'
+    return ''
+
+
+def _bindings_file():
+    """(text, mode) of bindings.lua, which must be the user's own regular file."""
+    st = BINDINGS_PATH.lstat()
+    if not (st.st_mode & 0o170000 == 0o100000) or st.st_uid != os.getuid() or st.st_size > 1024 * 1024:
+        raise ValueError(f'{BINDINGS_PATH} is not a regular file of yours.')
+    return BINDINGS_PATH.read_text(), st.st_mode & 0o7777
+
+
+def _write_bindings(text, mode):
+    tmp = BINDINGS_PATH.with_name('.' + BINDINGS_PATH.name + '.dashboard-tmp')
+    tmp.write_text(text)
+    os.chmod(tmp, mode)
+    tmp.replace(BINDINGS_PATH)
+
+
+def set_shortcut(plugin_id, name, combo):
+    """Writes (combo) or removes ('') the plugin's block in bindings.lua and reloads
+    Hyprland. Refuses a taken combination, and refuses to write at all while Hyprland
+    already reports config errors (a reload would not prove anything). If the reload
+    reports errors afterwards, the old file goes back."""
+    if not BINDINGS_PATH.exists():
+        return {'ok': False, 'message': f'No {BINDINGS_PATH}: shortcuts need Omarchy\'s Lua bindings file.'}
+    if combo:
+        try:
+            combo = normalize_combo(combo)[0]
+        except ValueError as e:
+            return {'ok': False, 'message': str(e)}
+    STATE.mkdir(parents=True, exist_ok=True)
+    with open(STATE / 'bindings.lock', 'w') as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return {'ok': False, 'message': 'Another shortcut change is being saved.'}
+        try:
+            raw, mode = _bindings_file()
+        except (OSError, ValueError) as e:
+            return {'ok': False, 'message': str(e)}
+        base = _SHORTCUT_BLOCK.sub(lambda m: '' if m.group('id') == plugin_id else m.group(0), raw)
+        if combo:
+            rc, out, _ = run(['hyprctl', '-j', 'binds'])
+            try:
+                binds = json.loads(out) if rc == 0 else None
+            except ValueError:
+                binds = None
+            if binds is None:
+                return {'ok': False, 'message': 'Could not read Hyprland\'s current bindings.'}
+            why = shortcut_conflict(binds, combo, shortcut_description(name))
+            if why:
+                return {'ok': False, 'message': why}
+        rc, errors, _ = run(['hyprctl', 'configerrors'])
+        if rc == 0 and errors.strip():
+            return {'ok': False, 'message': 'Hyprland already reports config errors; fix those first: '
+                                            + errors.strip().splitlines()[0]}
+        updated = (base.rstrip('\n') + '\n\n' + shortcut_block(plugin_id, name, combo)) if combo else base
+        if updated == raw:
+            return {'ok': True, 'message': 'Shortcut unchanged.'}
+        _write_bindings(updated, mode)
+        run(['hyprctl', 'reload'])
+        rc, errors, _ = run(['hyprctl', 'configerrors'])
+        if rc == 0 and errors.strip():
+            _write_bindings(raw, mode)
+            run(['hyprctl', 'reload'])
+            return {'ok': False, 'message': 'Hyprland rejected it, so bindings.lua was put back: '
+                                            + errors.strip().splitlines()[0]}
+    return {'ok': True, 'message': f'{combo} opens {name}.' if combo else f'Removed the shortcut for {name}.'}
+
+
+def cmd_shortcut(args):
+    plugin = next((p for p in discover_plugins() if p['id'] == args.id), None)
+    if plugin is None:
+        print(json.dumps({'ok': False, 'message': 'Not an installed third-party plugin.'}))
+        return
+    name = re.sub(r'[\x00-\x1f"\\]', '', str(plugin.get('name') or args.id))[:80] or args.id
+    if args.combo and not set(plugin.get('kinds') or []) & set(SHORTCUT_KINDS):
+        print(json.dumps({'ok': False, 'message': f'{name} has no popup or panel for a shortcut to open.'}))
+        return
+    result = set_shortcut(args.id, name, args.combo)
+    print(json.dumps(result))
+    if result['ok']:
+        check_all()
+
+
 def shell_cache_dir():
     return Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'quickshell'
 
@@ -2624,6 +2791,9 @@ def main():
     sub.add_parser('cleanup').add_argument('id')
     sub.add_parser('run-job').add_argument('job_id')
     sub.add_parser('restart-shell').add_argument('--now', action='store_true')
+    p_shortcut = sub.add_parser('shortcut')
+    p_shortcut.add_argument('id')
+    p_shortcut.add_argument('combo', nargs='?', default='')
     args = parser.parse_args()
     handlers = {
         'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
@@ -2633,7 +2803,7 @@ def main():
         'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup, 'catalog': cmd_catalog,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
         'inspect-package': cmd_inspect_package, 'terminal-update': cmd_terminal_update,
-        'restart-shell': cmd_restart_shell,
+        'restart-shell': cmd_restart_shell, 'shortcut': cmd_shortcut,
         'open-terminal-update': lambda a: print(json.dumps({'ok': open_terminal_update(a.ids)})),
     }
     handlers[args.command](args)

@@ -311,6 +311,7 @@ Panel {
 
     function showView(which) {
         root.view = which
+        if (which === "bar") root.refreshBar()
         if (which !== "discover") return
         root.catalogWanted = true
         if (!Model.statusFresh(root.catalog.ts, Date.now() / 1000, 6 * 3600)) root.runCatalog(false)
@@ -436,6 +437,7 @@ Panel {
         function hide(): void { root.close() }
         function toggle(): void { root.toggle() }
         function discover(): void { root.showView("discover"); root.open() }
+        function bar(): void { root.showView("bar"); root.open() }
         function check(): string { root.runCheck(true); return "ok" }
         function count(): string { return String(root.updatable) }
         function update(id: string): string {
@@ -531,6 +533,107 @@ Panel {
                 catalogFile.reload()
             }
         }
+    }
+
+    // The Bar tab: the shell's own layout (listShellConfig) and plugin names (listPlugins),
+    // and each move through `omarchy-shell shell moveBarWidget`, the call `omarchy plugin`
+    // uses -- the shell writes shell.json and redraws the bar itself.
+    property var barLayout: ({})
+    property var barNames: ({})
+    property string barMovedId: ""
+    readonly property var barSectionList: Model.barSections(root.barLayout)
+    Process {
+        id: barConfigProc
+        command: ["omarchy-shell", "shell", "listShellConfig"]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                try { root.barLayout = (JSON.parse(text).bar || {}).layout || {} } catch (e) { root.actionStatus = "Could not read the bar layout." }
+            }
+        }
+    }
+    Process {
+        id: barPluginsProc
+        command: ["omarchy-shell", "shell", "listPlugins"]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var names = {}
+                try {
+                    var list = JSON.parse(text)
+                    for (var i = 0; i < list.length; i++) names[list[i].id] = { name: list[i].name || list[i].id, own: !!list[i].firstParty }
+                } catch (e) {}
+                root.barNames = names
+            }
+        }
+    }
+    Process {
+        id: barMoveProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var reply = text.trim()
+                if (reply !== "ok") root.actionStatus = "Not moved: " + (reply || "the shell did not answer.")
+                else root.actionStatus = ""
+                barConfigProc.running = true
+            }
+        }
+    }
+    // A change made elsewhere (`omarchy plugin enable`, an edit to shell.json) shows here too.
+    FileView {
+        path: root.view === "bar" ? Quickshell.env("HOME") + "/.config/omarchy/shell.json" : ""
+        watchChanges: true
+        printErrors: false
+        onFileChanged: { reload(); if (!barMoveProc.running) root.refreshBar() }
+    }
+    function refreshBar() {
+        if (!barConfigProc.running) barConfigProc.running = true
+        if (!barPluginsProc.running) barPluginsProc.running = true
+    }
+    function moveBarWidget(section, index, dir) {
+        if (barMoveProc.running || barConfigProc.running) return
+        var entry = (root.barLayout[section] || [])[index]
+        var place = Model.barMove(root.barLayout, root.barSectionList, section, index, dir)
+        if (!entry || !place) return
+        root.barMovedId = entry.id
+        barMoveProc.command = ["omarchy-shell", "shell", "moveBarWidget", entry.id, JSON.stringify(place)]
+        barMoveProc.running = true
+    }
+    function barName(id) {
+        return root.barNames[id] ? root.barNames[id].name : id
+    }
+
+    // Keyboard shortcuts: the row whose capture box is open, what it says, and the save.
+    property string shortcutEditId: ""
+    property string shortcutMessage: ""
+    property bool shortcutError: false
+    Timer { id: shortcutCloseTimer; interval: 1600; onTriggered: root.shortcutEditId = "" }
+    Process {
+        id: shortcutProc
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var r = null
+                try { r = JSON.parse(text) } catch (e) {}
+                root.shortcutError = !(r && r.ok)
+                root.shortcutMessage = (r && r.message) || "Could not save the shortcut."
+                // dashboard.py rechecked on success; status.json brings the row up to date.
+                if (r && r.ok) shortcutCloseTimer.restart()
+            }
+        }
+    }
+    function editShortcut(id) {
+        shortcutCloseTimer.stop()
+        root.shortcutEditId = root.shortcutEditId === id ? "" : id
+        root.shortcutMessage = ""
+        root.shortcutError = false
+    }
+    function saveShortcut(id, combo) {
+        if (shortcutProc.running) return
+        root.shortcutError = false
+        root.shortcutMessage = combo ? "Saving " + combo + "…" : "Removing…"
+        shortcutProc.command = ["python3", root.helper, "shortcut", id].concat(combo ? [combo] : [])
+        shortcutProc.running = true
     }
 
     // Restart shell: dashboard.py clears the compiled-QML cache and restarts the shell from
@@ -1251,6 +1354,12 @@ Panel {
                         onClicked: Qt.openUrlExternally(row.info.webUrl)
                     }
                     SmallButton {
+                        text: row.modelData.shortcut ? "Shortcut: " + row.modelData.shortcut : "Shortcut…"
+                        accent: Commons.Color.muted
+                        visible: Model.canShortcut(row.modelData)
+                        onClicked: root.editShortcut(row.modelData.id)
+                    }
+                    SmallButton {
                         text: "Marketplace ↗"
                         visible: !!(row.modelData.market && row.modelData.market.url)
                         accent: Commons.Color.muted
@@ -1286,6 +1395,99 @@ Panel {
                         onClicked: row.modelData.kind === "app"
                                    ? row.confirmThen("remove", function() { root.runAction("remove-app", row.modelData.id) })
                                    : root.showRemovePlan(row.modelData.id)
+                    }
+                }
+            }
+
+            // The shortcut recorder: focus moves here and the next combination pressed is
+            // saved. A combination Hyprland already owns never reaches the panel, hence
+            // the hint.
+            Rectangle {
+                id: shortcutBox
+                readonly property bool shown: root.shortcutEditId === row.modelData.id
+                property string held: ""
+                visible: shown
+                width: parent.width
+                height: visible ? shortcutCol.implicitHeight + 20 : 0
+                radius: 8
+                color: Style.normalFill
+                border.color: shortcutCatcher.activeFocus ? Commons.Color.accent : Style.normalBorderColor
+                onShownChanged: {
+                    held = ""
+                    if (!shown) return
+                    shortcutCatcher.forceActiveFocus()
+                    revealTimer.restart()
+                }
+                // Opened at the bottom of a long row: once laid out, scroll the list so all
+                // of it shows.
+                Timer {
+                    id: revealTimer
+                    interval: 60
+                    onTriggered: {
+                        var y = shortcutBox.mapToItem(listScroll.contentItem, 0, 0).y
+                        var bottom = y + shortcutBox.height + 8 - listScroll.height
+                        if (bottom > listScroll.contentY)
+                            listScroll.contentY = Math.min(bottom, Math.max(0, listScroll.contentHeight - listScroll.height))
+                    }
+                }
+                Item {
+                    id: shortcutCatcher
+                    focus: shortcutBox.shown
+                    Keys.onPressed: function(event) {
+                        event.accepted = true
+                        if (event.key === Qt.Key_Escape) { root.shortcutEditId = ""; return }
+                        if (shortcutProc.running) return
+                        var r = Model.comboFromKey(event.key, event.modifiers)
+                        if (r.held !== undefined) { shortcutBox.held = r.held; return }
+                        shortcutBox.held = ""
+                        if (r.error) { root.shortcutError = true; root.shortcutMessage = r.error; return }
+                        root.saveShortcut(row.modelData.id, r.combo)
+                    }
+                    Keys.onReleased: function(event) { if (!event.modifiers) shortcutBox.held = "" }
+                }
+                MouseArea { anchors.fill: parent; onClicked: shortcutCatcher.forceActiveFocus() }
+                Column {
+                    id: shortcutCol
+                    x: 10; y: 10
+                    width: parent.width - 20
+                    spacing: 8
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Style.font.caption
+                        text: "Press the keys that should open " + row.modelData.name + ", e.g. Super + Alt + P. Esc cancels."
+                    }
+                    Text {
+                        width: parent.width
+                        horizontalAlignment: Text.AlignHCenter
+                        text: shortcutBox.held ? shortcutBox.held + " + …" : (row.modelData.shortcut || "No shortcut yet")
+                        color: shortcutBox.held || row.modelData.shortcut ? root.ink : Util.alpha(root.ink, 0.45)
+                        font.family: Style.font.family
+                        font.pixelSize: Style.font.body
+                        font.bold: true
+                    }
+                    Label {
+                        width: parent.width
+                        wrapMode: Text.WordWrap
+                        font.pixelSize: Style.font.caption
+                        color: root.shortcutError ? Commons.Color.urgent : Util.alpha(root.ink, 0.8)
+                        text: root.shortcutMessage
+                              || "If nothing happens when you press them, those keys already do something else."
+                    }
+                    Row {
+                        spacing: 6
+                        SmallButton {
+                            text: "Remove shortcut"
+                            accent: Commons.Color.urgent
+                            visible: !!row.modelData.shortcut
+                            enabled: !shortcutProc.running
+                            onClicked: root.saveShortcut(row.modelData.id, "")
+                        }
+                        SmallButton {
+                            text: "Done"
+                            accent: Commons.Color.muted
+                            onClicked: root.shortcutEditId = ""
+                        }
                     }
                 }
             }
@@ -1761,11 +1963,12 @@ Panel {
                             onClicked: root.runUpdateAll()
                         }
                         SmallButton {
-                            readonly property bool running: root.view === "discover" ? catalogProc.running : checkProc.running
+                            readonly property bool running: root.view === "discover" ? catalogProc.running
+                                                          : root.view === "bar" ? barConfigProc.running : checkProc.running
                             text: running ? "…" : "Refresh"
                             enabled: !running
                             anchors.verticalCenter: parent.verticalCenter
-                            onClicked: root.view === "discover" ? root.runCatalog(true) : root.runCheck(true)
+                            onClicked: root.view === "discover" ? root.runCatalog(true) : root.view === "bar" ? root.refreshBar() : root.runCheck(true)
                         }
                     }
                     Column {
@@ -1778,12 +1981,13 @@ Panel {
                         spacing: 3
                         Heading {
                             width: parent.width
-                            text: root.view === "discover" ? "Discover" : "Plugins"; font.pixelSize: Style.font.heading
+                            text: root.view === "discover" ? "Discover" : root.view === "bar" ? "Bar" : "Plugins"; font.pixelSize: Style.font.heading
                             elide: Text.ElideRight
                         }
                         Label {
                             width: parent.width
-                            text: root.view === "discover"
+                            text: root.view === "bar" ? "The order of the widgets on your bar"
+                                  : root.view === "discover"
                                   ? (root.catalogPlugins.length > 0 ? root.catalogPlugins.length + " in the catalog · " + Model.relativeAge(root.catalog.ts, root.now)
                                                                     : "The official plugin catalog")
                                   : root.items.length > 0 ? Model.installedSummary(root.items) : "Third-party plugins and apps"
@@ -1808,6 +2012,133 @@ Panel {
                         text: "Discover"
                         accent: root.view === "discover" ? Commons.Color.accent : Commons.Color.muted
                         onClicked: root.showView("discover")
+                    }
+                    SmallButton {
+                        text: "Bar"
+                        accent: root.view === "bar" ? Commons.Color.accent : Commons.Color.muted
+                        onClicked: root.showView("bar")
+                    }
+                }
+
+                // Bar: every widget on the bar, section by section, each with a step up or
+                // down and a step into the neighbouring section. The bar redraws as you go.
+                Flickable {
+                    id: barScroll
+                    visible: root.view === "bar"
+                    width: parent.width
+                    height: Math.min(barColumn.implicitHeight, Style.space(420))
+                    contentWidth: width
+                    contentHeight: barColumn.implicitHeight
+                    clip: true
+                    boundsBehavior: Flickable.StopAtBounds
+                    interactive: contentHeight > height
+                    ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                    Column {
+                        id: barColumn
+                        width: barScroll.width - 8
+                        spacing: 10
+                        Repeater {
+                            model: root.view === "bar" ? root.barSectionList : []
+                            Column {
+                                id: barSection
+                                required property var modelData
+                                readonly property var entries: root.barLayout[modelData] || []
+                                width: parent ? parent.width : 0
+                                spacing: 2
+                                Label {
+                                    text: Model.barSectionLabel(barSection.modelData) + "  " + barSection.entries.length
+                                    font.pixelSize: Style.font.caption
+                                    font.letterSpacing: 1.5
+                                }
+                                Label {
+                                    visible: barSection.entries.length === 0
+                                    text: "Empty"
+                                    font.pixelSize: Style.font.caption
+                                    color: Util.alpha(root.ink, 0.35)
+                                }
+                                Repeater {
+                                    model: barSection.entries
+                                    Rectangle {
+                                        id: barRow
+                                        required property var modelData
+                                        required property int index
+                                        readonly property bool moved: root.barMovedId === modelData.id
+                                        width: barSection.width
+                                        height: 30
+                                        radius: 6
+                                        color: barHover.hovered ? Style.hoverFill : (barRow.moved ? Util.alpha(Commons.Color.accent, 0.08) : "transparent")
+                                        // A handler, not a MouseArea: it stays hovered while the pointer is on
+                                        // an arrow, so the arrows do not vanish from under it.
+                                        HoverHandler { id: barHover }
+                                        Row {
+                                            anchors.left: parent.left
+                                            anchors.leftMargin: 8
+                                            anchors.right: barArrows.left
+                                            anchors.rightMargin: 8
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            spacing: 8
+                                            Text {
+                                                id: barRowName
+                                                width: Math.min(implicitWidth, parent.width - barRowTag.width - 8)
+                                                elide: Text.ElideRight
+                                                text: root.barName(barRow.modelData.id)
+                                                color: barRow.moved ? Commons.Color.accent : root.ink
+                                                font.family: Style.font.family
+                                                font.pixelSize: Style.font.bodySmall
+                                            }
+                                            // Third-party widgets say so: the ones this Dashboard looks after.
+                                            Text {
+                                                id: barRowTag
+                                                anchors.verticalCenter: barRowName.verticalCenter
+                                                visible: !(root.barNames[barRow.modelData.id] && root.barNames[barRow.modelData.id].own)
+                                                text: "plugin"
+                                                color: Util.alpha(root.ink, 0.4)
+                                                font.family: Style.font.family
+                                                font.pixelSize: Style.font.caption
+                                            }
+                                        }
+                                        // Shown on the row under the pointer (and the one just moved, so
+                                        // repeated steps need no re-aim); the list stays quiet otherwise.
+                                        Row {
+                                            id: barArrows
+                                            visible: barHover.hovered || barRow.moved
+                                            anchors.right: parent.right
+                                            anchors.rightMargin: 4
+                                            anchors.verticalCenter: parent.verticalCenter
+                                            spacing: 4
+                                            Repeater {
+                                                model: [["up", "↑"], ["down", "↓"], ["left", "←"], ["right", "→"]]
+                                                Rectangle {
+                                                    id: arrow
+                                                    required property var modelData
+                                                    readonly property bool can: !!Model.barMove(root.barLayout, root.barSectionList,
+                                                                                                barSection.modelData, barRow.index, modelData[0])
+                                                    width: 24; height: 22; radius: 6
+                                                    color: arrowMouse.containsMouse && arrow.can ? Style.hoverFill : "transparent"
+                                                    border.color: arrow.can ? Style.normalBorderColor : "transparent"
+                                                    opacity: arrow.can ? 1 : 0.25
+                                                    Text {
+                                                        anchors.centerIn: parent
+                                                        text: arrow.modelData[1]
+                                                        color: root.ink
+                                                        font.family: Style.font.family
+                                                        font.pixelSize: Style.font.caption
+                                                    }
+                                                    MouseArea {
+                                                        id: arrowMouse
+                                                        anchors.fill: parent
+                                                        hoverEnabled: true
+                                                        enabled: arrow.can && !barMoveProc.running
+                                                        cursorShape: Qt.PointingHandCursor
+                                                        onClicked: root.moveBarWidget(barSection.modelData, barRow.index, arrow.modelData[0])
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
 

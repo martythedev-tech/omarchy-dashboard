@@ -2909,3 +2909,95 @@ class SeedAppsTests(unittest.TestCase):
                  patch.object(dash, 'APPS_PATH', apps_path), patch.object(dash, 'STATE', Path(d)):
                 dash.ensure_apps_file()
                 self.assertEqual(json.loads(apps_path.read_text()), [])
+
+
+class ShortcutTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.bindings = root / 'bindings.lua'
+        self.original = 'o.bind("SUPER + ALT + U", "Plugin Dashboard", "omarchy-shell martythedev-tech.dashboard toggle")\n'
+        self.bindings.write_text(self.original)
+        for target, value in (('BINDINGS_PATH', self.bindings), ('STATE', root / 'state')):
+            p = patch.object(dash, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        self.binds = [{'modmask': 72, 'key': 'U', 'description': 'Plugin Dashboard', 'submap': ''},
+                      {'modmask': 72, 'key': '', 'description': 'Switch to group window 1', 'submap': ''}]
+        self.config_errors = ['', '']
+        self.calls = []
+
+        def fake(args, **kw):
+            self.calls.append(list(args))
+            if args[:3] == ['hyprctl', '-j', 'binds']:
+                return (0, json.dumps(self.binds), '')
+            if args[:2] == ['hyprctl', 'configerrors']:
+                return (0, self.config_errors.pop(0) if self.config_errors else '', '')
+            return (0, '', '')
+        p = patch.object(dash, 'run', fake)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_normalize(self):
+        self.assertEqual(dash.normalize_combo('alt + super + p'), ('SUPER + ALT + P', 72, 'P'))
+        self.assertEqual(dash.normalize_combo('Control+Shift+F5')[0], 'CTRL + SHIFT + F5')
+        for bad in ('SHIFT + P', 'SUPER', 'SUPER + P + Q', 'SUPER + SUPER + P', 'SUPER + COMMA', 'SUPER + F13'):
+            with self.assertRaises(ValueError, msg=bad):
+                dash.normalize_combo(bad)
+
+    def test_adds_then_removes_its_block_leaving_the_file_as_it_was(self):
+        r = dash.set_shortcut('nixfred.pulse', 'Pulse', 'super+alt+p')
+        self.assertTrue(r['ok'], r)
+        text = self.bindings.read_text()
+        self.assertIn('o.bind("SUPER + ALT + P", "Pulse (Plugin Dashboard)", "omarchy-shell shell toggle nixfred.pulse")', text)
+        self.assertEqual(dash.read_shortcuts(), {'nixfred.pulse': 'SUPER + ALT + P'})
+        self.assertIn(['hyprctl', 'reload'], self.calls)
+        self.config_errors = ['', '']
+        self.assertTrue(dash.set_shortcut('nixfred.pulse', 'Pulse', '')['ok'])
+        self.assertEqual(self.bindings.read_text(), self.original)
+
+    def test_changing_a_shortcut_replaces_its_block_and_ignores_its_own_binding(self):
+        dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + P')
+        self.binds.append({'modmask': 72, 'key': 'P', 'description': 'Pulse (Plugin Dashboard)', 'submap': ''})
+        self.config_errors = ['', '']
+        self.assertTrue(dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + P')['ok'])
+        self.config_errors = ['', '']
+        self.assertTrue(dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + O')['ok'])
+        self.assertEqual(dash.read_shortcuts(), {'nixfred.pulse': 'SUPER + ALT + O'})
+        self.assertEqual(self.bindings.read_text().count('plugin-dashboard shortcut: nixfred.pulse begin'), 1)
+
+    def test_a_taken_combination_is_refused_and_nothing_is_written(self):
+        r = dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + U')
+        self.assertEqual((r['ok'], r['message']), (False, 'SUPER + ALT + U is already used for Plugin Dashboard.'))
+        r = dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + 1')
+        self.assertFalse(r['ok'])
+        self.assertIn('Cannot tell', r['message'])
+        self.assertEqual(self.bindings.read_text(), self.original)
+
+    def test_lock_and_numlock_do_not_hide_a_conflict(self):
+        self.binds = [{'modmask': 72 | 2 | 16, 'key': 'u', 'description': 'X', 'submap': ''}]
+        self.assertIn('already used for X', dash.shortcut_conflict(self.binds, 'SUPER + ALT + U', 'own'))
+        self.binds = [{'modmask': 72, 'key': 'U', 'description': 'X', 'submap': 'resize'}]
+        self.assertEqual(dash.shortcut_conflict(self.binds, 'SUPER + ALT + U', 'own'), '')
+
+    def test_existing_config_errors_mean_no_write(self):
+        self.config_errors = ['error: something else\n']
+        r = dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + P')
+        self.assertFalse(r['ok'])
+        self.assertEqual(self.bindings.read_text(), self.original)
+
+    def test_rejected_by_hyprland_puts_the_file_back(self):
+        self.config_errors = ['', 'error: bad bind\n', '']
+        r = dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + P')
+        self.assertFalse(r['ok'])
+        self.assertIn('put back', r['message'])
+        self.assertEqual(self.bindings.read_text(), self.original)
+
+    def test_quotes_in_a_name_cannot_break_out_of_the_lua_string(self):
+        block = dash.shortcut_block('x.y', 'A "quoted" \\ name', 'SUPER + P')
+        self.assertIn('"A \\"quoted\\" \\\\ name (Plugin Dashboard)"', block)
+
+    def test_check_carries_each_plugins_shortcut(self):
+        dash.set_shortcut('nixfred.pulse', 'Pulse', 'SUPER + ALT + P')
+        self.assertEqual(dash.read_shortcuts(self.bindings.read_text() + 'junk'), {'nixfred.pulse': 'SUPER + ALT + P'})
