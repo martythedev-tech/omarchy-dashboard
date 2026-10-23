@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "martythedev-tech.dashboard",
   "name": "Plugin Dashboard",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "author": "martythedev-tech",
   "license": "MIT",
   "description": "Lists every third-party and custom Omarchy plugin -- including itself -- plus the apps you track (installed packages or source repos you build), with enable/disable, diff preview, update-all, a Discover tab for the official plugin catalog, and a real update check against each one's actual upstream (git, package repos, AUR).",

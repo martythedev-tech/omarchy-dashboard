@@ -24,6 +24,13 @@ def setUpModule():
     # Never read the real shell log, and never wait for a reload that is not happening.
     dash.SHELL_LOG_ROOT = dash.STATE / 'no-shell'
     dash.LOAD_SETTLE_SECONDS = 0
+    # Never download the real catalog: a full check refreshes it. Tests that want one
+    # patch fetch_catalog themselves.
+    dash.fetch_catalog = _offline_catalog
+
+
+def _offline_catalog():
+    raise OSError('no network in tests')
 
 
 def tearDownModule():
@@ -361,6 +368,7 @@ class CheckAllTests(unittest.TestCase):
                               side_effect=lambda d: {'a.plugin': ('behind', 2, ''),
                                                      'b.plugin': ('up-to-date', 0, '')}[Path(d).name]), \
                  patch.object(dash, 'app_update_state', return_value=('dirty', 1, '')), \
+                 patch.object(dash, 'refresh_catalog', return_value=({}, 'offline')), \
                  patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
                 dash.PLUGINS_DIR = home / '.config/omarchy/plugins'
                 state = home / '.local/state/omarchy/plugins/martythedev-tech.dashboard'
@@ -500,6 +508,7 @@ class CheckAllConcurrencyTests(unittest.TestCase):
             with patch.object(dash, 'discover_plugins', return_value=[{'id': 'p1'}, {'id': 'p2'}, {'id': 'p3'}]), \
                  patch.object(dash, 'load_apps', return_value=[]), \
                  patch.object(dash, 'check_plugin', slow_check), \
+                 patch.object(dash, 'refresh_catalog', return_value=({}, '')), \
                  patch.object(dash, 'STATE', Path(d)), patch.object(dash, 'STATUS_PATH', Path(d) / 'status.json'):
                 status = dash.check_all()
         self.assertEqual([i['id'] for i in status['items']], ['p1', 'p2', 'p3'])
@@ -2484,6 +2493,67 @@ class CmdCatalogTests(CatalogFixture):
         saved = dash._read_json(dash.catalog_path(), {})
         self.assertEqual(saved['plugins'], [{'id': 'old'}])
         self.assertIn('no network', saved['error'])
+
+
+class CatalogVerificationTests(CatalogFixture):
+    def test_keeps_the_checked_commit_only_when_its_snapshot_was_verified(self):
+        sha = 'a' * 40
+        [p] = dash.normalize_catalog({'plugins': [catalog_entry(verificationCommit=sha.upper(),
+                                                                verificationSnapshotStatus='verified')]})
+        self.assertEqual(p['verifiedCommit'], sha)
+        [p] = dash.normalize_catalog({'plugins': [catalog_entry(verificationCommit=sha,
+                                                                verificationSnapshotStatus='unverified')]})
+        self.assertEqual(p['verifiedCommit'], '')
+        [p] = dash.normalize_catalog({'plugins': [catalog_entry(verificationCommit='not-a-sha',
+                                                                verificationSnapshotStatus='verified')]})
+        self.assertEqual(p['verifiedCommit'], '')
+
+    def test_a_cache_from_before_the_schema_is_refetched(self):
+        dash._write_json(dash.catalog_path(), {'ts': time.time(), 'plugins': [{'id': 'old'}]})
+        with patch.object(dash, 'fetch_catalog', return_value={'generatedAt': 'x', 'plugins': [{'id': 'new'}]}):
+            catalog, error = dash.refresh_catalog()
+            self.assertEqual((catalog['plugins'], error), ([{'id': 'new'}], ''))
+            self.assertEqual(dash.refresh_catalog()[0]['schema'], dash.CATALOG_SCHEMA)
+
+    def _repo(self):
+        repo = self.plugins / 'acme.weather'
+        repo.mkdir()
+        git(repo, 'init', '-q')
+        git(repo, 'config', 'user.email', 't@t'); git(repo, 'config', 'user.name', 't')
+        (repo / 'f').write_text('1'); git(repo, 'add', '.'); git(repo, 'commit', '-qm', 'one')
+        first = git(repo, 'rev-parse', 'HEAD')
+        (repo / 'f').write_text('2'); git(repo, 'commit', '-qam', 'two')
+        return repo, first, git(repo, 'rev-parse', 'HEAD')
+
+    def _index(self, checked, **over):
+        return dash.catalog_index({'plugins': [dict({'id': 'acme.weather', 'repo': 'https://github.com/acme/omarchy-weather',
+                                                      'verifiedCommit': checked}, **over)]})
+
+    def test_verified_only_at_the_checked_commit(self):
+        repo, first, second = self._repo()
+        item = {'id': 'acme.weather', 'updateState': 'up-to-date', 'info': {'path': str(repo)}}
+        self.assertEqual(dash.market_status(item, self._index(second))['installed'], 'verified')
+        status = dash.market_status(item, self._index(first))
+        self.assertEqual((status['installed'], status['sinceChecked'], status['checked']), ('unverified', 1, first[:7]))
+        self.assertEqual(dash.market_status(item, self._index(''))['installed'], 'unverified')
+
+    def test_an_update_is_judged_by_the_commit_it_brings(self):
+        repo, first, second = self._repo()
+        git(repo, 'reset', '-q', '--hard', first)
+        (repo / '.git' / 'FETCH_HEAD').write_text(second + "\t\tbranch 'main' of x\n")
+        item = {'id': 'acme.weather', 'updateState': 'behind', 'info': {'path': str(repo)}}
+        status = dash.market_status(item, self._index(second))
+        self.assertEqual((status['installed'], status['incoming']), ('unverified', 'verified'))
+        status = dash.market_status(item, self._index(first))
+        self.assertEqual((status['installed'], status['incoming']), ('verified', 'unverified'))
+
+    def test_found_by_repo_when_the_id_differs_and_none_when_unlisted(self):
+        repo, first, second = self._repo()
+        item = {'id': 'mine', 'updateState': 'up-to-date',
+                'info': {'path': str(repo), 'webUrl': 'https://github.com/Acme/omarchy-weather'}}
+        self.assertEqual(dash.market_status(item, self._index(second))['id'], 'acme.weather')
+        item['info']['webUrl'] = 'https://github.com/someone/else'
+        self.assertIsNone(dash.market_status(item, self._index(second)))
 
 
 class CmdInstallTests(CatalogFixture):

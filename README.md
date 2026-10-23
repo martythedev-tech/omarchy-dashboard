@@ -205,6 +205,33 @@ Beside it, in a muted outline:
   mistaken for an untouched install.
 - **EDITED**: the checkout has uncommitted edits; an update carries them over (see Plugins
   with local work above).
+- **✓ VERIFIED** (green) / **UNVERIFIED**: what the marketplace says about the code you
+  run -- see [Marketplace verification](#marketplace-verification). On a row with an update
+  waiting it is about the update instead: **✓ UPDATE VERIFIED** / **UPDATE UNVERIFIED**.
+  No badge for a plugin the marketplace does not list.
+
+When the name line is full, the name keeps its room: the badges show in that order (state,
+marketplace, LOCAL / EDITED) while they fit, and a marketplace badge that does not fit
+moves to the line under the description ("→ v1.5.5 · update unverified").
+
+### Marketplace verification
+
+The official catalog runs an automated security baseline on each listed plugin and
+records the exact commit it passed. The Dashboard compares that commit with yours:
+
+- **Verified** only when the commit you run is that exact commit. Uncommitted edits are
+  not covered (the expanded row says so; the row says EDITED).
+- **Unverified** for anything else: a newer upstream commit the check has not reached yet,
+  your own local commits, or a plugin whose check never passed. The expanded row's
+  **Checked** line says which, and how many commits you are past the checked one.
+- When an update is waiting, the badge judges the commit the update would bring
+  (`FETCH_HEAD`), since that is the decision in front of you.
+
+Most listed plugins move faster than the check, so UNVERIFIED is common and is not a
+warning on its own: it means nobody but you has looked at this exact code. The expanded row
+links to the plugin's marketplace page (**Marketplace ↗**). The check reuses Discover's
+cached catalog (refetched when older than 6 hours); if it cannot be read, rows show no
+badge rather than a guess. Update all does not filter on it.
 
 Checks run side by side, so a full check takes about as long as the slowest single
 fetch rather than the sum of them.
@@ -319,7 +346,9 @@ UPDATE UNVERIFIED / UNVERIFIED). Then, as a job like an update:
 
 The catalog is about 15 MB; `dashboard.py catalog` keeps a trimmed copy (~3 MB,
 `catalog.json` in the state folder) and refetches it when it is older than 6 hours or on
-**Refresh**. A failed fetch keeps the old list and says why. Installs show under Recent.
+**Refresh**. The regular check uses the same copy for [Marketplace
+verification](#marketplace-verification). A failed fetch keeps the old list and says why.
+Installs show under Recent.
 
 Opening a row shows the catalog's screenshot of the plugin (its 720 px card image, fetched
 from plugins.omarchy.org only when the row is opened).

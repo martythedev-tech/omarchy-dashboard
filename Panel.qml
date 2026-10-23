@@ -934,6 +934,16 @@ Panel {
         readonly property var info: row.modelData.info || ({})
         readonly property bool isSelf: row.modelData.id === root.moduleName
         readonly property color accentNow: root.pillAccent(row.modelData)
+        readonly property real badgesWidth: (pillBox.visible ? pillBox.width + 6 : 0) + (localPill.visible ? localPill.width + 6 : 0)
+                                            + (marketPill.visible ? marketPill.width + 6 : 0)
+        // What the badges may take on the name line: the name keeps up to 110 px of itself
+        // whatever else wants room. They are shown in order -- state, marketplace, LOCAL --
+        // while they fit; a marketplace badge that does not fit moves to the line below.
+        readonly property real badgeRoom: nameCol.width - Math.min(nameText.implicitWidth, 110) - 22
+        readonly property real stateTake: pillBox.visible ? pillBox.implicitWidth + 6 : 0
+        readonly property bool marketFits: row.stateTake + marketPill.implicitWidth + 6 <= row.badgeRoom
+        readonly property bool localFits: row.stateTake + (marketPill.visible ? marketPill.implicitWidth + 6 : 0)
+                                          + localPill.implicitWidth + 6 <= row.badgeRoom
         // Which destructive button is waiting for its second click ("remove"/"rollback"), if any.
         property string confirming: ""
         height: content.implicitHeight + 20
@@ -990,7 +1000,7 @@ Panel {
                     Row {
                         width: parent.width
                         spacing: 6
-                        Heading { id: nameText; text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - (pillBox.visible ? pillBox.width + 6 : 0) - (localPill.visible ? localPill.width + 6 : 0) - 22) }
+                        Heading { id: nameText; text: row.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - row.badgesWidth - 22) }
                         // Only when there is something to say: CURRENT on every row was a column
                         // of green that drowned out the one row that needed you.
                         Rectangle {
@@ -1017,7 +1027,7 @@ Panel {
                         Rectangle {
                             id: localPill
                             readonly property string label: Model.localTag(row.modelData)
-                            visible: label !== "" && !row.busy
+                            visible: label !== "" && !row.busy && row.localFits
                             anchors.verticalCenter: nameText.verticalCenter
                             implicitWidth: localPillText.implicitWidth + 12
                             implicitHeight: 18
@@ -1035,10 +1045,36 @@ Panel {
                                 textFormat: Text.PlainText
                             }
                         }
+                        // The marketplace's say on the commit (VERIFIED only when it is the exact
+                        // one its security check passed). Outlined like LOCAL: information, not
+                        // a state -- green when verified, grey otherwise, absent when unlisted.
+                        Rectangle {
+                            id: marketPill
+                            readonly property string label: Model.marketPill(row.modelData)
+                            readonly property color tone: label.indexOf("UNVERIFIED") < 0
+                                                          ? root.paletteColor("green", Commons.Color.accent) : Util.alpha(root.ink, 0.45)
+                            visible: label !== "" && !row.busy && row.marketFits
+                            anchors.verticalCenter: nameText.verticalCenter
+                            implicitWidth: marketPillText.implicitWidth + 12
+                            implicitHeight: 18
+                            radius: 9
+                            color: "transparent"
+                            border.color: Util.alpha(marketPill.tone, 0.6)
+                            Text {
+                                id: marketPillText
+                                anchors.centerIn: parent
+                                text: (marketPill.label.indexOf("UNVERIFIED") < 0 ? "✓ " : "") + marketPill.label
+                                color: marketPill.tone
+                                font.family: Style.font.family
+                                font.pixelSize: 9
+                                font.bold: true
+                                textFormat: Text.PlainText
+                            }
+                        }
                         // The first thing to give way when the line is full: name and pills stay whole.
                         Text {
                             id: versionText
-                            width: Math.max(0, Math.min(implicitWidth, parent.width - nameText.width - (pillBox.visible ? pillBox.width + 6 : 0) - (localPill.visible ? localPill.width + 6 : 0) - 28))
+                            width: Math.max(0, Math.min(implicitWidth, parent.width - nameText.width - row.badgesWidth - 28))
                             visible: width > 24
                             elide: Text.ElideRight
                             text: (row.modelData.version ? "v" + row.modelData.version : "")
@@ -1069,7 +1105,8 @@ Panel {
                               ? (Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s")
                               : [row.modelData.held ? "held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "",
                                  !row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? row.modelData.reason : "",
-                                 !row.modelData.held && row.modelData.updateState === "behind" ? Model.behindLabel(row.modelData) : ""]
+                                 !row.modelData.held && row.modelData.updateState === "behind" ? Model.behindLabel(row.modelData) : "",
+                                 !marketPill.visible && marketPill.label && !row.busy ? marketPill.label.toLowerCase() : ""]
                                 .filter(function(t) { return t !== "" }).join(" · ")
                         width: parent.width
                         visible: extra !== ""
@@ -1158,6 +1195,12 @@ Panel {
                         visible: !!row.info.webUrl
                         accent: Commons.Color.muted
                         onClicked: Qt.openUrlExternally(row.info.webUrl)
+                    }
+                    SmallButton {
+                        text: "Marketplace ↗"
+                        visible: !!(row.modelData.market && row.modelData.market.url)
+                        accent: Commons.Color.muted
+                        onClicked: Qt.openUrlExternally(row.modelData.market.url)
                     }
                     SmallButton {
                         text: "Open folder"

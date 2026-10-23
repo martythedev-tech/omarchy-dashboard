@@ -289,10 +289,44 @@ function infoRows(item, nowSeconds, home) {
         rows.push(['From', info.repo === 'AUR' ? 'the AUR' : 'the ' + info.repo + ' repo'])
         rows.push(['Updates', item.updateVia === 'system' ? 'with the system (omarchy update), in a terminal' : 'yay -S, in a terminal'])
     }
+    var market = marketLine(item)
+    if (market) rows.push(['Checked', market])
     if (info.branch) rows.push(['Branch', info.branch])
     if (info.upstreamTs) rows.push(['Upstream', 'last commit ' + relativeAge(info.upstreamTs, nowSeconds)])
     if (info.path) rows.push(['Folder', home && info.path.indexOf(home + '/') === 0 ? '~' + info.path.slice(home.length) : info.path])
     return rows
+}
+
+// The marketplace badge: about the update when one is waiting (that is the decision in
+// front of you), otherwise about the code installed. '' for a plugin it does not list.
+function marketPill(item) {
+    var m = item && item.market
+    if (!m) return ''
+    if (item.updateState === 'behind' && m.incoming)
+        return m.incoming === 'verified' ? 'UPDATE VERIFIED' : 'UPDATE UNVERIFIED'
+    return m.installed === 'verified' ? 'VERIFIED' : 'UNVERIFIED'
+}
+
+// The expanded row's Marketplace line: what was checked and how your copy relates to it.
+function marketLine(item) {
+    if (!item || item.kind === 'app' || item.market === undefined) return ''
+    var m = item.market
+    if (m === null) return 'Not listed in the marketplace'
+    var line
+    if (m.installed === 'verified') {
+        line = 'Verified: this is the commit its security check passed (' + m.checked + ')'
+        if (item.edits > 0) line += ', but your uncommitted edits are not covered'
+    } else if (!m.checked) {
+        line = 'Unverified: its security check has not passed any commit'
+    } else if (m.sinceChecked > 0) {
+        line = 'Unverified: ' + m.sinceChecked + (m.sinceChecked === 1 ? ' commit' : ' commits')
+             + ' past the one its security check passed (' + m.checked + ')'
+    } else {
+        line = 'Unverified: not the commit its security check passed (' + m.checked + ')'
+    }
+    if (item.updateState === 'behind' && m.incoming)
+        line += m.incoming === 'verified' ? '. The update is the verified commit.' : '. The update is not verified either.'
+    return line
 }
 
 // The source link as shown: host and path, no scheme.
