@@ -1728,7 +1728,7 @@ class InspectRepoTests(RepoGuessFixture):
         rebuild.write_text('#!/bin/sh\n'); rebuild.chmod(0o755)
         fields, notes = dash.inspect_repo(str(self.repo))
         self.assertEqual(fields, {'name': 'Flea', 'id': 'flea', 'repoDir': str(self.repo), 'pkgName': 'flea',
-                                  'branch': 'master', 'remote': 'origin', 'updateCmd': './rebuild.sh --install'})
+                                  'branch': 'master', 'remote': 'origin', 'updateCmd': './rebuild.sh --install', 'pullFirst': False})
         self.assertEqual(notes, [])
 
     def test_upstream_branch_without_origin_head_falls_back_to_an_existing_master_or_main(self):
@@ -2404,6 +2404,15 @@ class NormalizeCatalogTests(unittest.TestCase):
         self.assertEqual(dash.catalog_repo('https://github.com/a/b/'), 'https://github.com/a/b')
         self.assertEqual(dash.catalog_repo('git@github.com:a/b'), '')
 
+    def test_preview_is_the_catalogs_own_thumbnail_or_nothing(self):
+        [p] = dash.normalize_catalog({'plugins': [catalog_entry(
+            previewThumbnail='assets/img/plugins/1-acme-card.webp', previewThumbnailWidth=720, previewThumbnailHeight=405)]})
+        self.assertEqual(p['preview'], 'https://plugins.omarchy.org/assets/img/plugins/1-acme-card.webp')
+        self.assertAlmostEqual(p['previewAspect'], 1.778, places=3)
+        for bad in ('https://evil.example/x.webp', '../../x.webp', 'assets/img/plugins/x.svg', ''):
+            [p] = dash.normalize_catalog({'plugins': [catalog_entry(previewThumbnail=bad)]})
+            self.assertEqual(p['preview'], '', bad)
+
     def test_not_a_catalog_raises(self):
         with self.assertRaises(ValueError):
             dash.normalize_catalog({'items': []})
@@ -2541,3 +2550,163 @@ class CmdInstallTests(CatalogFixture):
         with patch.object(dash, 'cmd_install', lambda a: seen.append(a.id) or print(json.dumps({'ok': True}))):
             dash.execute_job(dash.new_job('install', ['acme.weather']))
         self.assertEqual(seen, ['acme.weather'])
+
+
+class RepoAppUpdateTests(unittest.TestCase):
+    """A source app whose update command only builds (`make install`): a real upstream and
+    clone, so the fetch/merge/verify run for real; the build itself is `true`."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        root = Path(self._tmp.name)
+        self.upstream = root / 'upstream'
+        self.upstream.mkdir()
+        git(self.upstream, 'init', '-q', '-b', 'main')
+        git(self.upstream, 'config', 'user.email', 't@t'); git(self.upstream, 'config', 'user.name', 't')
+        (self.upstream / 'app.c').write_text('one')
+        git(self.upstream, 'add', '.'); git(self.upstream, 'commit', '-qm', 'one')
+        self.clone = root / 'clone'
+        __import__("subprocess").run(["git", "clone", "-q", str(self.upstream), str(self.clone)], check=True)
+        (self.upstream / 'app.c').write_text('two')
+        git(self.upstream, 'commit', '-qam', 'two')
+        self.new = git(self.upstream, 'rev-parse', 'HEAD')
+        self.app = {'id': 'tool', 'name': 'Tool', 'repoDir': str(self.clone), 'pkgName': 'tool',
+                    'branch': 'main', 'remote': 'origin', 'updateCmd': ['true']}
+        state = root / 'state'
+        self.printed = []
+        for target, value in (('STATE', state), ('STATUS_PATH', state / 'status.json'),
+                              ('load_apps', lambda: [self.app]), ('ensure_apps_file', lambda: None),
+                              ('check_all', lambda: {}), ('pkg_version', lambda name: '')):
+            p = patch.object(dash, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch('builtins.print', lambda *a, **k: self.printed.append(json.loads(a[0])))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def update(self):
+        dash.cmd_update(type('A', (), {'id': 'tool'})())
+        return self.printed[-1]
+
+    def test_a_build_only_command_that_leaves_upstream_out_is_a_failure(self):
+        self.assertEqual(dash.check_app(self.app)['updateState'], 'behind')
+        r = self.update()
+        self.assertFalse(r['ok'])
+        self.assertIn("still lacks upstream's commits", r['message'])
+
+    def test_pull_first_fast_forwards_then_builds(self):
+        self.app['pullFirst'] = True
+        r = self.update()
+        self.assertTrue(r['ok'], r)
+        self.assertEqual(git(self.clone, 'rev-parse', 'HEAD'), self.new)
+
+    def test_pull_first_never_merges_over_local_commits(self):
+        self.app['pullFirst'] = True
+        git(self.clone, 'config', 'user.email', 't@t'); git(self.clone, 'config', 'user.name', 't')
+        (self.clone / 'local.txt').write_text('mine')
+        git(self.clone, 'add', '.'); git(self.clone, 'commit', '-qm', 'mine')
+        mine = git(self.clone, 'rev-parse', 'HEAD')
+        r = self.update()
+        self.assertFalse(r['ok'])
+        self.assertIn('Could not fast-forward', r['message'])
+        self.assertEqual(git(self.clone, 'rev-parse', 'HEAD'), mine)
+
+    def test_pull_first_refuses_another_branch(self):
+        self.app['pullFirst'] = True
+        git(self.clone, 'checkout', '-qb', 'other')
+        r = self.update()
+        self.assertFalse(r['ok'])
+        self.assertIn('needs main checked out', r['message'])
+
+    def test_add_repo_guess_pulls_first_without_rebuild_sh(self):
+        fields, notes = dash.inspect_repo(str(self.clone))
+        self.assertTrue(fields['pullFirst'])
+
+
+class PackageAppTests(unittest.TestCase):
+    def ctx(self, **over):
+        c = {'repos': {'brave-bin': 'omarchy', 'howdy': '', 'foo-git': '', 'gone': ''},
+             'sync': {}, 'syncError': '', 'aur': {}, 'aurError': ''}
+        c.update(over)
+        return c
+
+    def check(self, pkg, ctx, installed='1.0-1', older=False):
+        with patch.object(dash, 'pkg_version', return_value=installed), \
+             patch.object(dash, 'installed_older_than', return_value=older):
+            return dash.check_package_app({'id': pkg, 'name': pkg, 'source': 'package', 'pkgName': pkg}, ctx)
+
+    def test_repo_package_is_behind_when_checkupdates_lists_it(self):
+        item = self.check('brave-bin', self.ctx(sync={'brave-bin': '1:1.99.0-1'}))
+        self.assertEqual((item['updateState'], item['upstreamVersion'], item['updateVia']),
+                         ('behind', '1:1.99.0-1', 'system'))
+        self.assertTrue(dash.alerts(item))
+        self.assertEqual(self.check('brave-bin', self.ctx())['updateState'], 'up-to-date')
+
+    def test_failed_checkupdates_is_unreachable_not_current(self):
+        item = self.check('brave-bin', self.ctx(sync=None, syncError='no network'))
+        self.assertEqual((item['updateState'], item['reason']), ('unreachable', 'no network'))
+
+    def test_aur_package_compares_with_the_aur_version(self):
+        item = self.check('howdy', self.ctx(aur={'howdy': '2.7.0-1'}), older=True)
+        self.assertEqual((item['updateState'], item['updateVia']), ('behind', 'aur'))
+        self.assertIn('aur.archlinux.org/packages/howdy', item['info']['webUrl'])
+        self.assertEqual(self.check('howdy', self.ctx(aur={'howdy': '1.0-1'}))['updateState'], 'up-to-date')
+
+    def test_vcs_unknown_and_missing_packages_say_so(self):
+        self.assertEqual(self.check('foo-git', self.ctx())['updateState'], 'no-repo')
+        self.assertIn('not in the repos or the AUR', self.check('gone', self.ctx())['reason'])
+        self.assertIn('not installed', self.check('brave-bin', self.ctx(), installed='')['reason'])
+
+    def test_context_only_asks_the_sources_in_use(self):
+        apps = [{'id': 'brave', 'source': 'package', 'pkgName': 'brave-bin'},
+                {'id': 'flea', 'repoDir': '/x'}]
+        with patch.object(dash, 'sync_repo', return_value='omarchy'), \
+             patch.object(dash, 'sync_updates', return_value=({}, '')) as su, \
+             patch.object(dash, 'aur_versions') as av:
+            dash.package_context(apps)
+        su.assert_called_once()
+        av.assert_not_called()
+
+    def test_checkupdates_output_is_parsed_and_rc2_means_none(self):
+        out = 'brave-bin 1:1.98.60-1 -> 1:1.99.0-1\nc-ares 1.34.8-1 -> 1.34.9-1\n'
+        with patch.object(dash, 'run', return_value=(0, out, '')):
+            self.assertEqual(dash.sync_updates(), ({'brave-bin': '1:1.99.0-1', 'c-ares': '1.34.9-1'}, ''))
+        with patch.object(dash, 'run', return_value=(2, '', '')):
+            self.assertEqual(dash.sync_updates(), ({}, ''))
+        with patch.object(dash, 'run', return_value=(1, '', 'cannot sync')):
+            self.assertEqual(dash.sync_updates()[0], None)
+
+    def test_a_package_app_never_updates_as_a_background_job(self):
+        with patch.object(dash, 'ensure_apps_file'), \
+             patch.object(dash, 'load_apps', return_value=[{'id': 'brave', 'name': 'Brave', 'source': 'package',
+                                                            'pkgName': 'brave-bin'}]), \
+             patch.object(dash, 'run') as run_mock, patch('builtins.print') as printed:
+            dash.cmd_update(type('A', (), {'id': 'brave'})())
+        run_mock.assert_not_called()
+        self.assertIn('terminal', json.loads(printed.call_args[0][0])['message'])
+
+    def test_inspect_package_names_it_and_says_how_it_updates(self):
+        with patch.object(dash, 'installed_name', return_value='brave-bin'), \
+             patch.object(dash, 'sync_repo', return_value='omarchy'), \
+             patch.object(dash, 'load_apps', return_value=[]):
+            fields, notes = dash.inspect_package('brave-bin')
+        self.assertEqual((fields['id'], fields['name'], fields['source']), ('brave-bin', 'Brave', 'package'))
+        self.assertIn('omarchy update', notes[0])
+        with patch.object(dash, 'installed_name', return_value=''), \
+             patch.object(dash, 'run', return_value=(0, 'brave-bin\nbash\nlibbrave\n', '')):
+            fields, notes = dash.inspect_package('brave')
+        self.assertIsNone(fields)
+        self.assertIn('Did you mean brave-bin or libbrave?', notes[0])
+        # A name another package provides is tracked as that package.
+        with patch.object(dash, 'installed_name', return_value='brave-bin'), \
+             patch.object(dash, 'sync_repo', return_value='omarchy'), \
+             patch.object(dash, 'load_apps', return_value=[]):
+            fields, notes = dash.inspect_package('brave')
+        self.assertEqual((fields['pkgName'], fields['id'], fields['name']), ('brave-bin', 'brave-bin', 'Brave'))
+        self.assertIn('provided by brave-bin', notes[0])
+        self.assertIsNone(dash.inspect_package('bad name; rm')[0])
+
+    def test_terminal_ids_picks_out_package_apps(self):
+        items = [{'id': 'brave', 'source': 'package'}, {'id': 'flea'}, {'id': 'x.plugin'}]
+        self.assertEqual(dash.terminal_ids(items, ['flea', 'brave', 'x.plugin']), ['brave'])

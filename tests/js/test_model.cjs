@@ -30,6 +30,18 @@ assert.equal(ctx.stateLabel({updateState: 'diverged', reason: '1 local commit(s)
 assert.equal(ctx.stateLabel({updateState: 'in-progress', reason: 'rebase onto cc65416'}), 'Git operation in progress (rebase onto cc65416) -- resolve manually');
 assert.equal(ctx.stateLabel({updateState: 'in-progress'}), 'Git operation in progress -- resolve manually');
 assert.equal(ctx.stateLabel({updateState: 'no-repo'}), 'No update source');
+assert.equal(ctx.stateLabel({updateState: 'no-repo', reason: 'not in the repos or the AUR'}), 'No update source (not in the repos or the AUR)');
+// Package apps
+var brave = {id: 'brave', source: 'package', updateState: 'behind', behind: 1, updateVia: 'system', upstreamVersion: '1:1.99-1', info: {repo: 'omarchy'}};
+assert.equal(ctx.canShowDiff(brave), false);
+assert.equal(ctx.inTerminal(brave), true);
+assert.equal(ctx.inTerminal({updateState: 'behind'}), false);
+assert.equal(ctx.updateCaption(brave), 'Update system…');
+assert.equal(ctx.updateCaption({source: 'package', updateVia: 'aur'}), 'Update…');
+assert.equal(ctx.updateCaption({}), 'Update');
+assert.equal(ctx.pillLabel(brave), 'UPDATE');
+assert.equal(ctx.infoRows(brave, 0, '').map(function(r) { return r[0] + '=' + r[1] }).join('|'),
+             'Status=Update available: 1:1.99-1|From=the omarchy repo|Updates=with the system (omarchy update), in a terminal');
 assert.equal(ctx.stateLabel({updateState: 'unreachable'}), 'Could not reach source');
 assert.equal(ctx.stateLabel({updateState: 'unreachable', reason: 'no network\nmore detail'}), 'Could not reach source: no network');
 assert.equal(ctx.stateLabel({updateState: 'up-to-date'}), 'Up to date');

@@ -547,6 +547,14 @@ def pkg_version(pkg_name):
     return parts[1] if len(parts) > 1 else ''
 
 
+def installed_name(pkg_name):
+    """The installed package's own name, or '' -- `pacman -Q brave` answers for brave-bin,
+    which provides it, and tracking 'brave' would check the wrong package."""
+    rc, out, _ = run(['pacman', '-Q', pkg_name])
+    parts = out.split() if rc == 0 else []
+    return parts[0] if parts else ''
+
+
 def repo_operation_in_progress(repo_dir):
     """Name of a git operation left mid-flight (rebase/merge/cherry-pick/
     bisect), or '' if the tree is otherwise idle. Checked before comparing
@@ -967,6 +975,172 @@ def check_app(a):
     }
 
 
+# Package apps: something installed with pacman or from the AUR (Brave's brave-bin), tracked
+# without a source checkout. There is no Dashboard-side build: the update is the system's.
+AUR_RPC = 'https://aur.archlinux.org/rpc/v5/info'
+# AUR packages built from a VCS head: the AUR's version is whenever the PKGBUILD was last
+# touched, not when the source moved, so it cannot say when one is behind.
+VCS_SUFFIXES = ('-git', '-svn', '-hg', '-bzr', '-darcs', '-fossil', '-cvs')
+
+
+def is_package_app(app):
+    return app.get('source') == 'package'
+
+
+def sync_repo(pkg_name):
+    """The sync repo that carries this package ('omarchy', 'extra', ...), or '' when none
+    does: then it came from the AUR or a local build."""
+    rc, out, _ = run(['pacman', '-Si', pkg_name])
+    if rc != 0:
+        return ''
+    for line in out.splitlines():
+        key, sep, value = line.partition(':')
+        if sep and key.strip() == 'Repository':
+            return value.strip()
+    return ''
+
+
+def sync_updates():
+    """({package: new version}, '') for every repo package with an update, from
+    checkupdates (which refreshes a private copy of the sync databases, never the system's,
+    and needs no root), or (None, why) when it could not tell."""
+    rc, out, err = run(['checkupdates', '--nocolor'], timeout=180)
+    if rc == 2:  # nothing to update
+        return {}, ''
+    if rc != 0:
+        return None, (err or out).strip()[-300:] or 'checkupdates failed'
+    found = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[2] == '->':
+            found[parts[0]] = parts[3]
+    return found, ''
+
+
+def aur_versions(names):
+    """({name: AUR version}, '') for the names the AUR has, or (None, why)."""
+    if not names:
+        return {}, ''
+    query = '&'.join('arg[]=' + urllib.request.quote(n, safe='') for n in names)
+    try:
+        req = urllib.request.Request(f'{AUR_RPC}?{query}', headers={'User-Agent': 'omarchy-plugin-dashboard'})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            data = json.loads(resp.read(4 * 1024 * 1024))
+        return {r['Name']: r['Version'] for r in data.get('results', [])
+                if isinstance(r, dict) and r.get('Name') and r.get('Version')}, ''
+    except (OSError, ValueError, AttributeError, TypeError) as e:
+        return None, f'could not reach the AUR: {e}'
+
+
+def package_context(apps):
+    """What checking every package app needs, looked up once per check rather than per
+    app: where each comes from, and the pending versions (checkupdates for repo packages,
+    the AUR for the rest). Only asks a source that some tracked package actually uses."""
+    pkgs = [a.get('pkgName') or a['id'] for a in apps if is_package_app(a)]
+    repos = {p: sync_repo(p) for p in pkgs}
+    ctx = {'repos': repos, 'sync': {}, 'syncError': '', 'aur': {}, 'aurError': ''}
+    if any(repos.values()):
+        ctx['sync'], ctx['syncError'] = sync_updates()
+    foreign = [p for p, r in repos.items() if not r and not p.endswith(VCS_SUFFIXES)]
+    if foreign:
+        ctx['aur'], ctx['aurError'] = aur_versions(foreign)
+    return ctx
+
+
+def check_package_app(a, ctx):
+    pkg = a.get('pkgName') or a['id']
+    version = pkg_version(pkg)
+    repo = (ctx.get('repos') or {}).get(pkg, '')
+    info = {'path': '', 'branch': '', 'webUrl': '', 'upstreamTs': 0, 'repo': repo or 'AUR'}
+    state, reason, incoming = 'up-to-date', '', ''
+    if not version:
+        state, reason = 'no-repo', f'{pkg} is not installed'
+    elif repo:
+        updates = ctx.get('sync')
+        if updates is None:
+            state, reason = 'unreachable', ctx.get('syncError') or 'could not check for updates'
+        elif pkg in updates:
+            state, incoming = 'behind', updates[pkg]
+    else:
+        info['webUrl'] = f'https://aur.archlinux.org/packages/{pkg}'
+        aur = ctx.get('aur')
+        if pkg.endswith(VCS_SUFFIXES):
+            state, reason = 'no-repo', 'built from the latest source; the AUR cannot say when that moves'
+        elif aur is None:
+            state, reason = 'unreachable', ctx.get('aurError') or 'could not reach the AUR'
+        elif pkg not in aur:
+            state, reason = 'no-repo', 'not in the repos or the AUR'
+        elif installed_older_than(version, aur[pkg]):
+            state, incoming = 'behind', aur[pkg]
+    return {
+        'id': a['id'], 'kind': 'app', 'source': 'package', 'name': a.get('name', a['id']),
+        'version': version, 'upstreamVersion': incoming,
+        'versionChange': version_change(version, incoming),
+        'updateState': state, 'behind': 1 if state == 'behind' else 0, 'reason': reason, 'ahead': 0,
+        'updateVia': 'system' if repo else 'aur', 'info': info,
+    }
+
+
+def terminal_ids(items, ids):
+    """The ids among these that update in a terminal (package apps) rather than as a job."""
+    package = {i['id'] for i in items if i.get('source') == 'package'}
+    return [i for i in ids if i in package]
+
+
+def open_terminal_update(ids):
+    """A terminal running terminal-update for these package apps: their updates need sudo,
+    which only a terminal can ask for."""
+    if not ids:
+        return True
+    # Detached with no pipes: run() would wait on the terminal holding its output open.
+    try:
+        subprocess.Popen(['uwsm-app', '--', 'xdg-terminal-exec', '--title=Plugin Dashboard update',
+                          sys.executable, str(Path(__file__).resolve()), 'terminal-update', *ids],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        return False
+    return True
+
+
+def cmd_terminal_update(args):
+    """Runs in a terminal: updates package apps the way the system does. A repo package is
+    updated by `omarchy update` -- the whole system, since Arch does not support upgrading
+    one repo package on its own -- and an AUR one by `yay -S`. Then records each in Recent
+    and rechecks."""
+    ensure_apps_file()
+    apps = {a['id']: a for a in load_apps() if is_package_app(a)}
+    wanted = [apps[i] for i in args.ids if i in apps]
+    if not wanted:
+        print('Nothing to update here.')
+    before = {a['id']: pkg_version(a.get('pkgName') or a['id']) for a in wanted}
+    system = [a for a in wanted if sync_repo(a.get('pkgName') or a['id'])]
+    aur = [a for a in wanted if a not in system]
+    failed = set()
+    if system:
+        print('Updating the system (' + ', '.join(a['name'] for a in system) + ' come from the package repos)…\n')
+        if subprocess.run(['omarchy', 'update']).returncode != 0:
+            failed.update(a['id'] for a in system)
+    if aur:
+        print('\nUpdating from the AUR: ' + ', '.join(a['name'] for a in aur) + '\n')
+        if subprocess.run(['yay', '-S', '--needed', *[a.get('pkgName') or a['id'] for a in aur]]).returncode != 0:
+            failed.update(a['id'] for a in aur)
+    print()
+    for a in wanted:
+        after = pkg_version(a.get('pkgName') or a['id'])
+        ok = a['id'] not in failed
+        print(f"{a['name']}: {before[a['id']] or '?'} → {after or '?'}" + ('' if ok else ' (failed)'))
+        append_history({'ts': time.time(), 'id': a['id'], 'name': a['name'], 'kind': 'app', 'action': 'update',
+                        'ok': ok, 'before': '', 'after': '', 'fromVersion': before[a['id']], 'toVersion': after,
+                        'unitsInstalled': [], 'message': '' if ok else 'the update command failed; see its terminal'})
+    check_all()
+    if sys.stdin.isatty():
+        try:
+            input('\nPress Enter to close.')
+        except EOFError:
+            pass
+
+
 def alerts(item):
     """Whether an item belongs in the bar badge and the notification: it can be updated,
     is not held, and is not known to leave its version unchanged. An update whose
@@ -1031,6 +1205,12 @@ def cmd_await_notification(args):
     names = {i['id']: i.get('name', i['id']) for i in status.get('items', [])}
     done, failed = [], []
     ids = [i for i in args.ids if i in wanted]
+    in_terminal = terminal_ids(status.get('items', []), ids)
+    if in_terminal:
+        open_terminal_update(in_terminal)
+        ids = [i for i in ids if i not in in_terminal]
+        if not ids:
+            return
     # As a job, so an open panel shows it going like one it started itself. This waiter
     # is already its own unit, so it runs the job in-process.
     job = new_job('update', ids) if ids else None
@@ -1053,9 +1233,12 @@ def cmd_await_notification(args):
 
 def check_all():
     old_behind_ids = _previously_behind_ids()
+    apps = load_apps()
+    pkg_ctx = package_context(apps)
     with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as pool:
         jobs = [pool.submit(check_plugin, p) for p in discover_plugins()] + \
-               [pool.submit(check_app, a) for a in load_apps()]
+               [pool.submit(check_package_app, a, pkg_ctx) if is_package_app(a) else pool.submit(check_app, a)
+                for a in apps]
         items = [job.result() for job in jobs]
     holds = load_holds()
     history = load_history()
@@ -1122,13 +1305,37 @@ def cmd_update(args):
     ensure_apps_file()
     apps = {a['id']: a for a in load_apps()}
     app = apps.get(args.id)
+    if app and is_package_app(app):
+        print(json.dumps({'ok': False, 'message': f"{app.get('name', args.id)} is a package: it updates in a terminal, "
+                                                   'where sudo can ask (its Update button opens one).'}))
+        return
     repo_dir = app['repoDir'] if app else PLUGINS_DIR / args.id
     before = repo_head(repo_dir)
     from_version = item_version(args.id, app)
     units_installed_before = set()
     if app:
         a = app
-        rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900, stream_log=STATE / 'action.log')
+        rc, out, err = (pull_upstream(a['repoDir'], a.get('branch', 'master'), a.get('remote', 'origin'))
+                        if a.get('pullFirst') else (0, '', ''))
+        if rc == 0:
+            pulled = out
+            rc, out, err = run(a['updateCmd'], cwd=a['repoDir'], timeout=900, stream_log=STATE / 'action.log')
+            out = (pulled + '\n' if pulled.strip() else '') + out
+        if rc == 0:
+            # The command saying it worked is not the same as the app being current: one
+            # that builds without pulling (make install on a checkout nobody merged) rebuilt
+            # the old version and exited 0.
+            after = check_app(a)
+            if after['updateState'] in ('behind', 'not-installed', 'dirty', 'in-progress'):
+                rc = 1
+                err = (err + '\n' if err.strip() else '') + 'The update command finished, but ' + {
+                    'behind': "the checkout still lacks upstream's commits -- the command has to bring them in "
+                              '(or tick "Pull upstream first" for this app).',
+                    'not-installed': 'the installed package is still older than the repo builds: '
+                                     + after.get('reason', ''),
+                    'dirty': 'the checkout has local changes that keep upstream out: ' + after.get('reason', ''),
+                    'in-progress': 'it left a git operation unfinished: ' + after.get('reason', ''),
+                }[after['updateState']]
     else:
         plugin_dir = PLUGINS_DIR / args.id
         units_before = shipped_units(plugin_dir)
@@ -1656,6 +1863,9 @@ CATALOG_CACHE_SECONDS = 6 * 3600
 _CATALOG_ID = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,199}\Z')
 # Only plain GitHub repos: this URL is handed to `git clone`.
 _CATALOG_REPO = re.compile(r'https://github\.com/[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_][A-Za-z0-9._-]*\Z')
+# Preview images are the catalog's own (relative to its site); only plain image paths there.
+CATALOG_SITE = 'https://plugins.omarchy.org/'
+_CATALOG_PREVIEW = re.compile(r'assets/img/plugins/[A-Za-z0-9._-]+\.(?:webp|png|jpe?g)\Z')
 # How long a just-added plugin may take to show up in the shell's registry before enabling it.
 INSTALL_DISCOVER_SECONDS = 5
 
@@ -1701,6 +1911,8 @@ def normalize_catalog(data):
         else:
             verification = 'unverified'
         stars = e.get('stars')
+        thumb = str(e.get('previewThumbnail') or '')
+        width, height = e.get('previewThumbnailWidth'), e.get('previewThumbnailHeight')
         plugins.append({
             'id': plugin_id, 'name': _clean(e.get('name'), 120) or plugin_id,
             'description': _clean(e.get('description'), 600), 'author': _clean(e.get('author'), 80),
@@ -1713,6 +1925,10 @@ def normalize_catalog(data):
             'note': '' if installable else (_clean(e.get('installNote'), 300)
                                             or 'Not installable from here; see its repository.'),
             'verification': verification,
+            # The card-sized thumbnail (720 px wide, ~30 KB), not the full detail image.
+            'preview': CATALOG_SITE + thumb if _CATALOG_PREVIEW.fullmatch(thumb) else '',
+            'previewAspect': round(width / height, 3) if isinstance(width, int) and isinstance(height, int)
+                             and width > 0 and height > 0 else 16 / 9,
         })
     return plugins
 
@@ -2005,11 +2221,86 @@ def cmd_diff(args):
                       'incoming': incoming, 'local': local}))
 
 
+def pull_upstream(repo_dir, branch, remote):
+    """For an app whose update command only builds: bring `remote/branch` into the checked-out
+    `branch`, fast-forward only, so local work is never merged over or thrown away."""
+    rc, head, _ = run(['git', '-C', str(repo_dir), 'rev-parse', '--abbrev-ref', 'HEAD'])
+    if rc != 0 or head.strip() != branch:
+        return 1, '', f"Pull upstream first needs {branch} checked out; it is on {head.strip() or '?'}."
+    rc, out, err = run(['git', '-C', str(repo_dir), 'fetch', '--quiet', remote], timeout=60)
+    if rc != 0:
+        return rc, out, err
+    rc, out, err = run(['git', '-C', str(repo_dir), 'merge', '--ff-only', f'{remote}/{branch}'], timeout=60)
+    if rc != 0:
+        err = (err.strip() + '\n' if err.strip() else '') + \
+            f'Could not fast-forward {branch}: it has commits {remote}/{branch} does not. Merge them by hand.'
+    return rc, out, err
+
+
+def inspect_package(name):
+    """(fields, notes) for the Add app form from an installed package, or (None, [why])."""
+    pkg = name.strip()
+    if not re.fullmatch(r'[A-Za-z0-9@._+-]+', pkg):
+        return None, ['Enter a package name, e.g. brave-bin.']
+    real = installed_name(pkg)
+    if not real:
+        # People type the app's name (brave); the package is often brave-bin.
+        rc, out, _ = run(['pacman', '-Qq'])
+        close = [n for n in out.split() if pkg.lower() in n.lower()][:5] if rc == 0 else []
+        return None, [f'{pkg} is not installed (pacman -Q {pkg}).'
+                      + (' Did you mean ' + ' or '.join(close) + '?' if close else '')]
+    notes = []
+    if real != pkg:
+        notes.append(f'{pkg} is provided by {real}; tracking {real}.')
+        pkg = real
+    repo = sync_repo(pkg)
+    if repo:
+        notes.append(f'From the {repo} repo: Update runs omarchy update (the whole system -- '
+                     'Arch does not support upgrading one repo package alone).')
+    elif pkg.endswith(VCS_SUFFIXES):
+        notes.append('A VCS package: the AUR cannot say when its source moves, so it will show no update source.')
+    else:
+        notes.append('From the AUR (or built locally): Update runs yay -S ' + pkg + '.')
+    base = re.sub(r'-(bin|git|appimage)$', '', pkg)
+    fields = {'source': 'package', 'pkgName': pkg, 'id': pkg,
+              'name': ' '.join(w[:1].upper() + w[1:] for w in re.split(r'[-_]+', base) if w) or pkg}
+    if fields['id'] in {a.get('id') for a in load_apps()}:
+        notes.append(f"An app with id {fields['id']} is already tracked; saving replaces it.")
+    return fields, notes
+
+
+def cmd_inspect_package(args):
+    ensure_apps_file()
+    fields, notes = inspect_package(args.name)
+    print(json.dumps({'ok': fields is not None, 'fields': fields or {}, 'notes': notes}))
+
+
 def cmd_add_app(args):
     try:
         fields = json.loads(args.json)
     except ValueError:
         print(json.dumps({'ok': False, 'message': 'Invalid app data.'}))
+        return
+    if fields.get('source') == 'package':
+        pkg = str(fields.get('pkgName') or '').strip()
+        app_id = str(fields.get('id') or pkg).strip()
+        name = str(fields.get('name') or app_id).strip()
+        if not pkg or not app_id or not name:
+            print(json.dumps({'ok': False, 'message': 'A package name is required.'}))
+            return
+        real = installed_name(pkg)
+        if not real:
+            print(json.dumps({'ok': False, 'message': f'{pkg} is not installed.'}))
+            return
+        if app_id == pkg:
+            app_id = real
+        pkg = real
+        ensure_apps_file()
+        apps = [a for a in load_apps() if a.get('id') != app_id]
+        apps.append({'id': app_id, 'name': name, 'source': 'package', 'pkgName': pkg})
+        save_apps(apps)
+        print(json.dumps({'ok': True, 'message': 'Added ' + name + '.'}))
+        check_all()
         return
     app_id = str(fields.get('id') or '').strip()
     name = str(fields.get('name') or '').strip()
@@ -2034,6 +2325,7 @@ def cmd_add_app(args):
         'branch': str(fields.get('branch') or 'master'),
         'remote': str(fields.get('remote') or 'origin'),
         'updateCmd': update_cmd,
+        'pullFirst': bool(fields.get('pullFirst')),
     }
     ensure_apps_file()
     apps = [a for a in load_apps() if a.get('id') != app_id]
@@ -2052,7 +2344,7 @@ def inspect_repo(repo_dir):
     notes = []
     base = re.sub(r'[^a-z0-9._-]+', '-', repo.name.lower()).strip('-') or 'app'
     fields = {'name': repo.name[:1].upper() + repo.name[1:], 'id': base, 'repoDir': str(repo),
-              'pkgName': base, 'branch': '', 'remote': '', 'updateCmd': ''}
+              'pkgName': base, 'branch': '', 'remote': '', 'updateCmd': '', 'pullFirst': False}
     srcinfo = {}
     try:
         for line in (repo / '.SRCINFO').read_text().splitlines():
@@ -2082,7 +2374,11 @@ def inspect_repo(repo_dir):
     if os.access(repo / 'rebuild.sh', os.X_OK):
         fields['updateCmd'] = './rebuild.sh --install'
     else:
-        notes.append('No executable rebuild.sh: enter the command that builds and installs it.')
+        # A rebuild.sh brings upstream in itself; anything else is taken to only build, so
+        # the Dashboard pulls first.
+        fields['pullFirst'] = True
+        notes.append('No executable rebuild.sh: enter the command that builds and installs it. '
+                     'The Dashboard pulls upstream (fast-forward) before running it.')
     if fields['id'] in {a.get('id') for a in load_apps()}:
         notes.append(f"An app with id {fields['id']} is already tracked; saving replaces it.")
     return fields, notes
@@ -2130,6 +2426,9 @@ def main():
         p.add_argument('id')
     sub.add_parser('inspect-repo').add_argument('dir')
     sub.add_parser('pick-folder')
+    sub.add_parser('inspect-package').add_argument('name')
+    sub.add_parser('terminal-update').add_argument('ids', nargs='+')
+    sub.add_parser('open-terminal-update').add_argument('ids', nargs='+')
     p_await = sub.add_parser('await-notification')
     p_await.add_argument('title')
     p_await.add_argument('body')
@@ -2154,6 +2453,8 @@ def main():
         'await-notification': cmd_await_notification, 'start': cmd_start, 'run-job': cmd_run_job,
         'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup, 'catalog': cmd_catalog,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
+        'inspect-package': cmd_inspect_package, 'terminal-update': cmd_terminal_update,
+        'open-terminal-update': lambda a: print(json.dumps({'ok': open_terminal_update(a.ids)})),
     }
     handlers[args.command](args)
 

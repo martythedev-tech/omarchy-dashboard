@@ -203,6 +203,9 @@ The catalog is about 15 MB; `dashboard.py catalog` keeps a trimmed copy (~3 MB,
 `catalog.json` in the state folder) and refetches it when it is older than 6 hours or on
 **Refresh**. A failed fetch keeps the old list and says why. Installs show under Recent.
 
+Opening a row shows the catalog's screenshot of the plugin (its 720 px card image, fetched
+from plugins.omarchy.org only when the row is opened).
+
 ## Keyboard and scripts
 
 The panel answers the shell's IPC:
@@ -226,15 +229,41 @@ shell's generic `shell toggle`, which did not open this bar widget's popup when 
 
 ## Tracked apps
 
-Use "+ Add app" in the panel. Start with the repo: **Choose…** opens the
-desktop's folder chooser, or type a path and press **Fill in**. Either reads the
-repo and fills the rest -- name and id from the folder, the package name from
-`.SRCINFO`, the upstream branch and remote from git, and `./rebuild.sh --install`
-if the repo has an executable `rebuild.sh` -- and says what it could not work
-out. Saving checks the repo dir is a real git checkout and that there is an
-update command. Remove one the same way as a
-plugin, via its Remove button -- that only forgets it here, it never touches
-the repo or package.
+"+ Add app" in the panel tracks two kinds of app.
+
+**An installed package** (Brave's `brave-bin`, anything from pacman or the AUR): pick
+**Installed package**, type the package name and press **Fill in**; it names the app and
+says where the package comes from and how it will update.
+
+- *From a package repo* (omarchy, extra, ...): checked with `checkupdates`, which refreshes
+  a private copy of the sync databases (no root, the system's are untouched). Its update is
+  **Update system…**: `omarchy update` in a terminal -- the whole system, because Arch does
+  not support upgrading one repo package on its own.
+- *From the AUR*: checked against the AUR's version; **Update…** runs `yay -S <pkg>` in a
+  terminal.
+- A `-git` (or other VCS) package shows "No update source": the AUR's version only moves
+  when its PKGBUILD does, not when the source does.
+
+Both update in a terminal because they need sudo; the terminal records the result under
+Recent and rechecks when it is done. Update all and the notification's Update button open
+one terminal for all package apps and run everything else as usual.
+
+**A source repo you build yourself** (Flea, Howdy): pick **Source repo**, then **Choose…**
+(the desktop's folder chooser) or type a path and press **Fill in**. That reads the repo and
+fills the rest -- name and id from the folder, the package name from `.SRCINFO`, the upstream
+branch and remote from git, and `./rebuild.sh --install` if the repo has an executable
+`rebuild.sh` -- and says what it could not work out.
+
+- The update command must build *and install*. A `rebuild.sh` brings upstream in itself.
+  For anything else (say `make install`), **Pull upstream first** is ticked: the Dashboard
+  fast-forwards the checked-out branch to upstream before running the command. It never
+  merges: local commits upstream lacks make it stop and say so.
+- After the command, the app is checked again. If the checkout still lacks upstream's
+  commits, or the installed package is older than what the repo builds, the update is
+  reported as failed with that reason -- an exit code 0 alone is not trusted.
+
+Remove either kind via its **Stop tracking** button -- that only forgets it here, it never
+touches the repo or package.
 
 Under the hood, apps live in a small file,
 `~/.local/state/omarchy/plugins/martythedev-tech.dashboard/apps.json`,
@@ -243,13 +272,12 @@ seeded on first run with Flea and Howdy, and can still be hand-edited:
 ```json
 [
   {"id": "flea", "name": "Flea", "repoDir": "/home/you/Projects/flea", "pkgName": "flea",
-   "branch": "master", "remote": "origin", "updateCmd": ["./rebuild.sh", "--install"]}
+   "branch": "master", "remote": "origin", "updateCmd": ["./rebuild.sh", "--install"]},
+  {"id": "tool", "name": "Tool", "repoDir": "/home/you/Projects/tool", "pkgName": "tool",
+   "branch": "main", "remote": "origin", "updateCmd": ["make", "install"], "pullFirst": true},
+  {"id": "brave-bin", "name": "Brave", "source": "package", "pkgName": "brave-bin"}
 ]
 ```
-
-Add another app the same way: a repo with a `master` (or whatever
-`branch` names) tracking its real upstream, and an `updateCmd` that
-builds and installs from the checked-out working tree.
 
 ## Install
 
