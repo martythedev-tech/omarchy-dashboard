@@ -533,6 +533,31 @@ Panel {
         }
     }
 
+    // Restart shell: dashboard.py clears the compiled-QML cache and restarts the shell from
+    // its own unit (this panel goes with the shell). It answers only to refuse or to say
+    // it started; the footer shows which.
+    property bool restartConfirm: false
+    Timer { id: restartConfirmTimer; interval: 4000; onTriggered: root.restartConfirm = false }
+    Process {
+        id: restartProc
+        command: ["python3", root.helper, "restart-shell"]
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: {
+                var r = null
+                try { r = JSON.parse(text) } catch (e) {}
+                root.actionStatus = (r && r.message) || "Could not restart the shell."
+            }
+        }
+    }
+    function restartShell() {
+        if (!root.restartConfirm) { root.restartConfirm = true; restartConfirmTimer.restart(); return }
+        restartConfirmTimer.stop()
+        root.restartConfirm = false
+        if (root.busyId !== "" || restartProc.running) return
+        restartProc.running = true
+    }
+
     // Typing filters after a pause, not on every key: the catalog has thousands of entries.
     Timer { id: discoverDebounce; interval: 180; onTriggered: root.refilterDiscover() }
 
@@ -2160,23 +2185,58 @@ Panel {
                 }
 
                 Rectangle { width: parent.width; height: 1; color: Style.normalBorderColor }
+                // Status and the actions share a line when both fit; otherwise the actions
+                // drop below, right-aligned, and the status gets the full width.
                 Item {
+                    id: footerBox
+                    readonly property bool oneLine: footerMetrics.width + footerActions.implicitWidth + 16 <= width
                     width: parent.width
-                    height: Math.max(footerStatus.implicitHeight, scopeSwitch.implicitHeight)
+                    height: oneLine ? Math.max(footerStatus.implicitHeight, footerActions.implicitHeight)
+                                    : footerStatus.implicitHeight + 4 + footerActions.implicitHeight
+                TextMetrics { id: footerMetrics; font: footerStatus.font; text: footerStatus.text }
                 Label {
                     id: footerStatus
-                    width: parent.width - (scopeSwitch.visible ? scopeSwitch.implicitWidth + 12 : 0)
+                    width: footerBox.oneLine ? parent.width - footerActions.implicitWidth - 16 : parent.width
                     wrapMode: Text.WordWrap
                     font.pixelSize: Style.font.caption
                     text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
                           (checkProc.running ? "Checking sources…" :
                            "Last checked " + Model.relativeAge(root.status.ts, root.now))
                 }
+                Row {
+                    id: footerActions
+                    anchors.right: parent.right
+                    y: footerBox.oneLine ? 0 : footerStatus.implicitHeight + 4
+                    spacing: 6
+                // For a plugin still running old code after its files changed: clears the
+                // compiled QML and restarts the shell. Two clicks, since the bar goes away
+                // for a moment; not while an update runs.
+                Text {
+                    text: root.restartConfirm ? "Restart the shell?" : "Restart shell"
+                    color: root.restartConfirm ? Commons.Color.urgent
+                           : restartMouse.containsMouse && restartMouse.enabled ? Commons.Color.accent : Util.alpha(root.ink, 0.45)
+                    opacity: restartMouse.enabled ? 1 : 0.5
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    MouseArea {
+                        id: restartMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        enabled: root.busyId === "" && root.updateQueueTotal === 0 && !restartProc.running
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.restartShell()
+                    }
+                }
+                Text {
+                    visible: scopeSwitch.visible
+                    text: "·"
+                    color: Util.alpha(root.ink, 0.3)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                }
                 // Update all's scope, as a quiet switch: click to flip.
                 Text {
                     id: scopeSwitch
-                    anchors.right: parent.right
-                    anchors.top: parent.top
                     visible: root.view === "installed" && root.grouped.plugins.length + root.grouped.disabled.length > 0
                     text: "Update all: " + (root.updateAllScope === "verified" ? "verified only" : "everything")
                     color: scopeMouse.containsMouse ? Commons.Color.accent : Util.alpha(root.ink, root.updateAllScope === "verified" ? 0.8 : 0.45)
@@ -2189,6 +2249,7 @@ Panel {
                         cursorShape: Qt.PointingHandCursor
                         onClicked: root.setUpdateAllScope(root.updateAllScope === "verified" ? "all" : "verified")
                     }
+                }
                 }
                 }
             }

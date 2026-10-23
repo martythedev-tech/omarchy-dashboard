@@ -297,6 +297,15 @@ fetch rather than the sum of them.
   hidden -- pulling either out from under its own running widget is asking
   for the exact kind of hot-reload-during-lock crash this plugin exists to
   avoid; use `omarchy plugin disable/remove` from a terminal for those two.
+- **Restart shell** (bottom right, beside the Update all switch): for a plugin still
+  running old code after its files changed. It clears the shell's compiled-QML caches
+  (`~/.cache/quickshell/qmlcache` and `qtpipelinecache-*`; nothing else there) and runs
+  `omarchy-restart-shell`. It asks first ("Restart the shell?", click again) since the
+  bar goes away for a moment, and is unavailable while an update runs -- the update's load
+  check reads the shell's log. It runs in its own unit (`dashboard-restart-shell-*`),
+  because the restart takes this panel down with the shell; if the restart fails (for
+  instance while the session is locked) a notification says why. From a terminal:
+  `python3 ~/.config/omarchy/plugins/martythedev-tech.dashboard/dashboard.py restart-shell`.
 
 ## After an update: did it actually load?
 
