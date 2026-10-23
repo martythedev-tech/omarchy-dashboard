@@ -112,9 +112,10 @@ JOB_KINDS = ('update', 'rollback', 'remove', 'cleanup', 'install')
 # A job that is 'starting' this long without its worker having taken it never will.
 JOB_START_GRACE_SECONDS = 60
 
-# Seeded into APPS_PATH the first time it's missing; from then on the file on
-# disk is what's read; edit it there (or via the "+ Add app" form) to add or
-# change tracked apps.
+# Seeded into APPS_PATH the first time it's missing -- only those whose checkout exists, so
+# anyone else installing this starts with no apps rather than two rows for folders they do
+# not have. From then on the file on disk is what's read; edit it there (or via the
+# "+ Add app" form) to add or change tracked apps.
 DEFAULT_APPS = [
     {'id': 'flea', 'name': 'Flea', 'repoDir': str(Path.home() / 'Projects/flea'), 'pkgName': 'flea',
      'branch': 'master', 'remote': 'origin', 'updateCmd': ['./rebuild.sh', '--install']},
@@ -261,7 +262,11 @@ def load_apps():
                 return data
         except (OSError, ValueError):
             pass
-    return DEFAULT_APPS
+    return default_apps()
+
+
+def default_apps():
+    return [a for a in DEFAULT_APPS if (Path(a['repoDir']) / '.git').is_dir()]
 
 
 def save_apps(apps):
@@ -274,7 +279,7 @@ def save_apps(apps):
 def ensure_apps_file():
     if APPS_PATH.exists():
         return
-    save_apps(DEFAULT_APPS)
+    save_apps(default_apps())
 
 
 def discover_plugins():
@@ -1136,7 +1141,8 @@ def cmd_terminal_update(args):
         print(f"{a['name']}: {before[a['id']] or '?'} → {after or '?'}" + ('' if ok else ' (failed)'))
         append_history({'ts': time.time(), 'id': a['id'], 'name': a['name'], 'kind': 'app', 'action': 'update',
                         'ok': ok, 'before': '', 'after': '', 'fromVersion': before[a['id']], 'toVersion': after,
-                        'unitsInstalled': [], 'message': '' if ok else 'the update command failed; see its terminal'})
+                        'unitsInstalled': [], 'source': 'package',
+                        'message': '' if ok else 'the update command failed; see its terminal'})
     check_all()
     if sys.stdin.isatty():
         try:
@@ -1261,7 +1267,7 @@ def check_all():
         'leftovers': leftovers(),
         # Plugin entries were recorded under their id (cmd_update knows no display name), so
         # Recent read "com.omastorm.radar updated"; show the name the rows use instead.
-        'history': [dict({k: e.get(k) for k in ('id', 'name', 'kind', 'action', 'ok', 'fromVersion',
+        'history': [dict({k: e.get(k) for k in ('id', 'name', 'kind', 'source', 'action', 'ok', 'fromVersion',
                                                  'toVersion', 'ts', 'message')},
                          name=display_names.get(e.get('id')) or e.get('name') or e.get('id'))
                     for e in reversed(history[-HISTORY_SHOWN:])],

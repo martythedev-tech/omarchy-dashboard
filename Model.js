@@ -262,6 +262,8 @@ function historyLine(e, nowSeconds) {
     // pulled commits that left the version alone (docs, tooling).
     else if (!e.ok) what = 'update failed'
     else if (versions) what = 'updated' + versions
+    // A package app's update is the system's: one that left it alone did not rebuild anything.
+    else if (e.source === 'package') what = 'not changed by the update'
     else what = e.kind === 'app' ? 'rebuilt, no version change' : 'updated, same version'
     return name + ' ' + what + ' · ' + relativeAge(e.ts, nowSeconds)
 }

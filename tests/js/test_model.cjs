@@ -188,6 +188,10 @@ assert.equal(ctx.historyLine({name: 'Omastorm', action: 'update', ok: true, from
              'Omastorm updated 0.1.15 → 0.1.16 · just now');
 assert.equal(ctx.historyLine({id: 'flea', kind: 'app', action: 'update', ok: true, fromVersion: '1', toVersion: '1', ts: now}, now),
              'flea rebuilt, no version change · just now');
+assert.equal(ctx.historyLine({name: 'Brave', kind: 'app', source: 'package', action: 'update', ok: true, fromVersion: '1:1.98-1', toVersion: '1:1.98-1', ts: now}, now),
+             'Brave not changed by the update · just now');
+assert.equal(ctx.historyLine({name: 'Brave', kind: 'app', source: 'package', action: 'update', ok: true, fromVersion: '1:1.98-1', toVersion: '1:1.99-1', ts: now}, now),
+             'Brave updated 1:1.98-1 → 1:1.99-1 · just now');
 assert.equal(ctx.historyLine({name: 'Omastorm', kind: 'plugin', action: 'update', ok: true, fromVersion: '0.1.16', toVersion: '0.1.16', ts: now}, now),
              'Omastorm updated, same version · just now');
 assert.equal(ctx.historyLine({name: 'X', action: 'update', ok: false, ts: now}, now), 'X update failed · just now');

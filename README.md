@@ -127,8 +127,9 @@ could not work out.
 
 **Stop tracking** (in the expanded row, two clicks) only forgets an app here; it never
 touches the repo or the package. Apps live in
-`~/.local/state/omarchy/plugins/martythedev-tech.dashboard/apps.json` (seeded on first run
-with Flea and Howdy), which can be hand-edited:
+`~/.local/state/omarchy/plugins/martythedev-tech.dashboard/apps.json`, which can be
+hand-edited. It starts empty -- except on the author's machine, where it is seeded with Flea
+and Howdy because their checkouts are there:
 
 ```json
 [
