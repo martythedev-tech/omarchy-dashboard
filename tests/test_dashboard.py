@@ -406,6 +406,25 @@ class LocalCommitsAndInstalledVersionTests(unittest.TestCase):
             (Path(d) / '.SRCINFO').write_text('pkgbase = x\n\tpkgver = 1.0\n')
             self.assertEqual(dash.srcinfo_version(d), '')
 
+    def test_manifest_description(self):
+        with tempfile.TemporaryDirectory() as d, patch.object(dash, 'PLUGINS_DIR', Path(d)):
+            (Path(d) / 'x').mkdir()
+            (Path(d) / 'x' / 'manifest.json').write_text('{"description": "Does a thing"}')
+            self.assertEqual(dash.manifest_description('x'), 'Does a thing')
+            self.assertEqual(dash.manifest_description('missing'), '')
+
+    def test_pkg_description_reads_pacman_qi(self):
+        out = 'Name            : brave-bin\nVersion         : 1:1.98.60-1\nDescription     : Web browser: fast\nArchitecture    : aarch64\n'
+        with patch.object(dash, 'run', fake_run({('pacman', '-Qi', 'brave-bin'): (0, out, '')})):
+            self.assertEqual(dash.pkg_description('brave-bin'), 'Web browser: fast')
+        with patch.object(dash, 'run', return_value=(1, '', 'not found')):
+            self.assertEqual(dash.pkg_description('nope'), '')
+
+    def test_app_row_carries_package_description(self):
+        item = self._check_app('up-to-date', '0.3.1-2', '\tpkgver = 0.3.1\n\tpkgrel = 2\n', vercmp_out='0')
+        self.assertEqual(item['description'], 'A file manager')
+        self.assertEqual(self._check_app('up-to-date', '', '')['description'], '')
+
     def test_installed_older_than_uses_vercmp(self):
         with patch.object(dash, 'run', fake_run({('vercmp', '0.3.9-1', '0.3.10-1'): (0, '-1\n', '')})):
             self.assertTrue(dash.installed_older_than('0.3.9-1', '0.3.10-1'))
@@ -420,6 +439,7 @@ class LocalCommitsAndInstalledVersionTests(unittest.TestCase):
                 (Path(d) / '.SRCINFO').write_text(srcinfo)
             table = {
                 ('vercmp',): (0, vercmp_out + '\n', ''),
+                ('pacman', '-Qi'): (0, 'Name            : flea\nDescription     : A file manager\n', ''),
                 ('git', '-C', d, 'rev-list', '--count', 'origin/master..HEAD'): (0, '21\n', ''),
                 ('git', '-C', d, 'show', 'origin/master:.SRCINFO'): (0, 'pkgbase = flea\n\tpkgver = 0.3.1\n\tpkgrel = 2\n', ''),
             }
