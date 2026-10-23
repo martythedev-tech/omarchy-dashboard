@@ -27,8 +27,21 @@ function canHold(item) {
 
 // True for anything a diff preview is meaningful for: 'behind' shows what
 // the Update button would apply, 'diverged' shows what's making it refuse.
+// Not for a package app: there is no checkout to diff, only a version.
 function canShowDiff(item) {
-    return !!item && (item.updateState === 'behind' || item.updateState === 'diverged')
+    return !!item && item.source !== 'package' && (item.updateState === 'behind' || item.updateState === 'diverged')
+}
+
+// A package app (pacman or AUR) updates in a terminal, where sudo can ask -- never as a
+// background job, so never in Update all's job either.
+function inTerminal(item) {
+    return !!item && item.source === 'package'
+}
+
+// The Update button's caption: a repo package is updated by updating the whole system.
+function updateCaption(item) {
+    if (!inTerminal(item)) return 'Update'
+    return item.updateVia === 'system' ? 'Update system…' : 'Update…'
 }
 
 // Whether an item belongs in the bar badge (and its pulse): updatable, not held, and
@@ -61,7 +74,9 @@ function stateLabel(item) {
     if (!item) return ''
     var why = item.reason ? ' (' + item.reason.split('\n')[0] + ')' : ''
     switch (item.updateState) {
-        case 'behind': return item.behind + (item.behind === 1 ? ' commit behind' : ' commits behind')
+        case 'behind':
+            if (item.source === 'package') return 'Update available' + (item.upstreamVersion ? ': ' + item.upstreamVersion : '')
+            return item.behind + (item.behind === 1 ? ' commit behind' : ' commits behind')
         case 'dirty': return 'Local changes' + why + ' -- update manually'
         case 'diverged': return 'Local commits ahead' + why + ' -- update manually'
         // A git operation (rebase/merge/cherry-pick/bisect) left mid-flight --
@@ -70,7 +85,7 @@ function stateLabel(item) {
         // way they refuse 'dirty'/'diverged': see canUpdate/canShowDiff below.
         case 'in-progress': return 'Git operation in progress' + why + ' -- resolve manually'
         case 'not-installed': return 'Built, not installed' + why
-        case 'no-repo': return 'No update source'
+        case 'no-repo': return 'No update source' + why
         case 'unreachable': return 'Could not reach source' + (item.reason ? ': ' + item.reason.split('\n')[0] : '')
         case 'up-to-date': return 'Up to date'
         default: return ''
@@ -133,7 +148,7 @@ function pillLabel(item) {
     if (item.enabled === false) return 'OFF'
     if (item.held) return 'HELD'
     switch (item.updateState) {
-        case 'behind': return 'BEHIND ' + item.behind
+        case 'behind': return item.source === 'package' ? 'UPDATE' : 'BEHIND ' + item.behind
         case 'up-to-date': return 'CURRENT'
         case 'diverged': return 'DIVERGED'
         case 'dirty': return 'DIRTY'
@@ -268,6 +283,10 @@ function infoRows(item, nowSeconds, home) {
     if (item.held) status += ' · held' + (item.holdReason && item.holdReason !== 'held' ? ' (' + item.holdReason + ')' : '')
     if (item.ahead > 0) status += ' · ' + item.ahead + (item.ahead === 1 ? ' local commit' : ' local commits')
     rows.push(['Status', status])
+    if (item.source === 'package') {
+        rows.push(['From', info.repo === 'AUR' ? 'the AUR' : 'the ' + info.repo + ' repo'])
+        rows.push(['Updates', item.updateVia === 'system' ? 'with the system (omarchy update), in a terminal' : 'yay -S, in a terminal'])
+    }
     if (info.branch) rows.push(['Branch', info.branch])
     if (info.upstreamTs) rows.push(['Upstream', 'last commit ' + relativeAge(info.upstreamTs, nowSeconds)])
     if (info.path) rows.push(['Folder', home && info.path.indexOf(home + '/') === 0 ? '~' + info.path.slice(home.length) : info.path])

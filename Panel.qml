@@ -78,7 +78,11 @@ Panel {
     property string diffTab: "commits"
     property var detailCommits: ({incoming: [], local: []})
     readonly property var history: status.history || []
-    property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install"})
+    property var addAppFields: ({name: "", id: "", repoDir: "", pkgName: "", branch: "", remote: "", updateCmd: "./rebuild.sh --install", pullFirst: false})
+    // What is being added: a source repo built here ("repo") or an installed pacman/AUR
+    // package ("package"), and whether the notes under the form are problems or just facts.
+    property string addAppSource: "repo"
+    property bool addAppNotesOk: false
     property real now: Date.now() / 1000
     property real elapsedNow: Date.now() / 1000
 
@@ -151,8 +155,14 @@ Panel {
 
     function runUpdateAll() {
         if (root.busyId !== "" || root.updateQueueTotal > 0) return
-        var ids = []
-        for (var i = 0; i < root.items.length; i++) if (Model.canUpdate(root.items[i])) ids.push(root.items[i].id)
+        var ids = [], terminal = []
+        for (var i = 0; i < root.items.length; i++) {
+            if (!Model.canUpdate(root.items[i])) continue
+            if (Model.inTerminal(root.items[i])) terminal.push(root.items[i].id)
+            else ids.push(root.items[i].id)
+        }
+        // Package apps get one terminal between them; the rest run as the usual job.
+        if (terminal.length > 0) root.updateInTerminal(terminal)
         if (ids.length === 0) return
         root.updateQueueTotal = ids.length
         root.updateQueueDone = 1
@@ -162,6 +172,13 @@ Panel {
         root.actionStartSec = Date.now() / 1000
         root.actionStatus = actionVerb("update") + ids[0] + "…"
         startJob("update", ids)
+    }
+
+    // Package apps (pacman, AUR): their update needs sudo, so it opens in a terminal
+    // (dashboard.py terminal-update), which records it and rechecks when done.
+    function updateInTerminal(ids) {
+        Quickshell.execDetached(["python3", root.helper, "open-terminal-update"].concat(ids))
+        root.actionStatus = "Updating " + ids.map(root.itemName).join(", ") + " in a terminal…"
     }
 
     function startJob(kind, ids, purge) {
@@ -256,7 +273,7 @@ Panel {
         // install, on its Discover row.
         if (kind === "install") root.showView(r.ok ? "installed" : "discover")
         if (kind === "add-app") {
-            if (!r.ok) root.addAppNotes = [r.message || "Could not add it."]
+            if (!r.ok) { root.addAppNotes = [r.message || "Could not add it."]; root.addAppNotesOk = false }
             if (r.ok) root.addAppFormOpen = false
         } else if (r.ok && (kind === "remove" || kind === "remove-app")) {
             // The row is about to disappear from the list -- nothing left to show a panel on;
@@ -370,7 +387,10 @@ Panel {
     function submitAddApp() {
         if (root.busyId !== "") return
         var f = root.addAppFields
-        if (!f.name || !f.id || !f.repoDir) { root.actionStatus = "Name, id, and repo dir are required."; return }
+        if (root.addAppSource === "package") {
+            f = {source: "package", pkgName: pkgLookupField.text.trim(), name: f.name, id: f.id || pkgLookupField.text.trim()}
+            if (!f.pkgName) { root.actionStatus = "A package name is required."; return }
+        } else if (!f.name || !f.id || !f.repoDir) { root.actionStatus = "Name, id, and repo dir are required."; return }
         root.busyId = "__add_app__"
         root.lastActionKind = "add-app"
         root.actionStatus = "Adding " + f.name + "…"
@@ -408,6 +428,8 @@ Panel {
         function check(): string { root.runCheck(true); return "ok" }
         function count(): string { return String(root.updatable) }
         function update(id: string): string {
+            for (var i = 0; i < root.items.length; i++)
+                if (root.items[i].id === id && Model.inTerminal(root.items[i])) { root.updateInTerminal([id]); return "terminal" }
             if (root.busyId !== "") return "busy"
             root.runAction("update", id)
             return "started"
@@ -558,7 +580,13 @@ Panel {
     // desktop's folder chooser (its own process; see cmd_pick_folder for why).
     function applyRepoGuess(r) {
         root.addAppNotes = r.notes || []
+        root.addAppNotesOk = !!r.ok
         var f = r.fields || {}
+        if (f.source === "package") {
+            nameField.text = f.name || ""
+            idField.text = f.id || ""
+            return
+        }
         if (f.repoDir !== undefined) repoField.text = f.repoDir
         if (!r.ok) return
         nameField.text = f.name || ""
@@ -567,6 +595,7 @@ Panel {
         branchField.text = f.branch || ""
         remoteField.text = f.remote || ""
         cmdField.text = f.updateCmd || ""
+        root.addAppFields = Object.assign({}, root.addAppFields, {pullFirst: !!f.pullFirst})
     }
 
     Process {
@@ -580,6 +609,7 @@ Panel {
                     root.applyRepoGuess(r)
                 } catch (e) {
                     root.addAppNotes = ["Could not read that repo."]
+                    root.addAppNotesOk = false
                 }
             }
         }
@@ -861,7 +891,7 @@ Panel {
                         text: row.busy
                               ? (Math.max(0, Math.round(root.elapsedNow - root.actionStartSec)) + "s")
                               : ((row.modelData.version ? "v" + row.modelData.version : "no version")
-                                 + (row.modelData.kind === "app" ? " · app" : "")
+                                 + (row.modelData.kind === "app" ? (row.modelData.source === "package" ? " · package" : " · app") : "")
                                  + (row.isSelf ? " · this widget" : "")
                                  + (row.modelData.held ? " · held" + (row.modelData.holdReason && row.modelData.holdReason !== "held" ? ": " + row.modelData.holdReason : "") : "")
                                  + (!row.modelData.held && row.modelData.updateState === "not-installed" && row.modelData.reason ? " · " + row.modelData.reason : "")
@@ -938,11 +968,11 @@ Panel {
                     // back and Remove and ran them over its own name and pill. The rest live in
                     // the expanded row.
                     SmallButton {
-                        text: row.busy ? "…" : "Update"
+                        text: row.busy ? "…" : Model.updateCaption(row.modelData)
                         visible: Model.canUpdate(row.modelData)
                         enabled: !row.busy && root.busyId === ""
                         anchors.verticalCenter: parent.verticalCenter
-                        onClicked: root.runAction("update", row.modelData.id)
+                        onClicked: Model.inTerminal(row.modelData) ? root.updateInTerminal([row.modelData.id]) : root.runAction("update", row.modelData.id)
                     }
                     SmallButton {
                         text: "Unhold"
@@ -1260,6 +1290,32 @@ Panel {
                         spacing: 8
                         Label { text: modelData[0]; width: 64; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.45) }
                         Label { text: modelData[1]; width: parent.width - 72; wrapMode: Text.Wrap; font.pixelSize: Style.font.caption; color: Util.alpha(root.ink, 0.8) }
+                    }
+                }
+                // The catalog's screenshot, fetched only once the row is opened.
+                Rectangle {
+                    visible: !!drow.modelData.preview
+                    width: parent.width
+                    height: visible ? Math.round(width / (drow.modelData.previewAspect || 1.778)) : 0
+                    radius: 6
+                    color: Style.normalFill
+                    border.color: Style.normalBorderColor
+                    clip: true
+                    Image {
+                        id: previewImage
+                        anchors.fill: parent
+                        anchors.margins: 1
+                        source: drow.open && drow.modelData.preview ? drow.modelData.preview : ""
+                        asynchronous: true
+                        cache: true
+                        fillMode: Image.PreserveAspectFit
+                        sourceSize.width: Math.ceil(width * 2)
+                    }
+                    Label {
+                        anchors.centerIn: parent
+                        visible: previewImage.status !== Image.Ready
+                        text: previewImage.status === Image.Error ? "No preview" : "Loading preview…"
+                        font.pixelSize: Style.font.caption
                     }
                 }
                 Flow {
@@ -1729,11 +1785,48 @@ Panel {
                                 width: parent.width
                                 visible: root.addAppFormOpen
                                 spacing: 6
+                                Row {
+                                    spacing: 6
+                                    SmallButton {
+                                        text: "Source repo"
+                                        accent: root.addAppSource === "repo" ? Commons.Color.accent : Commons.Color.muted
+                                        onClicked: { root.addAppSource = "repo"; root.addAppNotes = [] }
+                                    }
+                                    SmallButton {
+                                        text: "Installed package"
+                                        accent: root.addAppSource === "package" ? Commons.Color.accent : Commons.Color.muted
+                                        onClicked: { root.addAppSource = "package"; root.addAppNotes = [] }
+                                    }
+                                }
+                                // A package (brave-bin): Fill in reads where it comes from and how it
+                                // updates -- with the system for a repo package, yay for an AUR one.
+                                Item {
+                                    width: parent.width
+                                    height: pkgLookupField.height
+                                    visible: root.addAppSource === "package"
+                                    FieldInput {
+                                        id: pkgLookupField
+                                        anchors.left: parent.left
+                                        anchors.right: pkgLookupButton.left
+                                        anchors.rightMargin: 6
+                                        placeholder: "Installed package, e.g. brave-bin"
+                                    }
+                                    SmallButton {
+                                        id: pkgLookupButton
+                                        anchors.right: parent.right
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        text: "Fill in"
+                                        accent: Commons.Color.muted
+                                        enabled: !repoProc.running && pkgLookupField.text.length > 0
+                                        onClicked: { repoProc.command = ["python3", root.helper, "inspect-package", pkgLookupField.text]; repoProc.running = true }
+                                    }
+                                }
                                 // The repo comes first: Choose… or Fill in reads it and guesses the rest
                                 // (name, id, package from .SRCINFO, upstream branch and remote, rebuild.sh).
                                 Item {
                                     width: parent.width
                                     height: repoField.height
+                                    visible: root.addAppSource === "repo"
                                     FieldInput {
                                         id: repoField
                                         anchors.left: parent.left
@@ -1763,14 +1856,23 @@ Panel {
                                 }
                                 FieldInput { id: nameField; placeholder: "Display name"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {name: text}) }
                                 FieldInput { id: idField; placeholder: "id (lowercase, no spaces)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {id: text}) }
-                                FieldInput { id: pkgField; placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
+                                FieldInput { id: pkgField; visible: root.addAppSource === "repo"; placeholder: "Package name (defaults to id)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {pkgName: text}) }
                                 Row {
                                     width: parent.width
                                     spacing: 6
+                                    visible: root.addAppSource === "repo"
                                     FieldInput { id: branchField; width: (parent.width - 6) / 2; placeholder: "Upstream branch (default master)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {branch: text}) }
                                     FieldInput { id: remoteField; width: (parent.width - 6) / 2; placeholder: "Remote (default origin)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {remote: text}) }
                                 }
-                                FieldInput { id: cmdField; text: "./rebuild.sh --install"; placeholder: "Update command (builds and installs it)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
+                                FieldInput { id: cmdField; visible: root.addAppSource === "repo"; text: "./rebuild.sh --install"; placeholder: "Update command (builds and installs it)"; onTextChanged: root.addAppFields = Object.assign({}, root.addAppFields, {updateCmd: text}) }
+                                // Off for a rebuild.sh, which merges upstream itself; on for a command
+                                // that only builds (make install), or it would rebuild the old code.
+                                SmallButton {
+                                    visible: root.addAppSource === "repo"
+                                    text: (root.addAppFields.pullFirst ? "☑" : "☐") + " Pull upstream first"
+                                    accent: Commons.Color.muted
+                                    onClicked: root.addAppFields = Object.assign({}, root.addAppFields, {pullFirst: !root.addAppFields.pullFirst})
+                                }
                                 Repeater {
                                     model: root.addAppNotes
                                     Label {
@@ -1779,7 +1881,7 @@ Panel {
                                         wrapMode: Text.WordWrap
                                         text: "· " + modelData
                                         font.pixelSize: Style.font.caption
-                                        color: Commons.Color.urgent
+                                        color: root.addAppNotesOk ? Util.alpha(root.ink, 0.62) : Commons.Color.urgent
                                     }
                                 }
                                 SmallButton { text: "Save"; enabled: root.busyId === ""; onClicked: root.submitAddApp() }
