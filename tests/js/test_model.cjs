@@ -372,4 +372,14 @@ assert.equal(ctx.marketLine(mk({}, {installed: 'unverified', checked: '', sinceC
 assert.equal(ctx.marketLine(mk({updateState: 'behind'}, {installed: 'unverified', checked: 'abc1234', sinceChecked: -1, incoming: 'verified'})),
              'Unverified: not the commit its security check passed (abc1234). The update is the verified commit.');
 
-console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles, marketplace verification all pass.');
+// Update all's scope.
+assert.equal(ctx.inUpdateAll(mk({updateState: 'behind'}, {incoming: 'unverified'}), 'all'), true);
+assert.equal(ctx.inUpdateAll(mk({updateState: 'behind'}, {incoming: 'verified'}), 'verified'), true);
+assert.equal(ctx.inUpdateAll(mk({updateState: 'behind'}, {incoming: 'unverified'}), 'verified'), false);
+assert.equal(ctx.inUpdateAll(mk({updateState: 'behind'}, null), 'verified'), false, 'unlisted stays out');
+assert.equal(ctx.inUpdateAll(mk({updateState: 'behind'}, undefined), 'verified'), false, 'unknown stays out');
+assert.equal(ctx.inUpdateAll(mk({kind: 'app', updateState: 'behind'}, undefined), 'verified'), true, 'apps always go');
+assert.equal(ctx.inUpdateAll(mk({updateState: 'behind', held: true}, {incoming: 'verified'}), 'verified'), false, 'held stays out');
+assert.equal(ctx.inUpdateAll(mk({}, {incoming: 'verified'}), 'all'), false, 'nothing to update');
+
+console.log('Model.js: canUpdate/badgeCount, stateLabel wording, groupByKind sort/split, relativeAge buckets, not-installed, localTag, holds, commits, history, status sort, row info and Update all summary, version-change badge, jobs, removal plan, gauge tone, discover, tiles, marketplace verification, Update all scope all pass.');

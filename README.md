@@ -231,7 +231,16 @@ Most listed plugins move faster than the check, so UNVERIFIED is common and is n
 warning on its own: it means nobody but you has looked at this exact code. The expanded row
 links to the plugin's marketplace page (**Marketplace ↗**). The check reuses Discover's
 cached catalog (refetched when older than 6 hours); if it cannot be read, rows show no
-badge rather than a guess. Update all does not filter on it.
+badge rather than a guess.
+
+**Update all: verified only.** The switch at the bottom right of the panel (**Update all:
+everything** / **Update all: verified only**; click it to flip) narrows Update all to plugin
+updates that bring the verified commit. The button then reads **Update verified (N)**. Left
+out: an UPDATE UNVERIFIED plugin, an unlisted one (your own plugins included), and any
+plugin while the catalog cannot be read. Apps are not in the marketplace and always go.
+Each skipped row keeps its own **Update** button, and the summary names what was skipped.
+The notification's **Update** follows the same switch. The choice is kept in
+`settings.json` in the state folder.
 
 Checks run side by side, so a full check takes about as long as the slowest single
 fetch rather than the sum of them.
@@ -256,7 +265,8 @@ fetch rather than the sum of them.
 - **Recent**: every update, rollback, install and removal is recorded in
   `history.json` (last 50); the newest few are listed at the bottom of the panel.
 - **Update all**: appears once more than one item is updatable; updates them
-  one at a time (package apps together, in one terminal -- see [Apps](#apps)).
+  one at a time (package apps together, in one terminal -- see [Apps](#apps)). It can be
+  limited to marketplace-verified plugin updates (see [verified only](#marketplace-verification)).
 - **Remove…** (a plugin): shows what it will do before anything happens --
   delete the folder (a git checkout; its source stays upstream), unlink it (a
   symlink), or move it to a backup (anything else); stop and remove the
@@ -314,8 +324,8 @@ services it ships that are running are restarted, so they run the new code.
 ## Notifications
 
 The "update available" notification has **Update** and **Open** buttons. Update
-updates the items it named that are still updatable and not held, then says how
-that went; Open opens the panel. It runs as a job like any other, so an open panel shows it
+updates the items it named that are still updatable and not held (and verified, under
+**Update all: verified only**), then says how that went, naming anything skipped; Open opens the panel. It runs as a job like any other, so an open panel shows it
 going -- except package apps, which get a terminal.
 The notification is waited on by a small
 transient user unit (`dashboard-notify-*`), which goes away once it is clicked,

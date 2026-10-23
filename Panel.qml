@@ -23,12 +23,18 @@ Panel {
     property var status: ({})
     readonly property var items: status.items || []
     readonly property var grouped: Model.groupByKind(items)
+    // Everything with an update waiting, whatever Update all's scope takes.
+    readonly property int updatableAny: {
+        var n = 0
+        for (var i = 0; i < items.length; i++) if (Model.canUpdate(items[i])) n++
+        return n
+    }
     // The bar badge, pulse, tooltip and IPC count: updates that change a version.
     readonly property int updatable: Model.badgeCount(items)
     // Everything Update all would run, including commits that leave the version alone.
     readonly property int updatableAll: {
         var n = 0
-        for (var i = 0; i < items.length; i++) if (Model.canUpdate(items[i])) n++
+        for (var i = 0; i < items.length; i++) if (Model.inUpdateAll(items[i], root.updateAllScope)) n++
         return n
     }
     property string actionStatus: ""
@@ -156,8 +162,10 @@ Panel {
     function runUpdateAll() {
         if (root.busyId !== "" || root.updateQueueTotal > 0) return
         var ids = [], terminal = []
+        root.queueSkipped = []
         for (var i = 0; i < root.items.length; i++) {
             if (!Model.canUpdate(root.items[i])) continue
+            if (!Model.inUpdateAll(root.items[i], root.updateAllScope)) { root.queueSkipped.push(root.items[i].name); continue }
             if (Model.inTerminal(root.items[i])) terminal.push(root.items[i].id)
             else ids.push(root.items[i].id)
         }
@@ -345,6 +353,7 @@ Panel {
         root.queueResults = []
         if (results.length === 0) return
         root.actionStatus = Model.queueSummary(results)
+            + (root.queueSkipped.length ? " Skipped, update not verified: " + root.queueSkipped.join(", ") + "." : "")
         for (var i = 0; i < results.length; i++) {
             if (!results[i].ok) {
                 root.detailOpenId = results[i].id
@@ -445,6 +454,26 @@ Panel {
         printErrors: false
         onFileChanged: reload()
         onLoaded: { try { root.status = JSON.parse(text()) } catch (e) {} }
+    }
+
+    // Update all's reach: "all", or "verified" for plugin updates the marketplace verified
+    // (apps always go). Kept in settings.json, which dashboard.py reads for a notification's
+    // Update; the footer switches it.
+    property string updateAllScope: "all"
+    property var queueSkipped: []
+    FileView {
+        id: settingsFile
+        path: root.stateDir + "/settings.json"
+        watchChanges: true
+        printErrors: false
+        onFileChanged: reload()
+        onLoaded: {
+            try { root.updateAllScope = JSON.parse(text()).updateAllScope === "verified" ? "verified" : "all" } catch (e) {}
+        }
+    }
+    function setUpdateAllScope(scope) {
+        root.updateAllScope = scope
+        settingsFile.setText(JSON.stringify({updateAllScope: scope}, null, 2) + "\n")
     }
 
     // The theme's named colors (red, green, ...), which Commons.Color does not expose: the
@@ -1696,8 +1725,12 @@ Panel {
                         anchors.verticalCenter: parent.verticalCenter
                         spacing: 8
                         SmallButton {
-                            text: root.updateQueueTotal > 0 ? ("Updating " + root.updateQueueDone + "/" + root.updateQueueTotal + "…") : "Update all (" + root.updatableAll + ")"
-                            visible: root.view === "installed" && (root.updatableAll > 1 || root.updateQueueTotal > 0)
+                            text: root.updateQueueTotal > 0 ? ("Updating " + root.updateQueueDone + "/" + root.updateQueueTotal + "…")
+                                  : (root.updateAllScope === "verified" ? "Update verified (" : "Update all (") + root.updatableAll + ")"
+                            // A lone update has its own button -- unless verified-only leaves
+                            // one out, when this says which one the scope takes.
+                            visible: root.view === "installed" && (root.updatableAll > 1 || root.updateQueueTotal > 0
+                                     || (root.updateAllScope === "verified" && root.updatableAll === 1 && root.updatableAny > 1))
                             enabled: root.updateQueueTotal === 0 && root.busyId === "" && !checkProc.running
                             anchors.verticalCenter: parent.verticalCenter
                             onClicked: root.runUpdateAll()
@@ -2127,14 +2160,36 @@ Panel {
                 }
 
                 Rectangle { width: parent.width; height: 1; color: Style.normalBorderColor }
+                Item {
+                    width: parent.width
+                    height: Math.max(footerStatus.implicitHeight, scopeSwitch.implicitHeight)
                 Label {
                     id: footerStatus
-                    width: parent.width
+                    width: parent.width - (scopeSwitch.visible ? scopeSwitch.implicitWidth + 12 : 0)
                     wrapMode: Text.WordWrap
                     font.pixelSize: Style.font.caption
                     text: (root.busyId === "" && !checkProc.running ? root.actionStatus : "") ||
                           (checkProc.running ? "Checking sources…" :
                            "Last checked " + Model.relativeAge(root.status.ts, root.now))
+                }
+                // Update all's scope, as a quiet switch: click to flip.
+                Text {
+                    id: scopeSwitch
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    visible: root.view === "installed" && root.grouped.plugins.length + root.grouped.disabled.length > 0
+                    text: "Update all: " + (root.updateAllScope === "verified" ? "verified only" : "everything")
+                    color: scopeMouse.containsMouse ? Commons.Color.accent : Util.alpha(root.ink, root.updateAllScope === "verified" ? 0.8 : 0.45)
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.caption
+                    MouseArea {
+                        id: scopeMouse
+                        anchors.fill: parent
+                        hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.setUpdateAllScope(root.updateAllScope === "verified" ? "all" : "verified")
+                    }
+                }
                 }
             }
         }

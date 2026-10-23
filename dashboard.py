@@ -234,6 +234,27 @@ def save_holds(holds):
     _write_json(holds_path(), holds)
 
 
+def settings_path():
+    return STATE / 'settings.json'
+
+
+def update_all_scope():
+    """'verified' when Update all (and a notification's Update) should take only plugin
+    updates that bring the commit the marketplace verified; 'all' otherwise. The panel's
+    footer writes it."""
+    settings = _read_json(settings_path(), {})
+    return 'verified' if isinstance(settings, dict) and settings.get('updateAllScope') == 'verified' else 'all'
+
+
+def in_update_all(item, scope):
+    """Whether Update all takes this item under that scope. Apps are not in the marketplace
+    and always go; a plugin goes under 'verified' only if its update is the verified commit
+    -- one that is unlisted, or whose catalog could not be read, does not."""
+    if scope != 'verified' or item.get('kind') == 'app':
+        return True
+    return (item.get('market') or {}).get('incoming') == 'verified'
+
+
 def repo_head(repo_dir):
     rc, out, _ = run(['git', '-C', str(repo_dir), 'rev-parse', 'HEAD'])
     return out.strip() if rc == 0 else ''
@@ -1231,16 +1252,23 @@ def cmd_await_notification(args):
     if choice != 'update':
         return
     status = load_status() or {}
-    wanted = {i['id'] for i in status.get('items', [])
-              if i['id'] in args.ids and i.get('updateState') in UPDATABLE_STATES and not i.get('held')}
+    scope = update_all_scope()
+    waiting = [i for i in status.get('items', [])
+               if i['id'] in args.ids and i.get('updateState') in UPDATABLE_STATES and not i.get('held')]
+    wanted = {i['id'] for i in waiting if in_update_all(i, scope)}
+    skipped = [i.get('name', i['id']) for i in waiting if i['id'] not in wanted]
     names = {i['id']: i.get('name', i['id']) for i in status.get('items', [])}
     done, failed = [], []
     ids = [i for i in args.ids if i in wanted]
+    skipped_note = ('Skipped, update not verified: ' + ', '.join(skipped)) if skipped else ''
     in_terminal = terminal_ids(status.get('items', []), ids)
     if in_terminal:
         open_terminal_update(in_terminal)
         ids = [i for i in ids if i not in in_terminal]
         if not ids:
+            if skipped_note:
+                run(['notify-send', '--app-name=Plugin Dashboard', '--icon=dialog-information',
+                     'Not all updated', skipped_note], timeout=5)
             return
     # As a job, so an open panel shows it going like one it started itself. This waiter
     # is already its own unit, so it runs the job in-process.
@@ -1252,13 +1280,14 @@ def cmd_await_notification(args):
     for r in (execute_job(job)['results'] if job else []):
         (done if r['ok'] else failed).append(names.get(r['id'], r['id']))
     if not done and not failed:
-        body = 'Nothing left to update.'
+        body = skipped_note or 'Nothing left to update.'
     else:
         body = ', '.join(filter(None, ['Updated ' + ', '.join(done) if done else '',
                                        'failed: ' + ', '.join(failed) if failed else '']))
+        body += ('. ' + skipped_note) if skipped_note else ''
     run(['notify-send', '--app-name=Plugin Dashboard',
          '--icon=' + ('dialog-error' if failed else 'system-software-update'),
-         'Update failed' if failed else 'Updated', body + (' — open the Dashboard for details.' if failed else '')],
+         'Update failed' if failed else 'Updated' if done else 'Not updated', body + (' — open the Dashboard for details.' if failed else '')],
         timeout=5)
 
 

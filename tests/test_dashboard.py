@@ -1349,6 +1349,37 @@ class AwaitNotificationTests(unittest.TestCase):
         self.assertIn('Update failed', last)
         self.assertIn('Updated A, failed: D — open the Dashboard for details.', last)
 
+    def _verified_only(self):
+        dash.STATUS_PATH.write_text(json.dumps({'items': [
+            {'id': 'a', 'name': 'A', 'kind': 'plugin', 'updateState': 'behind', 'market': {'incoming': 'verified'}},
+            {'id': 'd', 'name': 'D', 'kind': 'plugin', 'updateState': 'behind', 'market': {'incoming': 'unverified'}},
+            {'id': 'u', 'name': 'U', 'kind': 'plugin', 'updateState': 'behind', 'market': None},
+            {'id': 'e', 'name': 'E', 'kind': 'app', 'updateState': 'behind'},
+        ]}))
+        dash._write_json(dash.settings_path(), {'updateAllScope': 'verified'})
+        self.update_ok.update(a=True, e=True)
+
+    def test_verified_only_skips_unverified_plugin_updates_and_says_so(self):
+        self._verified_only()
+        self.wait(ids=('a', 'd', 'u', 'e'))
+        self.assertEqual(self.updated, ['a', 'e'], 'apps are not in the marketplace and always go')
+        self.assertIn('Updated A, E. Skipped, update not verified: D, U', self.run_calls[-1])
+
+    def test_verified_only_with_nothing_verified_says_not_updated(self):
+        self._verified_only()
+        self.wait(ids=('d', 'u'))
+        self.assertEqual(self.updated, [])
+        self.assertIn('Not updated', self.run_calls[-1])
+        self.assertIn('Skipped, update not verified: D, U', self.run_calls[-1])
+
+    def test_scope_defaults_to_all(self):
+        self.assertEqual(dash.update_all_scope(), 'all')
+        dash._write_json(dash.settings_path(), {'updateAllScope': 'bogus'})
+        self.assertEqual(dash.update_all_scope(), 'all')
+        dash._write_json(dash.settings_path(), ['not', 'a', 'dict'])
+        self.assertEqual(dash.update_all_scope(), 'all')
+        self.assertTrue(dash.in_update_all({'kind': 'plugin', 'market': None}, 'all'))
+
     def test_nothing_left(self):
         self.wait(ids=('c',))
         self.assertIn('Nothing left to update.', self.run_calls[-1])
