@@ -734,87 +734,137 @@ Panel {
             font.pixelSize: Style.font.bodySmall
         }
     }
-    // The Dashboard's mark: a dial, as on a car's dashboard. The arc fills with the share of
-    // items that are current and the needle points at it; both wear the theme's colour for
-    // the mood (Model.gaugeTone): green all current, yellow updates waiting, red something
-    // needs a person. While a check or an action runs, the needle sweeps.
-    component Gauge: Item {
-        id: g
-        property real frac: 0
+    // The Dashboard's mark: a puzzle piece, the usual sign for plugins. It wears the theme's
+    // colour for the mood (Model.gaugeTone) and moves with it:
+    //   calm       green, seated in its slot
+    //   waiting    yellow, lifted out of its slot (tilted), the count beside it
+    //   attention  red, with one shake when it turns red
+    //   working    rocks on its base while a check or an action runs
+    // and drops back into its slot with a bounce when updates are done -- a small pop if
+    // it was already seated.
+    component Puzzle: Item {
+        id: pz
         property color tone: Commons.Color.accent
         property color track: Style.normalBorderColor
-        property color needle: root.ink
+        property string mood: "idle"
         property bool working: false
         property bool compact: false
-        // The needle eases to a new reading instead of jumping.
-        property real shown: frac
-        Behavior on shown { NumberAnimation { duration: 700; easing.type: Easing.OutBack } }
-        property real sweep: 0.15
-        SequentialAnimation on sweep {
-            running: g.working
-            loops: Animation.Infinite
-            NumberAnimation { from: 0.15; to: 0.85; duration: 850; easing.type: Easing.InOutSine }
-            NumberAnimation { from: 0.85; to: 0.15; duration: 850; easing.type: Easing.InOutSine }
-        }
         implicitWidth: compact ? 22 : 48
         implicitHeight: implicitWidth
+
+        property real lift: mood === "waiting" ? 1 : 0
+        property real rock: 0
+        property real pop: 1
+        readonly property bool lifted: mood === "waiting"
+        onLiftedChanged: {
+            if (lifted) { dropIn.stop(); liftUp.restart() }
+            else { liftUp.stop(); dropIn.restart() }
+        }
+        onMoodChanged: if (mood === "attention" && !working) shake.restart()
+        onWorkingChanged: {
+            if (working) return
+            settle.restart()
+            if (mood === "calm" && !lifted) popIn.restart()
+        }
+        NumberAnimation { id: liftUp; target: pz; property: "lift"; to: 1; duration: 380; easing.type: Easing.OutBack }
+        NumberAnimation { id: dropIn; target: pz; property: "lift"; to: 0; duration: 700; easing.type: Easing.OutBounce }
+        SequentialAnimation {
+            running: pz.working
+            loops: Animation.Infinite
+            NumberAnimation { target: pz; property: "rock"; to: 10; duration: 260; easing.type: Easing.InOutSine }
+            NumberAnimation { target: pz; property: "rock"; to: -10; duration: 520; easing.type: Easing.InOutSine }
+            NumberAnimation { target: pz; property: "rock"; to: 0; duration: 260; easing.type: Easing.InOutSine }
+        }
+        NumberAnimation { id: settle; target: pz; property: "rock"; to: 0; duration: 200; easing.type: Easing.OutQuad }
+        SequentialAnimation {
+            id: shake
+            NumberAnimation { target: pz; property: "rock"; to: 14; duration: 60 }
+            NumberAnimation { target: pz; property: "rock"; to: -14; duration: 110 }
+            NumberAnimation { target: pz; property: "rock"; to: 9; duration: 100 }
+            NumberAnimation { target: pz; property: "rock"; to: -6; duration: 90 }
+            NumberAnimation { target: pz; property: "rock"; to: 0; duration: 80 }
+        }
+        SequentialAnimation {
+            id: popIn
+            NumberAnimation { target: pz; property: "pop"; to: 1.18; duration: 90; easing.type: Easing.OutQuad }
+            NumberAnimation { target: pz; property: "pop"; to: 1; duration: 320; easing.type: Easing.OutBack }
+        }
+
+        // The piece's outline in a 1x1 box: a tab on top and on the right, a blank (an
+        // inward notch) on the left, a flat bottom to sit on.
+        function trace(ctx, ox, oy, k) {
+            function X(v) { return ox + v * k }
+            function Y(v) { return oy + v * k }
+            var x0 = 0.12, x1 = 0.76, y0 = 0.3, y1 = 0.94
+            var kx = (x0 + x1) / 2, ky = (y0 + y1) / 2
+            var half = 0.065, reach = 0.075, r = Math.sqrt(half * half + reach * reach) * k
+            var a = Math.atan2(reach, half)
+            ctx.beginPath()
+            ctx.moveTo(X(x0), Y(y0))
+            ctx.lineTo(X(kx - half), Y(y0))
+            ctx.arc(X(kx), Y(y0 - reach), r, Math.PI - a, a, false)
+            ctx.lineTo(X(x1), Y(y0))
+            ctx.lineTo(X(x1), Y(ky - half))
+            ctx.arc(X(x1 + reach), Y(ky), r, -Math.PI + (Math.PI / 2 - a), Math.PI - (Math.PI / 2 - a), false)
+            ctx.lineTo(X(x1), Y(y1))
+            ctx.lineTo(X(x0), Y(y1))
+            ctx.lineTo(X(x0), Y(ky + half))
+            ctx.arc(X(x0 + reach), Y(ky), r, Math.PI - (Math.PI / 2 - a), -Math.PI + (Math.PI / 2 - a), true)
+            ctx.closePath()
+        }
+
+        // Where it sits: a faint outline that shows once the piece lifts out of it.
         Canvas {
-            id: dial
-            // Bigger than the gauge by the glow's reach, so the glow fades out instead of
-            // being cut off square at the gauge's edges.
-            readonly property real pad: g.compact ? 3 : 5
+            id: slot
             anchors.fill: parent
-            anchors.margins: -pad
-            readonly property real value: Math.max(0, Math.min(1, g.working ? g.sweep : g.shown))
-            readonly property color tone: g.tone
-            readonly property color track: g.track
-            readonly property color needle: g.needle
-            onValueChanged: requestPaint()
-            onToneChanged: requestPaint()
+            opacity: Math.min(1, pz.lift) * 0.9
+            visible: opacity > 0.01
+            readonly property color track: pz.track
             onTrackChanged: requestPaint()
-            onNeedleChanged: requestPaint()
             onWidthChanged: requestPaint()
             onHeightChanged: requestPaint()
             onPaint: {
                 var ctx = getContext("2d")
                 ctx.reset()
-                var w = width - 2 * pad, h = height - 2 * pad
-                var stroke = g.compact ? Math.max(2, w * 0.12) : w * 0.085
-                // A 270° dial open at the bottom: it is 1 + sin(45°) radii tall and two
-                // wide, so the radius is whichever of those fits first.
-                var r = Math.min((w - stroke) / 2, (h - stroke) / (1 + Math.SQRT1_2))
-                var cx = width / 2, cy = pad + stroke / 2 + r + (h - stroke - r * (1 + Math.SQRT1_2)) / 2
-                var a0 = Math.PI * 0.75, span = Math.PI * 1.5
-                ctx.lineCap = "round"
-                ctx.lineWidth = stroke
+                ctx.lineWidth = pz.compact ? 1 : 1.5
                 ctx.strokeStyle = track
-                ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + span); ctx.stroke()
-                if (value > 0.002) {
-                    ctx.save()
-                    ctx.shadowColor = tone
-                    ctx.shadowBlur = g.compact ? 3 : 6
-                    ctx.strokeStyle = tone
-                    ctx.beginPath(); ctx.arc(cx, cy, r, a0, a0 + span * value); ctx.stroke()
-                    ctx.restore()
-                }
-                if (!g.compact) {
-                    ctx.lineWidth = 1
-                    ctx.strokeStyle = track
-                    for (var i = 0; i <= 4; i++) {
-                        var t = a0 + span * i / 4
-                        ctx.beginPath()
-                        ctx.moveTo(cx + Math.cos(t) * (r - stroke * 1.9), cy + Math.sin(t) * (r - stroke * 1.9))
-                        ctx.lineTo(cx + Math.cos(t) * (r - stroke * 1.1), cy + Math.sin(t) * (r - stroke * 1.1))
-                        ctx.stroke()
-                    }
-                }
-                var a = a0 + span * value
-                var len = r - stroke * (g.compact ? 0.9 : 1.5)
-                ctx.lineWidth = g.compact ? 1.6 : 2.2
-                ctx.strokeStyle = needle
-                ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * len, cy + Math.sin(a) * len); ctx.stroke()
+                pz.trace(ctx, 0, 0, Math.min(width, height))
+                ctx.stroke()
+            }
+        }
+
+        Canvas {
+            id: piece
+            // Bigger than the icon by the glow's reach, so the glow fades out instead of
+            // being cut off square at the edges.
+            readonly property real pad: pz.compact ? 3 : 5
+            anchors.fill: parent
+            anchors.margins: -pad
+            readonly property color tone: pz.tone
+            onToneChanged: requestPaint()
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            transform: [
+                Rotation {
+                    origin.x: piece.width / 2; origin.y: piece.height - piece.pad
+                    angle: pz.rock - pz.lift * 10
+                },
+                Scale {
+                    origin.x: piece.width / 2; origin.y: piece.height / 2
+                    xScale: pz.pop; yScale: pz.pop
+                },
+                Translate { y: -pz.lift * pz.height * 0.2 }
+            ]
+            onPaint: {
+                var ctx = getContext("2d")
+                ctx.reset()
+                ctx.save()
+                ctx.shadowColor = tone
+                ctx.shadowBlur = pz.compact ? 3 : 6
                 ctx.fillStyle = tone
-                ctx.beginPath(); ctx.arc(cx, cy, g.compact ? 2.1 : 3.4, 0, Math.PI * 2); ctx.fill()
+                pz.trace(ctx, pad, pad, Math.min(width, height) - 2 * pad)
+                ctx.fill()
+                ctx.restore()
             }
         }
     }
@@ -1429,18 +1479,17 @@ Panel {
             id: chipRow
             anchors.centerIn: parent
             spacing: 4
-            // The gauge on the bar answers "is anything worth a look" before the panel is
+            // The piece on the bar answers "is anything worth a look" before the panel is
             // opened; the count beside it says how many updates are waiting.
-            Gauge {
-                id: barGauge
+            Puzzle {
+                id: barIcon
                 anchors.verticalCenter: parent.verticalCenter
                 compact: true
                 implicitWidth: Style.bar.iconCanvas + 2
                 implicitHeight: Style.bar.iconCanvas + 2
-                frac: root.health.total > 0 ? root.health.done / root.health.total : 0
                 tone: root.gaugeTone
-                track: Util.alpha(root.barForeground, 0.28)
-                needle: root.barForeground
+                track: Util.alpha(root.barForeground, 0.4)
+                mood: root.gaugeToneName
                 working: root.working
             }
             Text {
@@ -1502,12 +1551,12 @@ Panel {
                     width: parent.width
                     height: Math.max(ring.implicitHeight, titleCol.implicitHeight, headerButtons.implicitHeight)
 
-                    Gauge {
+                    Puzzle {
                         id: ring
                         anchors.left: parent.left
                         anchors.verticalCenter: parent.verticalCenter
-                        frac: root.health.total > 0 ? root.health.done / root.health.total : 0
                         tone: root.gaugeTone
+                        mood: root.gaugeToneName
                         working: root.working
                     }
                     Row {

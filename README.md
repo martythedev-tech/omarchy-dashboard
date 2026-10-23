@@ -15,14 +15,20 @@ Omarchy's own built-ins never show up here: the plugin list comes from
 `omarchy plugin list --json` filtered to `firstParty: false`, which is
 exactly the "not Omarchy's own" boundary Omarchy itself already draws.
 
-## The gauge
+## The icon
 
-The bar icon is a dial, like a car's dashboard: the arc fills with the share of
-plugins and apps that are current, and the needle points at it. Its colour comes
-from your theme's palette (`colors.toml`): green when everything is current,
-yellow with updates waiting (their count beside it), red when something needs a
-person -- local changes that clash with an update, a half-finished git operation, or an action that failed
-in the last day that you haven't seen yet (opening the panel counts as seeing it). While a check or an action runs, the needle sweeps.
+The bar icon is a puzzle piece, the usual sign for plugins. Its colour comes from your
+theme's palette (`colors.toml`), and it moves with what it is telling you:
+
+- **Green, seated in its slot**: everything is current.
+- **Yellow, lifted out of its slot** (its empty slot outlined beneath it), with the count
+  of waiting updates beside it.
+- **Red**, with one shake when it turns red: something needs a person -- local changes
+  that clash with an update, a half-finished git operation, or an action that failed in
+  the last day that you haven't seen yet (opening the panel counts as seeing it).
+- **Rocking on its base** while a check or an action runs.
+- When the last update lands it **drops back into its slot** with a bounce, or gives a
+  small pop if it was already seated.
 
 ## How it works
 
