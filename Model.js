@@ -20,6 +20,15 @@ function canUpdate(item) {
     return isUpdatableState(item) && !item.held
 }
 
+// Whether Update all takes this item. Under 'verified' a plugin goes only when its update
+// is the commit the marketplace verified (unlisted, or unknown, stays); apps are not in
+// the marketplace and always go. dashboard.py in_update_all is the same rule.
+function inUpdateAll(item, scope) {
+    if (!canUpdate(item)) return false
+    if (scope !== 'verified' || item.kind === 'app') return true
+    return !!item.market && item.market.incoming === 'verified'
+}
+
 // Hold is offered where it means something: an update is waiting that you do not want yet.
 function canHold(item) {
     return canUpdate(item)
