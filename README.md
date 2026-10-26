@@ -173,11 +173,13 @@ GitHub repo, or the AUR page), **Shortcut…** (see [Keyboard shortcuts](#keyboa
 **Same-version commits are quiet.** For anything behind, the check reads the
 version the incoming commits would install (the plugin's `manifest.json`, or an
 app's `.SRCINFO`) without touching the checkout. A row says `→ v1.2.0` when that
-changes the version, or `same version` (with a muted pill) when it doesn't --
-a README or screenshot commit. Same-version updates stay in the panel with their
-Update button and in Update all, but stay out of the bar badge and never send a
-notification. If the incoming version can't be read, it alerts as before. The
-catch: a plugin that changes code without bumping its version is quiet too.
+changes the version, or `same version` (with a muted pill) when it doesn't and
+the commits touch only docs, tests, CI or screenshots (`*.md`, images, `docs/`,
+`tests/`, `.github/`, LICENSE). Those stay in the panel with their Update button
+and in Update all, but stay out of the bar badge and never send a notification.
+A same-version update that changes anything else -- QML, scripts, icons -- says
+`same version, code changes` and alerts like any other update. If the incoming
+version can't be read, it alerts as before.
 
 **Update all** ends with a one-line summary ("2 updated, 1 failed (Flea).") and
 leaves the first failure's output open.

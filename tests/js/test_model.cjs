@@ -236,17 +236,21 @@ assert.equal(ctx.queueSummary([{id: 'a', name: 'A', ok: true}]), 'Update all: 1 
 assert.equal(ctx.queueSummary([]), '');
 
 // version-change awareness: same-version commits stay updatable but leave the badge
-assert.equal(ctx.alerts({updateState: 'behind', versionChange: false}), false);
+assert.equal(ctx.alerts({updateState: 'behind', versionChange: false, codeChange: false}), false);
 assert.equal(ctx.alerts({updateState: 'behind', versionChange: true}), true);
+assert.equal(ctx.alerts({updateState: 'behind', versionChange: false, codeChange: true}), true, 'same version, code changed');
+assert.equal(ctx.alerts({updateState: 'behind', versionChange: false}), true, 'not known to be docs-only');
+assert.equal(ctx.behindLabel({updateState: 'behind', behind: 8, versionChange: false, codeChange: true}), 'same version, code changes');
+assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: false, codeChange: true}), 'behind');
 assert.equal(ctx.alerts({updateState: 'behind'}), true, 'unknown still alerts');
 assert.equal(ctx.alerts({updateState: 'behind', versionChange: true, held: true}), false);
-assert.equal(ctx.canUpdate({updateState: 'behind', versionChange: false}), true, 'still updatable from the panel');
-assert.equal(ctx.badgeCount([{updateState: 'behind', versionChange: false}, {updateState: 'behind', versionChange: true}]), 1);
-assert.equal(ctx.behindLabel({updateState: 'behind', behind: 1, versionChange: false}), 'same version');
+assert.equal(ctx.canUpdate({updateState: 'behind', versionChange: false, codeChange: false}), true, 'still updatable from the panel');
+assert.equal(ctx.badgeCount([{updateState: 'behind', versionChange: false, codeChange: false}, {updateState: 'behind', versionChange: true}]), 1);
+assert.equal(ctx.behindLabel({updateState: 'behind', behind: 1, versionChange: false, codeChange: false}), 'same version');
 assert.equal(ctx.behindLabel({updateState: 'behind', behind: 3, versionChange: true, upstreamVersion: '1.2.0'}), '→ v1.2.0');
 assert.equal(ctx.behindLabel({updateState: 'behind', behind: 2}), '2 commits behind');
 assert.equal(ctx.behindLabel({updateState: 'up-to-date'}), '');
-assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: false}), 'ok');
+assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: false, codeChange: false}), 'ok');
 assert.equal(ctx.stripeKey({kind: 'plugin', updateState: 'behind', versionChange: true}), 'behind');
 
 
@@ -298,7 +302,7 @@ assert.equal(pal.mode, undefined);
 assert.equal(ctx.gaugeTone([], [], 0), 'idle');
 assert.equal(ctx.gaugeTone([{updateState: 'up-to-date'}], [], 0), 'calm');
 assert.equal(ctx.gaugeTone([{updateState: 'behind', versionChange: true}], [], 0), 'waiting');
-assert.equal(ctx.gaugeTone([{updateState: 'behind', versionChange: false}], [], 0), 'calm', 'same-version stays quiet');
+assert.equal(ctx.gaugeTone([{updateState: 'behind', versionChange: false, codeChange: false}], [], 0), 'calm', 'same-version stays quiet');
 assert.equal(ctx.gaugeTone([{updateState: 'dirty'}], [], 0), 'attention');
 assert.equal(ctx.gaugeTone([{updateState: 'dirty', held: true}], [], 0), 'calm');
 assert.equal(ctx.gaugeTone([{updateState: 'up-to-date'}], [{ok: false, ts: 1000}], 2000), 'attention');
