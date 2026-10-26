@@ -53,11 +53,17 @@ function updateCaption(item) {
     return item.updateVia === 'system' ? 'Update system…' : 'Update…'
 }
 
+// A same-version update that touches only docs, tests or screenshots: still an update in
+// the panel, just not one to flag from the bar. One that changes code at the same version
+// is not quiet (codeChange). Mirrors quiet() in dashboard.py.
+function quiet(item) {
+    return !!item && item.versionChange === false && item.codeChange === false
+}
+
 // Whether an item belongs in the bar badge (and its pulse): updatable, not held, and
-// not known to leave its version unchanged -- a README or screenshot commit is still an
-// update in the panel, just not one to flag from the bar. Mirrors alerts() in dashboard.py.
+// not quiet. Mirrors alerts() in dashboard.py.
 function alerts(item) {
-    return canUpdate(item) && item.versionChange !== false
+    return canUpdate(item) && !quiet(item)
 }
 
 function badgeCount(items) {
@@ -72,7 +78,7 @@ function badgeCount(items) {
 // is the fallback when the incoming version could not be read.
 function behindLabel(item) {
     if (!item || item.updateState !== 'behind') return ''
-    if (item.versionChange === false) return 'same version'
+    if (item.versionChange === false) return quiet(item) ? 'same version' : 'same version, code changes'
     if (item.upstreamVersion) return '→ v' + item.upstreamVersion
     return stateLabel(item)
 }
@@ -185,7 +191,7 @@ function localTag(item) {
 function stripeKey(item) {
     if (!item) return 'ok'
     if (item.enabled === false || item.held) return 'off'
-    if (item.updateState === 'behind' && item.versionChange === false) return 'ok'
+    if (item.updateState === 'behind' && quiet(item)) return 'ok'
     if (item.updateState === 'behind' || item.updateState === 'not-installed') return 'behind'
     if (item.updateState === 'dirty' || item.updateState === 'diverged' || item.updateState === 'in-progress') return 'attention'
     return 'ok'

@@ -982,6 +982,29 @@ def version_change(installed, incoming):
     return installed != incoming
 
 
+# What a same-version update may touch and still be quiet: docs, tests, CI and screenshots.
+# Anything else -- QML, scripts, an SVG icon -- changes what runs, version bump or not
+# (2026-10-26: Radio Atlas shipped six fixes at 0.1.9 and the badge missed them).
+DOC_DIRS = ('.github/', 'docs/', 'doc/', 'tests/', 'test/', 'screenshots/')
+DOC_SUFFIXES = ('.md', '.txt', '.png', '.jpg', '.jpeg', '.gif', '.webp')
+DOC_NAMES = {'LICENSE', 'CHANGELOG', '.gitignore'}
+
+
+def is_doc_path(path):
+    return path.startswith(DOC_DIRS) or path.lower().endswith(DOC_SUFFIXES) or Path(path).name in DOC_NAMES
+
+
+def code_change(repo_dir, ref, version_changed):
+    """Whether the incoming commits touch anything beyond docs -- only asked when the version
+    stays put, since a bump alerts anyway. None when it was not asked or git could not say."""
+    if version_changed is not False:
+        return None
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'diff', '--name-only', f'HEAD...{ref}'])
+    if rc != 0:
+        return None
+    return any(not is_doc_path(f) for f in out.splitlines() if f)
+
+
 def check_plugin(p):
     pid = p['id']
     plugin_dir = PLUGINS_DIR / pid
@@ -990,12 +1013,14 @@ def check_plugin(p):
     ahead = local_commit_count(plugin_dir, 'FETCH_HEAD') if compared else 0
     version = manifest_version(pid)
     incoming = upstream_version(plugin_dir, 'FETCH_HEAD', 'plugin') if state == 'behind' else ''
+    changed = version_change(version, incoming)
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
         'description': manifest_description(pid),
         'kinds': [k for k in (p.get('kinds') or []) if isinstance(k, str)],
         'version': version, 'upstreamVersion': incoming,
-        'versionChange': version_change(version, incoming), 'enabled': bool(p.get('enabled')),
+        'versionChange': changed, 'codeChange': code_change(plugin_dir, 'FETCH_HEAD', changed),
+        'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
         'edits': local_edit_count(plugin_dir) if compared else 0,
@@ -1018,11 +1043,12 @@ def check_app(a):
     compared = state not in NO_COMPARISON_STATES
     ahead = local_commit_count(a['repoDir'], f'{remote}/{branch}') if compared else 0
     incoming = upstream_version(a['repoDir'], f'{remote}/{branch}', 'app') if state == 'behind' else ''
+    changed = version_change(version, incoming)
     return {
         'id': a['id'], 'kind': 'app', 'name': a.get('name', a['id']),
         'description': a.get('description') or (pkg_description(a.get('pkgName', a['id'])) if version else ''),
         'version': version, 'upstreamVersion': incoming,
-        'versionChange': version_change(version, incoming),
+        'versionChange': changed, 'codeChange': code_change(a['repoDir'], f'{remote}/{branch}', changed),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
         'info': repo_info(a['repoDir'], remote, f'{remote}/{branch}' if compared else None),
     }
@@ -1198,10 +1224,15 @@ def cmd_terminal_update(args):
 
 def alerts(item):
     """Whether an item belongs in the bar badge and the notification: it can be updated,
-    is not held, and is not known to leave its version unchanged. An update whose
-    incoming version could not be read still alerts."""
+    is not held, and is not quiet. An update whose incoming version could not be read
+    still alerts."""
     return (item.get('updateState') in UPDATABLE_STATES and not item.get('held')
-            and item.get('versionChange') is not False)
+            and not quiet(item))
+
+
+def quiet(item):
+    """A same-version update known to touch only docs. Mirrors quiet() in Model.js."""
+    return item.get('versionChange') is False and item.get('codeChange') is False
 
 
 def _previously_behind_ids():

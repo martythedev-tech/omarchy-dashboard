@@ -1997,10 +1997,13 @@ class VersionChangeTests(RealRepoFixture):
         self.assertIsNone(dash.version_change('1.1.0', ''))
         self.assertIsNone(dash.version_change('', '1.1.0'))
 
-    def behind_item(self, upstream_manifest):
+    def behind_item(self, upstream_manifest, extra=None):
         # A third commit upstream that may or may not move the version.
         git(self.plugin, 'reset', '-q', '--hard', self.new)
         (self.plugin / 'README.md').write_text('docs\n')
+        for name, text in (extra or {}).items():
+            (self.plugin / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.plugin / name).write_text(text)
         if upstream_manifest:
             (self.plugin / 'manifest.json').write_text(upstream_manifest)
         git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'three')
@@ -2013,12 +2016,25 @@ class VersionChangeTests(RealRepoFixture):
     def test_a_docs_only_commit_is_behind_with_no_version_change(self):
         item = self.behind_item(None)
         self.assertEqual((item['version'], item['upstreamVersion'], item['versionChange']), ('1.1.0', '1.1.0', False))
+        self.assertIs(item['codeChange'], False)
+        self.assertFalse(dash.alerts(item))
+
+    def test_a_same_version_code_commit_alerts(self):
+        # 2026-10-26: Radio Atlas shipped six fixes at 0.1.9.
+        item = self.behind_item(None, extra={'Widget.qml': 'Item {}\n'})
+        self.assertEqual((item['versionChange'], item['codeChange']), (False, True))
+        self.assertTrue(dash.alerts(item))
+
+    def test_tests_and_screenshots_stay_quiet(self):
+        item = self.behind_item(None, extra={'tests/run': 'true\n', 'docs/shot.png': 'x', '.github/ci.yml': 'x'})
+        self.assertIs(item['codeChange'], False)
         self.assertFalse(dash.alerts(item))
 
     def test_a_version_bump_alerts(self):
         item = self.behind_item('{"version": "1.2.0"}')
         self.assertEqual((item['upstreamVersion'], item['versionChange']), ('1.2.0', True))
         self.assertTrue(dash.alerts(item))
+        self.assertIsNone(item['codeChange'], 'a bump alerts anyway, so the diff is not read')
 
     def test_not_read_unless_behind(self):
         with patch.object(dash, 'plugin_update_state', return_value=('up-to-date', 0, '')):
@@ -2027,22 +2043,30 @@ class VersionChangeTests(RealRepoFixture):
 
 
 class AlertsTests(unittest.TestCase):
+    def test_doc_paths(self):
+        for f in ('README.md', 'docs/x.html', 'tests/run', '.github/pr-evidence/a.png', 'preview.png', 'LICENSE'):
+            self.assertTrue(dash.is_doc_path(f), f)
+        for f in ('RadioAtlas.qml', 'radio-fetch', 'icon.svg', 'manifest.json', 'src/test.py'):
+            self.assertFalse(dash.is_doc_path(f), f)
+
     def test_alerts(self):
         self.assertTrue(dash.alerts({'updateState': 'behind', 'versionChange': True}))
         self.assertTrue(dash.alerts({'updateState': 'behind', 'versionChange': None}), 'unknown still alerts')
         self.assertTrue(dash.alerts({'updateState': 'not-installed'}))
-        self.assertFalse(dash.alerts({'updateState': 'behind', 'versionChange': False}))
+        self.assertFalse(dash.alerts({'updateState': 'behind', 'versionChange': False, 'codeChange': False}))
+        self.assertTrue(dash.alerts({'updateState': 'behind', 'versionChange': False, 'codeChange': True}))
+        self.assertTrue(dash.alerts({'updateState': 'behind', 'versionChange': False}), 'not known to be docs-only')
         self.assertFalse(dash.alerts({'updateState': 'behind', 'held': True}))
         self.assertFalse(dash.alerts({'updateState': 'dirty'}))
 
     def test_no_notification_for_a_same_version_commit(self):
         with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
-            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False}], set())
+            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False, 'codeChange': False}], set())
         run_mock.assert_not_called()
 
     def test_a_bump_beside_a_same_version_commit_notifies_for_the_bump_only(self):
         with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
-            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False},
+            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False, 'codeChange': False},
                                      {'id': 'b', 'name': 'B', 'updateState': 'behind', 'versionChange': True}], set())
         args = run_mock.call_args.args[0]
         self.assertEqual(args[args.index('await-notification') + 1:], ['Update available', 'B', 'b'])
