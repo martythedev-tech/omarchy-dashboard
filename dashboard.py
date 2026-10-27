@@ -96,13 +96,14 @@ SHELL_LOG_ROOT = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getui
 # its log is read. Loading is asynchronous; a broken plugin logs its failure within a
 # second or two.
 LOAD_SETTLE_SECONDS = 4
+PANEL_REOPEN_DELAY = 1.0
 _LOG_LEVEL = re.compile(r'^\S+ \S+\s+(WARN|ERROR|CRIT|FATAL)\b')
 _LOG_STAMP = re.compile(r'^\S+ \S+\s+')
 # What the shell says when a plugin did not load at all, as opposed to a warning from one
 # that did (Omastorm logs an IPC-handler warning on every load and works fine).
 _LOAD_FAILURE = re.compile(r'failed|\b\w*Error\b|is not a type|is not installed|unavailable', re.I)
 # A notification's buttons wait for a click; past this its waiter gives up.
-NOTIFY_WAIT_SECONDS = 3600
+NOTIFY_GLYPH = '\U000f0431'   # nf-md-puzzle, the bar icon's shape
 # Changed files that do not make a plugin's running services stale.
 _NOT_CODE = re.compile(r'(^|/)(docs|tests)/|\.(md|txt|png|jpe?g|gif|svg|webp)$|(^|/)LICENSE$', re.I)
 # The actions that change a plugin's directory. The shell answers any such change by
@@ -760,12 +761,6 @@ def untracked_in_update(plugin_dir, upstream_ref='FETCH_HEAD'):
     return same, differ
 
 
-def has_local_work(plugin_dir):
-    """Whether an update has anything of this checkout's own to carry over."""
-    return bool(local_edit_count(plugin_dir) or local_commit_count(plugin_dir, 'FETCH_HEAD')
-                or any(untracked_in_update(plugin_dir)))
-
-
 def local_work_carries(plugin_dir, upstream_ref='FETCH_HEAD'):
     """(True, '') when this checkout's own work -- local commits and uncommitted edits
     together -- merges cleanly onto upstream_ref; (False, 'a.qml, b.qml') naming the
@@ -793,59 +788,53 @@ def local_work_carries(plugin_dir, upstream_ref='FETCH_HEAD'):
 
 
 def carry_update(plugin_dir):
-    """`omarchy plugin update` for a checkout with its own work on it, which that command's
-    fast-forward-only merge refuses: set uncommitted edits aside, rebase local commits onto
-    upstream (a commit upstream already has drops out on its own), put the edits back, and
-    validate the result. Any step that fails puts the checkout back exactly as it was --
-    same HEAD, same edits -- so a refused update costs nothing. (rc, out, err) like run()."""
-    d = str(plugin_dir)
-    before = repo_head(plugin_dir)
-    rc, _, err = run(['git', '-C', d, 'fetch', '--quiet', 'origin', 'HEAD'], timeout=60)
+    """Every plugin update: fetch, then set uncommitted edits aside, rebase local commits
+    onto upstream (a commit upstream already has drops out on its own) or fast-forward, put
+    the edits back, and validate the result -- which `omarchy plugin update`'s
+    fast-forward-only merge cannot do for a checkout with its own work on it.
+
+    The steps run in a hidden copy beside the plugin (the shell's plugin watcher skips
+    dot-entries) and the result lands in the live folder in one rsync. Each file change
+    there makes the shell unload and rebuild every plugin -- the bar and dock blink, the
+    wallpaper flashes, the open panel closes -- and in place the stash, the merge, the stash
+    apply and a closing rescan were each their own reload: three or four per update
+    (2026-10-27). A step that fails just drops the copy, so a refused update costs nothing
+    and the live checkout is never touched. (rc, out, err) like run()."""
+    live = Path(plugin_dir).resolve()
+    rc, _, err = run(['git', '-C', str(live), 'fetch', '--quiet', 'origin', 'HEAD'], timeout=60)
     if rc != 0:
         return 1, '', 'fetch failed: ' + err.strip()
-    edits = local_edit_count(plugin_dir)
-    ahead = local_commit_count(plugin_dir, 'FETCH_HEAD')
-    stashed = False
+    if not (live / '.git').is_dir():
+        # A copy of a worktree's .git file still points at the shared git dir, so the
+        # steps would move the real branch: not something to do on a copy.
+        return 1, '', f'{live} is not a plain git checkout (its .git is not a folder); update it by hand.'
+    edits = local_edit_count(live)
+    ahead = local_commit_count(live, 'FETCH_HEAD')
+    same, differ = untracked_in_update(live)
+    if differ:
+        return 1, '', ('New files here clash with files the update adds: ' + ', '.join(differ[:5])
+                       + '\nNothing changed: the plugin is still on its old version with your local changes.')
+
+    stage = Path(plugin_dir).parent / f'.dashboard-stage-{Path(plugin_dir).name}'
+    shutil.rmtree(stage, ignore_errors=True)
+    rc, _, err = run(['cp', '-a', '--reflink=auto', str(live), str(stage)], timeout=300)
+    if rc != 0:
+        shutil.rmtree(stage, ignore_errors=True)
+        return 1, '', 'Could not make a working copy for the update: ' + err.strip()
+    d = str(stage)
+
+    def restore(why):
+        shutil.rmtree(stage, ignore_errors=True)
+        return 1, '', why + '\nNothing changed: the plugin is still on its old version with your local changes.'
+
     if edits:
         rc, _, err = run(['git', '-C', d, 'stash', 'push', '--quiet', '-m', 'dashboard: local edits before update'])
         if rc != 0:
-            return 1, '', 'Could not set the local edits aside: ' + err.strip()
-        stashed = True
-
-    # Untracked files the update adds would stop the merge. One identical to the update's
-    # copy is moved into the git dir for the merge (which writes the same bytes back) and
-    # dropped once the update has passed; restore() moves it back. One that differs is a
-    # clash like any other.
-    _, gitdir, _ = run(['git', '-C', d, 'rev-parse', '--absolute-git-dir'])
-    parking = Path(gitdir.strip()) / 'dashboard-parked'
-    parked = []
-
-    def unpark():
-        for path in parked:
-            dest = Path(d) / path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(parking / path, dest)
-        shutil.rmtree(parking, ignore_errors=True)
-
-    def restore(why):
-        run(['git', '-C', d, 'rebase', '--abort'])
-        run(['git', '-C', d, 'reset', '--hard', '--quiet', before])
-        unpark()
-        if stashed:
-            prc, _, perr = run(['git', '-C', d, 'stash', 'pop', '--quiet'])
-            if prc != 0:
-                return 1, '', (why + '\nThe local edits could not be put back; they are kept in '
-                               f'`git -C {d} stash list`: ' + perr.strip())
-        return 1, '', why + '\nNothing changed: the plugin is still on its old version with your local changes.'
-
-    same, differ = untracked_in_update(plugin_dir)
-    if differ:
-        return restore('New files here clash with files the update adds: ' + ', '.join(differ[:5]))
+            return restore('Could not set the local edits aside: ' + err.strip())
+    # Untracked files the update adds would stop the merge; these are byte-for-byte the
+    # update's own copies, so the merge writes them straight back.
     for path in same:
-        (parking / path).parent.mkdir(parents=True, exist_ok=True)
-        os.replace(Path(d) / path, parking / path)
-        parked.append(path)
-
+        (stage / path).unlink()
     if ahead:
         rc, out, err = run(['git', '-C', d, 'rebase', '--quiet', 'FETCH_HEAD'], timeout=60)
         if rc != 0:
@@ -854,30 +843,34 @@ def carry_update(plugin_dir):
         rc, out, err = run(['git', '-C', d, 'merge', '--ff-only', '--quiet', 'FETCH_HEAD'])
         if rc != 0:
             return restore('The update could not be applied: ' + (err or out).strip())
-    if stashed:
-        # apply, not pop: the stash entry stays the exact copy restore() puts back on the old
-        # HEAD until the update has passed validation, however far it got.
-        rc, out, err = run(['git', '-C', d, 'stash', 'apply', '--quiet'])
+    if edits:
+        rc, out, err = run(['git', '-C', d, 'stash', 'pop', '--quiet'])
         if rc != 0:
             return restore('Your local edits clash with the update:\n' + (err or out).strip()[-1500:])
     rc, out, err = run(['omarchy', 'plugin', 'validate', d], timeout=60)
     if rc != 0:
-        return restore('The update with your local changes on top failed validation:\n'
-                       + (err or out).strip()[-1500:])
-    if stashed:
-        run(['git', '-C', d, 'stash', 'drop', '--quiet'])
-    shutil.rmtree(parking, ignore_errors=True)
-    run(['omarchy-shell', 'shell', 'rescanPlugins'], timeout=20)
+        what = 'The update with your local changes on top' if edits or ahead or same else 'The update'
+        return restore(what + ' failed validation:\n' + (err or out).strip()[-1500:])
+    rc, out, err = run(['rsync', '-a', '--delete', '--checksum', d + '/', str(live) + '/'], timeout=300)
+    shutil.rmtree(stage, ignore_errors=True)
+    if rc != 0:
+        return 1, '', (f'Copying the update into {live} failed partway, so the checkout may be mixed: '
+                       + (err or out).strip()[-1500:] + f'\n`git -C {live} status` shows where it stands.')
+    # The copied index still holds the copy's inode and ctime for every file, so until it
+    # is refreshed git counts each one as edited.
+    run(['git', '-C', str(live), 'update-index', '-q', '--refresh'], timeout=60)
+    if not (edits or ahead or same):
+        return 0, f'Updated {live.name}.', ''
     kept = []
-    still_ahead = local_commit_count(plugin_dir, 'FETCH_HEAD')
+    still_ahead = local_commit_count(live, 'FETCH_HEAD')
     if still_ahead:
         kept.append(f'{still_ahead} local commit(s)')
-    still_edited = local_edit_count(plugin_dir)
+    still_edited = local_edit_count(live)
     if still_edited:
         kept.append(f'{still_edited} locally edited file(s)')
     note = ('Kept ' + ' and '.join(kept) + ' on top.') if kept else \
         'Your local changes are now part of the update itself, so none are left over.'
-    return 0, f'Updated {Path(d).name}. {note}', ''
+    return 0, f'Updated {live.name}. {note}', ''
 
 
 # States in which upstream was never compared, so there is no ahead count to give.
@@ -1161,12 +1154,6 @@ def check_package_app(a, ctx):
     }
 
 
-def terminal_ids(items, ids):
-    """The ids among these that update in a terminal (package apps) rather than as a job."""
-    package = {i['id'] for i in items if i.get('source') == 'package'}
-    return [i for i in ids if i in package]
-
-
 def open_terminal_update(ids):
     """A terminal running terminal-update for these package apps: their updates need sudo,
     which only a terminal can ask for."""
@@ -1255,74 +1242,20 @@ def notify_new_updates(items, old_behind_ids):
     if len(newly) > 5:
         names += f' and {len(newly) - 5} more'
     title = 'Update available' if len(newly) == 1 else f'{len(newly)} updates available'
-    # The notification's buttons need a process waiting for the click. Run it as its own
-    # transient user unit: started from dashboard-check.service, a plain child would be
-    # killed with the service's cgroup the moment the check finished.
-    rc, _, _ = run(['systemd-run', '--user', '--collect', '--quiet',
-                    f'--unit=dashboard-notify-{int(time.time())}',
-                    sys.executable, str(Path(__file__).resolve()), 'await-notification',
-                    title, names, *[i['id'] for i in newly]], timeout=10)
-    if rc != 0:
-        run(['notify-send', '--app-name=Plugin Dashboard', '--icon=system-software-update',
-             title, names], timeout=5)
+    # Like Omarchy's own: a glyph and one click that opens the panel. Update and Open buttons
+    # made it half as tall again as every other notification, and the theme had no
+    # system-software-update icon, so it showed a grey letter tile (2026-10-27).
+    notify(title, names, open_panel=True)
 
 
-def cmd_await_notification(args):
-    """Shows the update notification with Update and Open buttons and waits for a click.
-    Update updates the items the notification named that are still updatable and not held
-    by then (the same thing Update all does for them, one at a time), then says how it went.
-    Open opens the panel."""
-    try:
-        p = subprocess.run(['notify-send', '--app-name=Plugin Dashboard', '--icon=system-software-update',
-                            '--action=update=Update', '--action=open=Open',
-                            args.title, args.body], capture_output=True, text=True,
-                           timeout=NOTIFY_WAIT_SECONDS, check=False)
-        choice = p.stdout.strip()
-    except (OSError, subprocess.TimeoutExpired):
-        return
-    if choice == 'open':
-        run(['omarchy-shell', SELF_ID, 'open'], timeout=10)
-        return
-    if choice != 'update':
-        return
-    status = load_status() or {}
-    scope = update_all_scope()
-    waiting = [i for i in status.get('items', [])
-               if i['id'] in args.ids and i.get('updateState') in UPDATABLE_STATES and not i.get('held')]
-    wanted = {i['id'] for i in waiting if in_update_all(i, scope)}
-    skipped = [i.get('name', i['id']) for i in waiting if i['id'] not in wanted]
-    names = {i['id']: i.get('name', i['id']) for i in status.get('items', [])}
-    done, failed = [], []
-    ids = [i for i in args.ids if i in wanted]
-    skipped_note = ('Skipped, update not verified: ' + ', '.join(skipped)) if skipped else ''
-    in_terminal = terminal_ids(status.get('items', []), ids)
-    if in_terminal:
-        open_terminal_update(in_terminal)
-        ids = [i for i in ids if i not in in_terminal]
-        if not ids:
-            if skipped_note:
-                run(['notify-send', '--app-name=Plugin Dashboard', '--icon=dialog-information',
-                     'Not all updated', skipped_note], timeout=5)
-            return
-    # As a job, so an open panel shows it going like one it started itself. This waiter
-    # is already its own unit, so it runs the job in-process.
-    job = new_job('update', ids) if ids else None
-    if ids and job is None:
-        run(['notify-send', '--app-name=Plugin Dashboard', '--icon=dialog-information', 'Not updated',
-             'Another update is still running; try again once it is done.'], timeout=5)
-        return
-    for r in (execute_job(job)['results'] if job else []):
-        (done if r['ok'] else failed).append(names.get(r['id'], r['id']))
-    if not done and not failed:
-        body = skipped_note or 'Nothing left to update.'
-    else:
-        body = ', '.join(filter(None, ['Updated ' + ', '.join(done) if done else '',
-                                       'failed: ' + ', '.join(failed) if failed else '']))
-        body += ('. ' + skipped_note) if skipped_note else ''
-    run(['notify-send', '--app-name=Plugin Dashboard',
-         '--icon=' + ('dialog-error' if failed else 'system-software-update'),
-         'Update failed' if failed else 'Updated' if done else 'Not updated', body + (' — open the Dashboard for details.' if failed else '')],
-        timeout=5)
+def notify(title, body, urgency='normal', open_panel=False):
+    """A notification in Omarchy's own style. The shell runs the click command itself, so
+    nothing has to stay behind waiting for it."""
+    args = ['omarchy-notification-send', '--app-name', 'Plugin Dashboard', '-g', NOTIFY_GLYPH,
+            '-u', urgency, title, body]
+    if open_panel:
+        args += ['--exec', 'omarchy-shell', SELF_ID, 'open']
+    run(args, timeout=5)
 
 
 def check_all():
@@ -1449,11 +1382,7 @@ def cmd_update(args):
         units_before = shipped_units(plugin_dir)
         units_installed_before = {name for name in units_before if (USER_UNIT_DIR / name).exists()}
         log_mark = shell_log_mark()
-        if has_local_work(plugin_dir):
-            rc, out, err = carry_update(plugin_dir)
-        else:
-            rc, out, err = run(['omarchy', 'plugin', 'update', args.id, '--yes'], timeout=180,
-                               stream_log=STATE / 'action.log')
+        rc, out, err = carry_update(plugin_dir)
         if rc == 0 and has_ensure_bootstrap(plugin_dir):
             erc, eout, eerr = run_ensure_bootstrap(plugin_dir)
             if erc != 0:
@@ -1485,6 +1414,7 @@ def cmd_update(args):
                         'Update landed but a background service did not restart:\n' + text
         # Last, after every reload the steps above may have triggered.
         if rc == 0 and before != repo_head(plugin_dir):
+            reopen_panel_after_reload()   # now, not after the load check's wait
             load_ok, load_text = check_plugin_loaded(args.id, plugin_dir, log_mark)
             if not load_ok:
                 rc = 1
@@ -2315,17 +2245,32 @@ def run_job_item(kind, item_id, options=None):
     return {'ok': False, 'message': 'It did not report a result.'}
 
 
+def reopen_panel_after_reload():
+    """Opens the panel again if a shell reload took it away. Any change in a plugin folder
+    makes the shell rebuild every widget, this one too, which closes the open panel in the
+    middle of the update it was showing. panel.json says whether it was open (the widget
+    writes it on open and close, and a reload destroys it without either)."""
+    if not _read_json(STATE / 'panel.json', {}).get('open'):
+        return
+    time.sleep(PANEL_REOPEN_DELAY)   # for the rebuild to finish; earlier, the old widget answers
+    run(['omarchy-shell', SELF_ID, 'open'], timeout=10)
+
+
 def execute_job(job):
     """Runs a claimed job in this process, item by item, keeping job.json current so a
     panel (re)created at any point shows where it is."""
     job.update(state='running', pid=os.getpid())
     save_job(job)
+    app_ids = {a['id'] for a in load_apps()}
     try:
         for item_id in job['ids']:
             job.update(current=item_id, itemTs=time.time())
             save_job(job)
             job['results'].append(dict(run_job_item(job['kind'], item_id, job.get('options')), id=item_id))
             save_job(job)
+            # Apps live outside the plugins folder, and so do the backups a clean-up removes.
+            if job['kind'] != 'cleanup' and item_id not in app_ids:
+                reopen_panel_after_reload()
     finally:
         job.update(state='done', current='', finishedTs=time.time())
         save_job(job)
@@ -2760,8 +2705,7 @@ def cmd_restart_shell(args):
         rc, out, err = run(['omarchy-restart-shell'], timeout=120)
         if rc != 0:
             lines = (err or out).strip().splitlines()
-            run(['notify-send', '--app-name=Plugin Dashboard', '--icon=dialog-error', 'Shell not restarted',
-                 lines[-1] if lines else 'omarchy-restart-shell failed.'], timeout=5)
+            notify('Shell not restarted', lines[-1] if lines else 'omarchy-restart-shell failed.', urgency='critical')
         return
     reap_stale_job()
     if job_active(load_job()):
@@ -2805,10 +2749,6 @@ def main():
     sub.add_parser('inspect-package').add_argument('name')
     sub.add_parser('terminal-update').add_argument('ids', nargs='+')
     sub.add_parser('open-terminal-update').add_argument('ids', nargs='+')
-    p_await = sub.add_parser('await-notification')
-    p_await.add_argument('title')
-    p_await.add_argument('body')
-    p_await.add_argument('ids', nargs='*')
     p_hold = sub.add_parser('hold')
     p_hold.add_argument('id')
     p_hold.add_argument('--reason', default='')
@@ -2830,7 +2770,7 @@ def main():
         'check': cmd_check, 'enable': cmd_enable, 'disable': cmd_disable, 'update': cmd_update,
         'remove': cmd_remove, 'diff': cmd_diff, 'add-app': cmd_add_app, 'remove-app': cmd_remove_app,
         'rollback': cmd_rollback, 'hold': cmd_hold, 'unhold': cmd_unhold,
-        'await-notification': cmd_await_notification, 'start': cmd_start, 'run-job': cmd_run_job,
+        'start': cmd_start, 'run-job': cmd_run_job,
         'remove-plan': cmd_remove_plan, 'cleanup': cmd_cleanup, 'catalog': cmd_catalog,
         'inspect-repo': cmd_inspect_repo, 'pick-folder': cmd_pick_folder,
         'inspect-package': cmd_inspect_package, 'terminal-update': cmd_terminal_update,

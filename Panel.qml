@@ -412,6 +412,10 @@ Panel {
 
     onOpenedChanged: {
         root.markFailuresSeen()
+        // Whether a running job should open the panel again after a shell reload took it
+        // away: the reload destroys this widget without closing it, so the file keeps
+        // saying open, while closing it by hand says closed.
+        panelStateFile.setText(JSON.stringify({open: opened}) + "\n")
         if (opened) {
             if (root.view === "discover") root.showView("discover")
             statusFile.reload()
@@ -663,6 +667,13 @@ Panel {
 
     // Typing filters after a pause, not on every key: the catalog has thousands of entries.
     Timer { id: discoverDebounce; interval: 180; onTriggered: root.refilterDiscover() }
+
+    FileView {
+        id: panelStateFile
+        path: root.stateDir + "/panel.json"
+        atomicWrites: true
+        printErrors: false
+    }
 
     FileView {
         id: seenFile
