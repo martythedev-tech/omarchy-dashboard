@@ -24,6 +24,7 @@ def setUpModule():
     # Never read the real shell log, and never wait for a reload that is not happening.
     dash.SHELL_LOG_ROOT = dash.STATE / 'no-shell'
     dash.LOAD_SETTLE_SECONDS = 0
+    dash.PANEL_REOPEN_DELAY = 0
     # Never download the real catalog: a full check refreshes it. Tests that want one
     # patch fetch_catalog themselves.
     dash.fetch_catalog = _offline_catalog
@@ -35,6 +36,12 @@ def _offline_catalog():
 
 def tearDownModule():
     _STATE_DIR.cleanup()
+
+
+def carry_through_run(plugin_dir):
+    """Stands in for carry_update where a test fakes the whole plugin update as one run()
+    call, ['carry', <id>], to give it the effects it needs."""
+    return dash.run(['carry', Path(plugin_dir).name])
 
 
 def fake_run(table):
@@ -383,8 +390,8 @@ class CheckAllTests(unittest.TestCase):
             self.assertEqual(ids['flea']['updateState'], 'dirty')
             self.assertTrue(status_written)
             # No prior status.json existed, so 'a.plugin' becoming 'behind' is
-            # new -- notify-send should have fired once.
-            notifies = [c for c in run_mock.call_args_list if c.args[0][0] in ('notify-send', 'systemd-run')]
+            # new -- one notification should have gone out.
+            notifies = [c for c in run_mock.call_args_list if c.args[0][0] == 'omarchy-notification-send']
             self.assertEqual(len(notifies), 1)
 
 
@@ -530,20 +537,13 @@ class NotifyNewUpdatesTests(unittest.TestCase):
             dash.notify_new_updates(items, old_behind_ids={'a'})
         run_mock.assert_called_once()
         args = run_mock.call_args.args[0]
-        # A waiter in its own transient unit: title, body, then the ids it may update.
-        self.assertEqual(args[0], 'systemd-run')
-        i = args.index('await-notification')
-        self.assertEqual(args[i + 1:], ['Update available', 'B', 'b'])
-
-    def test_falls_back_to_a_plain_notification_without_systemd_run(self):
-        calls = []
-        def fake(args, **kw):
-            calls.append(args)
-            return (1, '', 'no systemd') if args[0] == 'systemd-run' else (0, '', '')
-        with patch.object(dash, 'run', fake):
-            dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind'}], set())
-        self.assertEqual([c[0] for c in calls], ['systemd-run', 'notify-send'])
-        self.assertEqual(calls[-1][-2:], ['Update available', 'A'])
+        # Omarchy's own style: a glyph, no buttons, a click opens the panel.
+        self.assertEqual(args[0], 'omarchy-notification-send')
+        self.assertIn(dash.NOTIFY_GLYPH, args)
+        i = args.index('--exec')
+        self.assertEqual(args[i - 2:i], ['Update available', 'B'])
+        self.assertEqual(args[i + 1:], ['omarchy-shell', dash.SELF_ID, 'open'])
+        self.assertFalse([a for a in args if a.startswith('--action')])
 
     def test_held_items_never_notify(self):
         with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
@@ -576,15 +576,16 @@ class CmdUpdateDispatchTests(unittest.TestCase):
             dash.cmd_update(args)
         self.assertIn(call(['./rebuild.sh', '--install'], cwd='/home/x/Projects/howdy', timeout=900, stream_log=dash.STATE / 'action.log'), run_mock.call_args_list)
 
-    def test_unknown_id_falls_through_to_omarchy_plugin_update(self):
+    def test_unknown_id_is_a_plugin_updated_through_the_staged_carry(self):
+        # Not `omarchy plugin update`: its merge and closing rescan are two shell reloads.
         with patch.object(dash, 'ensure_apps_file'), \
              patch.object(dash, 'load_apps', return_value=[]), \
-             patch.object(dash, 'has_local_work', return_value=False), \
-             patch.object(dash, 'run', return_value=(0, 'Updated sslvpn.', '')) as run_mock, \
+             patch.object(dash, 'carry_update', return_value=(0, 'Updated sslvpn.', '')) as carry, \
+             patch.object(dash, 'run', return_value=(0, '', '')), \
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': 'sslvpn'})()
             dash.cmd_update(args)
-        self.assertIn(call(['omarchy', 'plugin', 'update', 'sslvpn', '--yes'], timeout=180, stream_log=dash.STATE / 'action.log'), run_mock.call_args_list)
+        carry.assert_called_once_with(dash.PLUGINS_DIR / 'sslvpn')
 
     def test_a_failed_update_reports_what_it_said_and_what_went_wrong(self):
         # rebuild.sh explains a conflict on stdout and git's complaint arrives on stderr;
@@ -604,12 +605,12 @@ class CmdUpdateDispatchTests(unittest.TestCase):
         # Self-update is intentional: only disable/remove refuse SELF_ID.
         with patch.object(dash, 'ensure_apps_file'), \
              patch.object(dash, 'load_apps', return_value=[]), \
-             patch.object(dash, 'has_local_work', return_value=False), \
-             patch.object(dash, 'run', return_value=(0, 'Updated.', '')) as run_mock, \
+             patch.object(dash, 'carry_update', return_value=(0, 'Updated.', '')) as carry, \
+             patch.object(dash, 'run', return_value=(0, '', '')), \
              patch.object(dash, 'check_all'), patch('builtins.print'):
             args = type('A', (), {'id': dash.SELF_ID})()
             dash.cmd_update(args)
-        self.assertIn(call(['omarchy', 'plugin', 'update', dash.SELF_ID, '--yes'], timeout=180, stream_log=dash.STATE / 'action.log'), run_mock.call_args_list)
+        carry.assert_called_once_with(dash.PLUGINS_DIR / dash.SELF_ID)
 
 
 class CmdEnableTests(unittest.TestCase):
@@ -841,7 +842,7 @@ class RestartShellTests(unittest.TestCase):
     def test_a_failed_restart_is_a_notification(self):
         with self._run(rc=1, err='Refusing to restart Omarchy shell while the session is locked.\n'):
             self.output(now=True)
-        self.assertEqual(self.calls[-1][0], 'notify-send')
+        self.assertEqual(self.calls[-1][0], 'omarchy-notification-send')
         self.assertIn('Refusing to restart Omarchy shell while the session is locked.', self.calls[-1])
 
     def test_starts_in_its_own_unit(self):
@@ -1016,13 +1017,16 @@ class CmdUpdateUnitsTests(UnitFixture):
         original = dash.run
 
         def run_with_update(args, cwd=None, timeout=20, **_kwargs):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 self.calls.append(list(args))
                 if self.update_rc == 0:
                     self.ship('gpu')                       # what the update brings
                 return (self.update_rc, 'Updated.', '' if self.update_rc == 0 else 'merge failed')
             return original(args, cwd=cwd, timeout=timeout)
         patcher = patch.object(dash, 'run', run_with_update)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(dash, 'carry_update', carry_through_run)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1039,7 +1043,7 @@ class CmdUpdateUnitsTests(UnitFixture):
     def test_the_before_snapshot_is_taken_before_the_update_runs(self):
         # If it were taken after, the new unit would look as if it had always been there.
         self.assertTrue(self.update()['ok'])
-        self.assertLess(self.calls.index(['omarchy', 'plugin', 'update', 'nixfred.pulse', '--yes']),
+        self.assertLess(self.calls.index(['carry', 'nixfred.pulse']),
                         self.calls.index(['systemctl', '--user', 'enable', '--now', 'gpu.service']))
         self.assertTrue((self.units / 'gpu.service').exists())
 
@@ -1137,6 +1141,7 @@ class RealRepoFixture(unittest.TestCase):
         (self.units / 'gpu.service').write_text('[Service]\n')
         self.calls = []
         self.validate_rc = 0
+        self.validated = []
         real_run = dash.run
 
         def fake(args, cwd=None, timeout=20, **kw):
@@ -1276,12 +1281,12 @@ class UpdateHistoryTests(RealRepoFixture):
         plugin, units, new = self.plugin, self.units, self.new
 
         def updating(args, **kw):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 git(plugin, 'reset', '-q', '--hard', new)
                 (units / 'gpu.service').write_text('x')   # what install_new_units would do
                 return (0, 'Updated.', '')
             return real(args, **kw)
-        with patch.object(dash, 'run', updating), patch.object(dash, 'install_new_units', return_value=([], True)):
+        with patch.object(dash, 'run', updating), patch.object(dash, 'carry_update', carry_through_run), patch.object(dash, 'install_new_units', return_value=([], True)):
             dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
         e = dash.load_history()[-1]
         self.assertEqual((e['before'], e['after'], e['fromVersion'], e['toVersion']), (self.old, self.new, '1.0.0', '1.1.0'))
@@ -1292,10 +1297,10 @@ class UpdateHistoryTests(RealRepoFixture):
         real = dash.run
 
         def failing(args, **kw):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 return (1, '', 'fetch failed\ncannot fast-forward')
             return real(args, **kw)
-        with patch.object(dash, 'run', failing):
+        with patch.object(dash, 'run', failing), patch.object(dash, 'carry_update', carry_through_run):
             dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
         e = dash.load_history()[-1]
         self.assertFalse(e['ok'])
@@ -1357,101 +1362,6 @@ class GitLogTests(RealRepoFixture):
         self.assertTrue(r['ok'])
         self.assertEqual(r['incoming'], [])
         self.assertEqual([c['subject'] for c in r['local']], ['two'])
-
-
-class AwaitNotificationTests(unittest.TestCase):
-    def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self._tmp.cleanup)
-        state = Path(self._tmp.name)
-        for target, value in (('STATE', state), ('STATUS_PATH', state / 'status.json')):
-            patcher = patch.object(dash, target, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        dash.STATUS_PATH.write_text(json.dumps({'items': [
-            {'id': 'a', 'name': 'A', 'updateState': 'behind'},
-            {'id': 'b', 'name': 'B', 'updateState': 'behind', 'held': True},
-            {'id': 'c', 'name': 'C', 'updateState': 'up-to-date'},
-            {'id': 'd', 'name': 'D', 'updateState': 'not-installed'},
-        ]}))
-        self.subprocess_calls, self.run_calls = [], []
-        self.choice = 'update'
-        self.update_ok = {'a': True, 'd': False}
-
-        def fake_subprocess_run(args, **kw):
-            self.subprocess_calls.append(args)
-            return type('P', (), {'stdout': self.choice + '\n', 'returncode': 0})()
-
-        def fake_update(args):
-            self.updated.append(args.id)
-            print('progress...')
-            print(json.dumps({'ok': self.update_ok[args.id], 'message': ''}))
-        self.updated = []
-        p1 = patch.object(dash.subprocess, 'run', fake_subprocess_run)
-        p2 = patch.object(dash, 'run', lambda args, **kw: self.run_calls.append(args) or (0, '', ''))
-        p3 = patch.object(dash, 'cmd_update', fake_update)
-        for pt in (p1, p2, p3):
-            pt.start()
-            self.addCleanup(pt.stop)
-
-    def wait(self, ids=('a', 'b', 'c', 'd')):
-        dash.cmd_await_notification(type('A', (), {'title': 'T', 'body': 'B', 'ids': list(ids)})())
-
-    def test_update_runs_only_what_is_still_updatable_and_unheld_and_reports(self):
-        self.wait()
-        self.assertEqual(self.updated, ['a', 'd'])
-        self.assertIn('--action=update=Update', self.subprocess_calls[0])
-        last = self.run_calls[-1]
-        self.assertEqual(last[0], 'notify-send')
-        self.assertIn('Update failed', last)
-        self.assertIn('Updated A, failed: D — open the Dashboard for details.', last)
-
-    def _verified_only(self):
-        dash.STATUS_PATH.write_text(json.dumps({'items': [
-            {'id': 'a', 'name': 'A', 'kind': 'plugin', 'updateState': 'behind', 'market': {'incoming': 'verified'}},
-            {'id': 'd', 'name': 'D', 'kind': 'plugin', 'updateState': 'behind', 'market': {'incoming': 'unverified'}},
-            {'id': 'u', 'name': 'U', 'kind': 'plugin', 'updateState': 'behind', 'market': None},
-            {'id': 'e', 'name': 'E', 'kind': 'app', 'updateState': 'behind'},
-        ]}))
-        dash._write_json(dash.settings_path(), {'updateAllScope': 'verified'})
-        self.update_ok.update(a=True, e=True)
-
-    def test_verified_only_skips_unverified_plugin_updates_and_says_so(self):
-        self._verified_only()
-        self.wait(ids=('a', 'd', 'u', 'e'))
-        self.assertEqual(self.updated, ['a', 'e'], 'apps are not in the marketplace and always go')
-        self.assertIn('Updated A, E. Skipped, update not verified: D, U', self.run_calls[-1])
-
-    def test_verified_only_with_nothing_verified_says_not_updated(self):
-        self._verified_only()
-        self.wait(ids=('d', 'u'))
-        self.assertEqual(self.updated, [])
-        self.assertIn('Not updated', self.run_calls[-1])
-        self.assertIn('Skipped, update not verified: D, U', self.run_calls[-1])
-
-    def test_scope_defaults_to_all(self):
-        self.assertEqual(dash.update_all_scope(), 'all')
-        dash._write_json(dash.settings_path(), {'updateAllScope': 'bogus'})
-        self.assertEqual(dash.update_all_scope(), 'all')
-        dash._write_json(dash.settings_path(), ['not', 'a', 'dict'])
-        self.assertEqual(dash.update_all_scope(), 'all')
-        self.assertTrue(dash.in_update_all({'kind': 'plugin', 'market': None}, 'all'))
-
-    def test_nothing_left(self):
-        self.wait(ids=('c',))
-        self.assertIn('Nothing left to update.', self.run_calls[-1])
-
-    def test_open_opens_the_panel(self):
-        self.choice = 'open'
-        self.wait()
-        self.assertEqual(self.run_calls, [['omarchy-shell', dash.SELF_ID, 'open']])
-        self.assertEqual(len(self.subprocess_calls), 1)
-
-    def test_dismissed_does_nothing(self):
-        self.choice = ''
-        self.wait()
-        self.assertEqual(self.run_calls, [])
-        self.assertEqual(len(self.subprocess_calls), 1)
 
 
 LOG_LINE = '2026-10-01 13:24:52.349  {level} {text}'
@@ -1566,7 +1476,7 @@ class UpdateLoadCheckTests(RealRepoFixture):
         plugin, log, new = self.plugin, self.log, self.new
 
         def updating(args, **kw):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 git(plugin, 'reset', '-q', '--hard', new)
                 if self.broken:
                     with log.open('a') as f:
@@ -1575,6 +1485,9 @@ class UpdateLoadCheckTests(RealRepoFixture):
             return real(args, **kw)
         git(self.plugin, 'reset', '-q', '--hard', self.old)
         patcher = patch.object(dash, 'run', updating)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = patch.object(dash, 'carry_update', carry_through_run)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1663,12 +1576,14 @@ class CarryUpdateTests(unittest.TestCase):
         git(self.plugin, 'config', 'user.email', 't@t'); git(self.plugin, 'config', 'user.name', 't')
         self.old = git(self.plugin, 'rev-parse', 'HEAD')
         self.validate_rc = 0
+        self.validated = []
         real_run = dash.run
 
         def fake(args, cwd=None, timeout=20, **kw):
-            if args[0] == 'git':
+            if args[0] in ('git', 'cp', 'rsync'):
                 return real_run(args, cwd=cwd, timeout=timeout)
             if args[:3] == ['omarchy', 'plugin', 'validate']:
+                self.validated.append(args[3])
                 return (self.validate_rc, '', 'invalid manifest' if self.validate_rc else '')
             return (0, '', '')
         patcher = patch.object(dash, 'run', fake)
@@ -1772,13 +1687,11 @@ class CarryUpdateTests(unittest.TestCase):
         self.assertIn('none are left over', out)
         self.assertEqual(git(self.plugin, 'status', '--porcelain'), '')
         self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), git(self.upstream, 'rev-parse', 'HEAD'))
-        self.assertFalse((self.plugin / '.git' / 'dashboard-parked').exists())
 
-    def test_a_new_file_alone_routes_the_update_through_the_carry(self):
+    def test_a_new_file_alone_no_longer_blocks_the_update(self):
         (self.plugin / 'guard').write_text('#!/bin/sh\n')
         self.upstream_add('guard', '#!/bin/sh\n')
         self.fetch()
-        self.assertTrue(dash.has_local_work(self.plugin))
         rc, _, err = dash.carry_update(self.plugin)
         self.assertEqual(rc, 0, err)
         self.assertEqual(git(self.plugin, 'status', '--porcelain'), '')
@@ -1806,14 +1719,65 @@ class CarryUpdateTests(unittest.TestCase):
         self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
         self.assertEqual((self.plugin / 'guard').read_text(), '#!/bin/sh\n')
         self.assertIn('Commons.Color', (self.plugin / 'Bar.qml').read_text())
-        self.assertFalse((self.plugin / '.git' / 'dashboard-parked').exists())
 
     def test_an_unrelated_untracked_file_is_left_alone(self):
         (self.plugin / 'notes.md').write_text('mine\n')
         self.upstream_commit('Panel.qml', 'A\nb\nc\n')
         self.fetch()
-        self.assertFalse(dash.has_local_work(self.plugin))
         self.assertEqual(dash.plugin_update_state(self.plugin)[0], 'behind')
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual((self.plugin / 'notes.md').read_text(), 'mine\n')
+
+    def stage(self):
+        return self.plugin.parent / '.dashboard-stage-x.plugin'
+
+    def test_a_clean_update_fast_forwards_and_says_only_that(self):
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual((rc, out), (0, 'Updated x.plugin.'), err)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), git(self.upstream, 'rev-parse', 'HEAD'))
+        self.assertEqual((self.plugin / 'Panel.qml').read_text(), 'A\nb\nc\n')
+
+    def test_the_steps_run_in_a_hidden_copy_that_is_gone_afterwards(self):
+        # The shell rebuilds every plugin on each change it sees in a plugin folder; a
+        # dot-entry it skips. The live folder only changes once, at the end.
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(self.validated, [str(self.stage())])
+        self.assertFalse(self.stage().exists())
+
+    def test_a_refused_update_never_touches_the_live_folder(self):
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        before = {p: p.stat().st_mtime_ns for p in self.plugin.rglob('*') if p.is_file() and '.git' not in p.parts}
+        self.validate_rc = 1
+        rc, _, _ = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        after = {p: p.stat().st_mtime_ns for p in self.plugin.rglob('*') if p.is_file() and '.git' not in p.parts}
+        self.assertEqual(before, after)
+        self.assertFalse(self.stage().exists())
+
+    def test_a_file_the_update_deletes_is_deleted_in_the_live_folder(self):
+        git(self.upstream, 'rm', '-q', 'Panel.qml')
+        git(self.upstream, 'commit', '-qm', 'drop Panel.qml')
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertFalse((self.plugin / 'Panel.qml').exists())
+        self.assertEqual(git(self.plugin, 'status', '--porcelain'), '')
+
+    def test_a_symlinked_plugin_updates_the_checkout_it_points_at(self):
+        # The Dashboard itself and sslvpn are links into ~/Projects.
+        real = self.plugin.parent.parent / 'real'
+        self.plugin.rename(real)
+        self.plugin.symlink_to(real)
+        self.upstream_commit('Panel.qml', 'A\nb\nc\n')
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(self.plugin.is_symlink())
+        self.assertEqual((real / 'Panel.qml').read_text(), 'A\nb\nc\n')
 
 
 class RepoGuessFixture(unittest.TestCase):
@@ -1957,10 +1921,10 @@ class NoOpUpdateHistoryTests(RealRepoFixture):
     def test_a_plugin_update_that_pulled_nothing_is_not_recorded(self):
         real = dash.run
         def nothing_to_pull(args, **kw):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 return (0, 'x.plugin is up to date.', '')
             return real(args, **kw)
-        with patch.object(dash, 'run', nothing_to_pull):
+        with patch.object(dash, 'run', nothing_to_pull), patch.object(dash, 'carry_update', carry_through_run):
             dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
         self.assertTrue(self.printed[-1]['ok'])
         self.assertEqual(dash.load_history(), [])
@@ -1968,10 +1932,10 @@ class NoOpUpdateHistoryTests(RealRepoFixture):
     def test_a_failed_plugin_update_that_moved_nothing_is_still_recorded(self):
         real = dash.run
         def failing(args, **kw):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 return (1, '', 'fetch failed')
             return real(args, **kw)
-        with patch.object(dash, 'run', failing):
+        with patch.object(dash, 'run', failing), patch.object(dash, 'carry_update', carry_through_run):
             dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
         self.assertEqual(len(dash.load_history()), 1)
         self.assertFalse(dash.load_history()[0]['ok'])
@@ -2069,7 +2033,7 @@ class AlertsTests(unittest.TestCase):
             dash.notify_new_updates([{'id': 'a', 'name': 'A', 'updateState': 'behind', 'versionChange': False, 'codeChange': False},
                                      {'id': 'b', 'name': 'B', 'updateState': 'behind', 'versionChange': True}], set())
         args = run_mock.call_args.args[0]
-        self.assertEqual(args[args.index('await-notification') + 1:], ['Update available', 'B', 'b'])
+        self.assertEqual(args[args.index('--exec') - 2:args.index('--exec')], ['Update available', 'B'])
 
 
 class JobFixture(unittest.TestCase):
@@ -2163,6 +2127,37 @@ class JobTests(JobFixture):
         dash.execute_job(dash.new_job('rollback', ['r']))
         dash.execute_job(dash.new_job('remove', ['m']))
         self.assertEqual(calls, [('cmd_rollback', 'r'), ('cmd_remove', 'm')])
+
+
+class PanelReopenTests(JobFixture):
+    """A shell reload after each plugin change closes the open panel mid-job."""
+
+    def setUp(self):
+        super().setUp()
+        self.opened = []
+        for target, value in (('PANEL_REOPEN_DELAY', 0),
+                              ('load_apps', lambda: [{'id': 'app'}]),
+                              ('run', lambda args, **kw: self.opened.append(args) or (0, '', ''))):
+            p = patch.object(dash, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def panel(self, is_open):
+        (dash.STATE / 'panel.json').write_text(json.dumps({'open': is_open}))
+
+    def test_a_panel_open_when_the_reload_took_it_is_opened_after_each_plugin(self):
+        self.panel(True)
+        dash.execute_job(dash.new_job('update', ['a', 'app', 'c']))
+        self.assertEqual(self.opened, [['omarchy-shell', dash.SELF_ID, 'open']] * 2)
+
+    def test_a_panel_closed_by_hand_stays_closed(self):
+        self.panel(False)
+        dash.execute_job(dash.new_job('update', ['a']))
+        self.assertEqual(self.opened, [])
+
+    def test_no_panel_state_means_no_reopen(self):
+        dash.execute_job(dash.new_job('update', ['a']))
+        self.assertEqual(self.opened, [])
 
 
 class StartJobTests(JobFixture):
@@ -2279,11 +2274,11 @@ class RestartUpdatedUnitsTests(RealRepoFixture):
         git(self.plugin, 'reset', '-q', '--hard', self.new)
         real = dash.run
         def updating(args, **kw):
-            if args[:3] == ['omarchy', 'plugin', 'update']:
+            if args[0] == 'carry':
                 git(self.plugin, 'reset', '-q', '--hard', head)
                 return (0, 'Updated x.plugin.', '')
             return real(args, **kw)
-        with patch.object(dash, 'run', updating):
+        with patch.object(dash, 'run', updating), patch.object(dash, 'carry_update', carry_through_run):
             dash.cmd_update(type('A', (), {'id': 'x.plugin'})())
         self.assertTrue(self.printed[-1]['ok'], self.printed[-1])
         self.assertIn('Restarted gpu.service', self.printed[-1]['message'])
@@ -2908,10 +2903,6 @@ class PackageAppTests(unittest.TestCase):
         self.assertEqual((fields['pkgName'], fields['id'], fields['name']), ('brave-bin', 'brave-bin', 'Brave'))
         self.assertIn('provided by brave-bin', notes[0])
         self.assertIsNone(dash.inspect_package('bad name; rm')[0])
-
-    def test_terminal_ids_picks_out_package_apps(self):
-        items = [{'id': 'brave', 'source': 'package'}, {'id': 'flea'}, {'id': 'x.plugin'}]
-        self.assertEqual(dash.terminal_ids(items, ['flea', 'brave', 'x.plugin']), ['brave'])
 
 
 class SeedAppsTests(unittest.TestCase):

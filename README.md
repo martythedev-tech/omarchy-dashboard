@@ -36,22 +36,24 @@ theme's palette (`colors.toml`), and it moves with what it is telling you:
 Nothing here re-implements an update mechanism. Every action shells out to
 the command that already owns it:
 
-- **Plugins**: `omarchy plugin enable/disable <id>` for the switch,
-  `omarchy plugin update <id> --yes` for the button -- Omarchy's own
-  fetch + diff + fast-forward-only merge + validate + rollback --
+- **Plugins**: `omarchy plugin enable/disable <id>` for the switch and
   `omarchy plugin remove <id> --yes` for Remove. A plugin whose deployed
   directory isn't a git checkout (installed by hand rather than
   `omarchy plugin add`) shows "No update source" instead of a button,
   because there's genuinely nothing to check.
-- **Plugins with local work**: `omarchy plugin update` only fast-forwards, so it
-  refuses a checkout with its own edits or commits. The Dashboard does that
-  update itself: it sets uncommitted edits aside (`git stash`), rebases local
-  commits onto upstream (one upstream already has drops out), puts the edits
-  back, and validates. Any step that fails puts the checkout back exactly as it
-  was. Each check dry-runs this first (`git merge-tree`, which touches nothing),
-  so such a plugin shows a normal Update button with an EDITED / +N LOCAL tag,
-  and only work that clashes with the update shows "dirty" or "diverged",
-  naming the files.
+- **Plugin updates** are the one thing the Dashboard does itself, because
+  `omarchy plugin update` only fast-forwards (it refuses a checkout with its own edits or
+  commits) and changes the plugin folder twice. It fetches, sets uncommitted edits aside
+  (`git stash`), rebases local commits onto upstream (one upstream already has drops out)
+  or fast-forwards, puts the edits back, and validates (`omarchy plugin validate`). All of
+  that happens in a hidden copy beside the plugin, and the result is copied into the live
+  folder in one go. The shell rebuilds every plugin whenever a plugin folder changes (the
+  bar and dock blink, and the open panel closes), so one change means one rebuild instead
+  of three or four. If the panel was open, the Dashboard opens it again afterwards. Any
+  step that fails just drops the copy, and the plugin is left exactly as it was. Each check
+  dry-runs the carry first (`git merge-tree`, which touches nothing), so a plugin with
+  local work shows a normal Update button with an EDITED / +N LOCAL tag, and only work
+  that clashes with the update shows "dirty" or "diverged", naming the files.
 - **Apps**: an installed package updates the way the system does (`omarchy update`, or
   `yay -S` for an AUR package), in a terminal; a source repo runs its own `updateCmd`
   (default `rebuild.sh --install`). The whole story is under [Apps](#apps).
@@ -64,7 +66,7 @@ which the panel reads. It runs on a timer (`dashboard-check.timer`, every
 few hours) and once synchronously whenever the panel opens, so opening it
 never shows data older than that. Any item that just became updatable since
 the last check (not one that's been sitting there) fires a desktop
-notification via `notify-send`.
+notification (see [Notifications](#notifications)).
 
 ## Apps
 
@@ -106,8 +108,8 @@ one that is not installed gets suggestions.
   PKGBUILD does, not when the source does.
 
 These updates open a terminal because they need sudo. The terminal records the result
-under Recent and rechecks when it is done. **Update all** and the notification's **Update**
-open one terminal for every package app and run everything else as usual. A package app
+under Recent and rechecks when it is done. **Update all** opens one terminal for every package app
+and runs everything else as usual. A package app
 has no Changes view (there is no checkout to diff) and no Roll back.
 
 ### Source repos
@@ -243,7 +245,7 @@ updates that bring the verified commit. The button then reads **Update verified 
 out: an UPDATE UNVERIFIED plugin, an unlisted one (your own plugins included), and any
 plugin while the catalog cannot be read. Apps are not in the marketplace and always go.
 Each skipped row keeps its own **Update** button, and the summary names what was skipped.
-The notification's **Update** follows the same switch. The choice is kept in
+The choice is kept in
 `settings.json` in the state folder.
 
 Checks run side by side, so a full check takes about as long as the slowest single
@@ -288,7 +290,7 @@ fetch rather than the sum of them.
   stops and removes a unit.
 - **New background services**: an update can ship a systemd user unit the plugin's
   own `install.py` would have installed (Pulse 1.3.2 added `gpu-pulse.service`), and
-  `omarchy plugin update` never runs `install.py`. After a successful update the
+  a plugin update never runs `install.py`. After a successful update the
   Dashboard compares the units the plugin ships before and after, and installs and
   starts the ones that are new -- then reloads that plugin's widget so it notices. It is
   deliberately narrow: only a unit that was not shipped before (a service you removed on
@@ -336,13 +338,10 @@ services it ships that are running are restarted, so they run the new code.
 
 ## Notifications
 
-The "update available" notification has **Update** and **Open** buttons. Update
-updates the items it named that are still updatable and not held (and verified, under
-**Update all: verified only**), then says how that went, naming anything skipped; Open opens the panel. It runs as a job like any other, so an open panel shows it
-going -- except package apps, which get a terminal.
-The notification is waited on by a small
-transient user unit (`dashboard-notify-*`), which goes away once it is clicked,
-dismissed, or an hour has passed.
+The "update available" notification looks like Omarchy's own: the puzzle glyph, what has
+an update, and no buttons. Clicking it opens the panel, where you update from. (Until
+1.19.0 it had **Update** and **Open** buttons, which made it half as tall again as every
+other notification.)
 
 ## Discover
 
