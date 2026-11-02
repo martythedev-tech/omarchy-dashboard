@@ -160,6 +160,10 @@ assert.equal(ctx.localTag(null), '');
 assert.equal(ctx.localTag({updateState: 'behind', ahead: 0, edits: 2}), 'EDITED');
 assert.equal(ctx.localTag({updateState: 'behind', ahead: 1, edits: 1}), '+1 LOCAL · EDITED');
 assert.equal(ctx.localTag({updateState: 'dirty', ahead: 0, edits: 1}), '');
+// Edits git refuses only for neighbouring upstream lines; the update re-applies them.
+assert.equal(ctx.localTag({updateState: 'behind', ahead: 0, edits: 1, reapply: ['ui/Bar.qml']}), 'EDITED · RE-APPLY');
+assert.equal(ctx.localTag({updateState: 'up-to-date', ahead: 0, edits: 1, reapply: ['ui/Bar.qml']}), 'EDITED');
+assert.equal(ctx.localTag({updateState: 'behind', ahead: 0, edits: 1, reapply: []}), 'EDITED');
 // holds: out of the badge, ring and Update all; pill and stripe go quiet
 assert.equal(ctx.canUpdate({updateState: 'behind', held: true}), false);
 assert.equal(ctx.canHold({updateState: 'behind'}), true);
