@@ -54,6 +54,15 @@ the command that already owns it:
   dry-runs the carry first (`git merge-tree`, which touches nothing), so a plugin with
   local work shows a normal Update button with an EDITED / +N LOCAL tag, and only work
   that clashes with the update shows "dirty" or "diverged", naming the files.
+
+  git also refuses an edit that only sits on the line *next to* one the update changed.
+  For uncommitted edits the Dashboard then compares the old file, your copy and the
+  update's copy line by line, and puts each block you changed back only where the update
+  left those exact lines alone. Two insertions at the same spot keep yours first, and
+  lines the update already added are not added twice. If any block touches lines the
+  update changed, nothing is guessed: the plugin stays "dirty". Such a row says
+  EDITED · RE-APPLY before the update, and the result goes through the same validation,
+  load check and Roll back as any other update. Local commits still need git's own merge.
 - **Apps**: an installed package updates the way the system does (`omarchy update`, or
   `yay -S` for an AUR package), in a terminal; a source repo runs its own `updateCmd`
   (default `rebuild.sh --install`). The whole story is under [Apps](#apps).
@@ -211,6 +220,9 @@ Beside it, in a muted outline:
   mistaken for an untouched install.
 - **EDITED**: the checkout has uncommitted edits; an update carries them over (see Plugins
   with local work above).
+- **RE-APPLY**: with EDITED on a row with an update: git alone would call these edits
+  dirty because they sit next to the update's changes, so the update re-applies them
+  line by line (see Plugins with local work above).
 - **✓ VERIFIED** (green) / **UNVERIFIED**: what the marketplace says about the code you
   run -- see [Marketplace verification](#marketplace-verification). On a row with an update
   waiting it is about the update instead: **✓ UPDATE VERIFIED** / **UPDATE UNVERIFIED**.

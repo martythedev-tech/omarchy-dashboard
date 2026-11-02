@@ -179,12 +179,14 @@ function pillLabel(item) {
 // does not. CURRENT/BEHIND alone said nothing about them, so a 92-commit fork looked the
 // same as an untouched install. Not shown for 'diverged', whose pill already says it.
 // "EDITED" is the same for uncommitted edits, which an update now carries over too; not
-// shown for 'dirty', whose pill already says it.
+// shown for 'dirty', whose pill already says it. "RE-APPLY" marks edits git alone would
+// refuse for sitting next to upstream's changes; the update puts them back line by line.
 function localTag(item) {
     if (!item) return ''
     var parts = []
     if (item.ahead > 0 && item.updateState !== 'diverged') parts.push('+' + item.ahead + ' LOCAL')
     if (item.edits > 0 && item.updateState !== 'dirty') parts.push('EDITED')
+    if (item.reapply && item.reapply.length && item.updateState === 'behind') parts.push('RE-APPLY')
     return parts.join(' · ')
 }
 

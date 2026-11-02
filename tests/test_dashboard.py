@@ -1780,6 +1780,107 @@ class CarryUpdateTests(unittest.TestCase):
         self.assertEqual((real / 'Panel.qml').read_text(), 'A\nb\nc\n')
 
 
+class TransplantLinesTests(unittest.TestCase):
+    """The line check behind re-applying edits git refuses for sitting next to upstream's."""
+
+    @staticmethod
+    def lines(text):
+        return text.splitlines(keepends=True)
+
+    def merge(self, base, ours, theirs):
+        out = dash.transplant_lines(self.lines(base), self.lines(ours), self.lines(theirs))
+        return None if out is None else ''.join(out)
+
+    def test_an_insertion_next_to_upstreams_insertion_keeps_both(self):
+        # 2026-11-02, Omastorm: our Commons import, upstream's KeyMap import, same spot +1.
+        base = 'import A\nimport B\n\nx: Color.a\n'
+        ours = 'import A\nimport B\nimport B as Bee\n\nx: Bee.Color.a\n'
+        theirs = 'import A\nimport B\nimport "K.js" as K\n\nx: Color.a\n'
+        # Both insert right after `import B`: ours first, next to the line it follows.
+        self.assertEqual(self.merge(base, ours, theirs),
+                         'import A\nimport B\nimport B as Bee\nimport "K.js" as K\n\nx: Bee.Color.a\n')
+
+    def test_an_insertion_upstream_also_made_is_not_doubled(self):
+        base = 'import A\n\nx: Color.a\n'
+        ours = 'import A\nimport A as Aa\n\nx: Aa.Color.a\n'
+        theirs = 'import A\nimport A as Aa\nimport K\n\nx: Color.a\n'
+        self.assertEqual(self.merge(base, ours, theirs), 'import A\nimport A as Aa\nimport K\n\nx: Aa.Color.a\n')
+
+    def test_a_change_on_the_line_next_to_upstreams_change_keeps_both(self):
+        self.assertEqual(self.merge('a\nb\nc\nd\n', 'a\nB\nc\nd\n', 'a\nb\nC\nd\n'), 'a\nB\nC\nd\n')
+
+    def test_a_change_to_the_same_line_is_refused(self):
+        self.assertIsNone(self.merge('a\nb\nc\n', 'a\nX\nc\n', 'a\nY\nc\n'))
+
+    def test_upstream_inserting_inside_our_changed_block_is_refused(self):
+        self.assertIsNone(self.merge('a\nb\nc\nd\n', 'a\nB\nC\nd\n', 'a\nb\nnew\nc\nd\n'))
+
+    def test_our_change_follows_lines_upstream_moved_down(self):
+        self.assertEqual(self.merge('a\nb\nc\nd\ne\n', 'a\nb\nc\nd\nE\n', 'top\nmore\na\nb\nc\nd\ne\n'),
+                         'top\nmore\na\nb\nc\nd\nE\n')
+
+    def test_upstream_deleting_a_neighbour_keeps_our_change(self):
+        self.assertEqual(self.merge('a\nb\nc\n', 'a\nb\nC\n', 'a\nc\n'), 'a\nC\n')
+
+
+class ReapplyCarryTests(CarryUpdateTests):
+    """carry_update and the status check on a real repo, for edits git refuses only for
+    being next to upstream's change. Inherits the fixture (and re-runs its tests)."""
+
+    def omastorm_case(self):
+        (self.upstream / 'Bar.qml').write_text('import A\nimport B\n\nborder: Color.accent\nwidth: 336\n')
+        git(self.upstream, 'commit', '-qam', 'shape it like RadarBar')
+        self.fetch()
+        git(self.plugin, 'merge', '-q', '--ff-only', 'FETCH_HEAD')
+        (self.plugin / 'Bar.qml').write_text(
+            'import A\nimport B\nimport B as Bee\n\nborder: Bee.Color.accent\nwidth: 336\n')
+        self.upstream_commit('Bar.qml', 'import A\nimport B\nimport "K.js" as K\n\nborder: Color.accent\nwidth: K.scaled(308)\n')
+        self.fetch()
+
+    def test_an_edit_next_to_the_update_is_behind_and_marked(self):
+        self.omastorm_case()
+        self.assertEqual(dash.plugin_update_state(self.plugin), ('behind', 1, ''))
+        self.assertEqual(dash.reapply_needed(self.plugin), ['Bar.qml'])
+
+    def test_an_edit_next_to_the_update_is_reapplied(self):
+        self.omastorm_case()
+        rc, out, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 0, err)
+        self.assertIn('Re-applied your edits line by line', out)
+        self.assertIn('Bar.qml', out)
+        self.assertEqual((self.plugin / 'Bar.qml').read_text(),
+                         'import A\nimport B\nimport B as Bee\nimport "K.js" as K\n\nborder: Bee.Color.accent\nwidth: K.scaled(308)\n')
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), git(self.upstream, 'rev-parse', 'HEAD'))
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
+        self.assertFalse(dash.repo_operation_in_progress(self.plugin))
+
+    def test_a_reapplied_update_that_fails_validation_changes_nothing(self):
+        self.omastorm_case()
+        before = (self.plugin / 'Bar.qml').read_text()
+        self.validate_rc = 1
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertIn('Nothing changed', err)
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old_after_shape())
+        self.assertEqual((self.plugin / 'Bar.qml').read_text(), before)
+        self.assertEqual(git(self.plugin, 'stash', 'list'), '')
+
+    def old_after_shape(self):
+        return git(self.upstream, 'rev-parse', 'HEAD~1')
+
+    def test_the_same_line_still_stays_dirty_and_untouched(self):
+        self.upstream_commit('Bar.qml', 'color: Color.urgent\nwidth: 10\n')
+        (self.plugin / 'Bar.qml').write_text('color: Commons.Color.accent\nwidth: 10\n')
+        self.fetch()
+        self.assertEqual(dash.reapply_needed(self.plugin), [])
+        self.assertEqual(dash.plugin_update_state(self.plugin)[0], 'dirty')
+        rc, _, err = dash.carry_update(self.plugin)
+        self.assertEqual(rc, 1)
+        self.assertIn('the update changed the same lines', err)
+        self.assertEqual((self.plugin / 'Bar.qml').read_text(), 'color: Commons.Color.accent\nwidth: 10\n')
+        self.assertEqual(git(self.plugin, 'rev-parse', 'HEAD'), self.old)
+
+
 class RepoGuessFixture(unittest.TestCase):
     """A real repo with a real remote, so remote/branch guessing runs actual git."""
 

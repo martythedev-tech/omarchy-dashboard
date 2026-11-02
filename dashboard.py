@@ -761,13 +761,164 @@ def untracked_in_update(plugin_dir, upstream_ref='FETCH_HEAD'):
     return same, differ
 
 
+def _line_ranges_clash(ours, theirs):
+    """Whether two changed ranges of the same base file, each [start, end) in base lines,
+    touch the same lines. An empty range is an insertion before that line. Ranges that only
+    meet at an edge do not clash -- that is the neighbouring-line case git refuses."""
+    (i1, i2), (u1, u2) = ours, theirs
+    if i1 == i2 and u1 == u2:
+        return False             # both insert at one point: ours goes first (transplant_lines)
+    if i1 == i2:
+        return u1 < i1 < u2
+    if u1 == u2:
+        return i1 < u1 < i2
+    return i1 < u2 and u1 < i2
+
+
+def transplant_lines(base, ours, theirs):
+    """Our changes from base to ours, laid onto theirs, or None when that is not certain.
+
+    git's merge refuses two changes on neighbouring lines as a conflict even when they do
+    not touch the same line -- 2026-11-02, a one-line Qt 6.12 import fix in Omastorm sat
+    DIRTY because upstream added an import on the next line. This takes each block we
+    changed and puts it back only where upstream left exactly those base lines alone; any
+    block whose lines upstream changed gives up. Two insertions at one spot (that Omastorm
+    case: our import and upstream's both right after `import qs.Commons`) keep ours first,
+    next to the line it was added after; lines upstream inserted there too are not added
+    twice. Each argument is a list of lines with their endings."""
+    import difflib
+
+    def ops(a, b):
+        return difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes()
+
+    our_changes = [op for op in ops(base, ours) if op[0] != 'equal']
+    their_ops = ops(base, theirs)
+    their_changes = [op for op in their_ops if op[0] != 'equal']
+    for _, i1, i2, _, _ in our_changes:
+        for _, u1, u2, _, _ in their_changes:
+            if _line_ranges_clash((i1, i2), (u1, u2)):
+                return None
+
+    def where(p, insertion):
+        """Base line p's index in theirs. An insertion of ours at the start of a block
+        upstream changed lands before what upstream put there."""
+        if insertion:
+            for tag, a1, _, b1, _ in their_ops:
+                if tag != 'equal' and a1 == p:
+                    return b1
+        for tag, a1, a2, b1, _ in their_ops:
+            if tag == 'equal' and a1 <= p < a2:
+                return b1 + p - a1
+        for tag, a1, _, b1, _ in their_ops:
+            if tag != 'equal' and a1 == p:
+                return b1
+        return len(theirs)
+
+    def upstream_inserted_it(p, lines):
+        for tag, a1, _, b1, b2 in their_ops:
+            if tag != 'equal' and a1 == p:
+                new = theirs[b1:b2]
+                return any(new[k:k + len(lines)] == lines for k in range(len(new) - len(lines) + 1))
+        return False
+
+    merged = list(theirs)
+    for _, i1, i2, j1, j2 in reversed(our_changes):
+        if i1 == i2 and upstream_inserted_it(i1, ours[j1:j2]):
+            continue
+        at = where(i1, i1 == i2)
+        if merged[at:at + (i2 - i1)] != base[i1:i2]:
+            return None          # not the lines we changed after all: never guess
+        merged[at:at + (i2 - i1)] = ours[j1:j2]
+    return merged
+
+
+def git_blob(repo, ref, path):
+    """The bytes of path at ref (a commit or tree), or None if it has no such file."""
+    try:
+        p = subprocess.run(['git', '-C', str(repo), 'cat-file', 'blob', f'{ref}:{path}'],
+                           capture_output=True, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def reapply_edits(repo, base_ref, ours_ref, theirs_ref):
+    """({path: new bytes, or None to delete}, [merged paths], '') putting the edits
+    base_ref -> ours_ref onto theirs_ref file by file, or (None, [], 'why') when one cannot be
+    put back for certain. A file upstream did not touch keeps our copy whole; one both
+    changed goes through transplant_lines, must be UTF-8 text, and is listed as merged."""
+    rc, out, err = run(['git', '-C', str(repo), 'diff', '--name-status', '--no-renames', '-z',
+                        base_ref, ours_ref])
+    if rc != 0:
+        return None, [], err.strip() or 'could not list the local edits'
+    fields = out.split('\0')
+    files, merged_paths = {}, []
+    for status, path in zip(fields[0::2], fields[1::2]):
+        if not path:
+            continue
+        base = git_blob(repo, base_ref, path)
+        ours = git_blob(repo, ours_ref, path)
+        theirs = git_blob(repo, theirs_ref, path)
+        if theirs == base:                       # upstream left this file alone
+            files[path] = ours
+            continue
+        if theirs == ours:                       # upstream made the same edit
+            continue
+        if status != 'M' or base is None or ours is None or theirs is None:
+            return None, [], f'{path} was added, removed or replaced on both sides'
+        try:
+            texts = [b.decode('utf-8').splitlines(keepends=True) for b in (base, ours, theirs)]
+        except UnicodeDecodeError:
+            return None, [], f'{path} is not text'
+        merged = transplant_lines(*texts)
+        if merged is None:
+            return None, [], f'{path}: the update changed the same lines'
+        files[path] = ''.join(merged).encode('utf-8')
+        merged_paths.append(path)
+    return files, merged_paths, ''
+
+
+def reapply_needed(plugin_dir, upstream_ref='FETCH_HEAD'):
+    """The files whose uncommitted edits only carry over through reapply_edits -- git's own
+    merge refuses them, the line check does not -- or [] when git merges everything itself
+    or nothing can be carried. A dry run like local_work_carries."""
+    d = str(plugin_dir)
+    rc, base, _ = run(['git', '-C', d, 'merge-base', 'HEAD', upstream_ref])
+    _, stash, _ = run(['git', '-C', d, 'stash', 'create'])
+    if rc != 0 or not stash.strip():
+        return []
+    rc, out, _ = run(['git', '-C', d, 'merge-tree', '--write-tree', '--name-only',
+                      f'--merge-base={base.strip()}', stash.strip(), upstream_ref])
+    if rc == 0:
+        return []
+    # Local commits first, the way carry_update rebases them, then the edits on top.
+    rc, out, _ = run(['git', '-C', d, 'merge-tree', '--write-tree',
+                      f'--merge-base={base.strip()}', 'HEAD', upstream_ref])
+    if rc != 0:
+        return []
+    files, merged_paths, _ = reapply_edits(d, 'HEAD', stash.strip(), out.splitlines()[0].strip())
+    return merged_paths if files is not None else []
+
+
+def merge_tree_conflicts(out):
+    """The conflicted paths in `git merge-tree --write-tree --name-only` output: the tree id,
+    those paths, a blank line, then informational messages."""
+    files = []
+    for line in out.splitlines()[1:]:
+        if not line.strip():
+            break
+        files.append(line.strip())
+    return files
+
+
 def local_work_carries(plugin_dir, upstream_ref='FETCH_HEAD'):
     """(True, '') when this checkout's own work -- local commits and uncommitted edits
     together -- merges cleanly onto upstream_ref; (False, 'a.qml, b.qml') naming the
     conflicting files when it does not. A dry run in git's object store (`stash create`
     writes a commit without touching the tree or the stash list, `merge-tree` merges without
     a checkout), so a check can ask on every pass. An edit upstream has since made itself
-    merges as clean, which is what lets such a plugin update instead of sitting DIRTY."""
+    merges as clean, which is what lets such a plugin update instead of sitting DIRTY; so
+    does an edit git refuses only for sitting next to upstream's (reapply_needed)."""
     d = str(plugin_dir)
     rc, base, _ = run(['git', '-C', d, 'merge-base', 'HEAD', upstream_ref])
     if rc != 0:
@@ -778,12 +929,9 @@ def local_work_carries(plugin_dir, upstream_ref='FETCH_HEAD'):
                       f'--merge-base={base.strip()}', tip, upstream_ref])
     if rc == 0:
         return True, ''
-    # Output: the tree id, the conflicted paths, a blank line, then informational messages.
-    files = []
-    for line in out.splitlines()[1:]:
-        if not line.strip():
-            break
-        files.append(line.strip())
+    if reapply_needed(plugin_dir, upstream_ref):
+        return True, ''
+    files = merge_tree_conflicts(out)
     return False, ', '.join(files[:3]) + (f' and {len(files) - 3} more' if len(files) > 3 else '')
 
 
@@ -843,10 +991,26 @@ def carry_update(plugin_dir):
         rc, out, err = run(['git', '-C', d, 'merge', '--ff-only', '--quiet', 'FETCH_HEAD'])
         if rc != 0:
             return restore('The update could not be applied: ' + (err or out).strip())
+    reapplied = []
     if edits:
         rc, out, err = run(['git', '-C', d, 'stash', 'pop', '--quiet'])
         if rc != 0:
-            return restore('Your local edits clash with the update:\n' + (err or out).strip()[-1500:])
+            # git refuses an edit on a line next to one the update changed as readily as one
+            # on the same line; reapply_edits tells the two apart and puts back only the first.
+            popped_err = (err or out).strip()
+            run(['git', '-C', d, 'reset', '--hard', '--quiet', 'HEAD'])
+            files, reapplied, why = reapply_edits(d, 'stash@{0}^1', 'stash@{0}', 'HEAD')
+            if files is None:
+                return restore('Your local edits clash with the update (' + why + '):\n'
+                               + popped_err[-1500:])
+            for path, data in files.items():
+                target = stage / path
+                if data is None:
+                    target.unlink(missing_ok=True)
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
+            run(['git', '-C', d, 'stash', 'drop', '--quiet'])
     rc, out, err = run(['omarchy', 'plugin', 'validate', d], timeout=60)
     if rc != 0:
         what = 'The update with your local changes on top' if edits or ahead or same else 'The update'
@@ -870,6 +1034,10 @@ def carry_update(plugin_dir):
         kept.append(f'{still_edited} locally edited file(s)')
     note = ('Kept ' + ' and '.join(kept) + ' on top.') if kept else \
         'Your local changes are now part of the update itself, so none are left over.'
+    if reapplied:
+        note += (' Re-applied your edits line by line next to the update\'s changes in '
+                 + ', '.join(reapplied[:3]) + (f' and {len(reapplied) - 3} more' if len(reapplied) > 3 else '')
+                 + ' (git refused them only for sitting on neighbouring lines).')
     return 0, f'Updated {live.name}. {note}', ''
 
 
@@ -1007,6 +1175,7 @@ def check_plugin(p):
     version = manifest_version(pid)
     incoming = upstream_version(plugin_dir, 'FETCH_HEAD', 'plugin') if state == 'behind' else ''
     changed = version_change(version, incoming)
+    edits = local_edit_count(plugin_dir) if compared else 0
     return {
         'id': pid, 'kind': 'plugin', 'name': p.get('name', pid),
         'description': manifest_description(pid),
@@ -1016,7 +1185,9 @@ def check_plugin(p):
         'enabled': bool(p.get('enabled')),
         'canDisable': bool(p.get('canDisable', True)),
         'updateState': state, 'behind': behind, 'reason': reason, 'ahead': ahead,
-        'edits': local_edit_count(plugin_dir) if compared else 0,
+        'edits': edits,
+        # Files whose edits only carry over line by line (git alone would call them DIRTY).
+        'reapply': reapply_needed(plugin_dir) if state == 'behind' and edits else [],
         'info': repo_info(plugin_dir, 'origin', 'FETCH_HEAD' if compared else None),
     }
 
