@@ -899,7 +899,7 @@ Panel {
             width: 16; height: 16; radius: 8; color: Commons.Color.background
             anchors.verticalCenter: parent.verticalCenter
             x: tg.checked ? parent.width - width - 2 : 2
-            Behavior on x { NumberAnimation { duration: 120 } }
+            Behavior on x { NumberAnimation { duration: Style.duration(120); easing.type: Easing.Bezier; easing.bezierCurve: Style.easeOut } }
         }
         MouseArea { anchors.fill: parent; cursorShape: tg.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor; onClicked: if (tg.enabled) tg.toggled() }
     }
@@ -923,6 +923,7 @@ Panel {
             clip: true
         }
         Text {
+            textFormat: Text.PlainText
             anchors.left: input.left; anchors.verticalCenter: parent.verticalCenter
             text: field.placeholder
             visible: input.text.length === 0 && !input.activeFocus
@@ -963,28 +964,34 @@ Panel {
             settle.restart()
             if (mood === "calm" && !lifted) popIn.restart()
         }
-        NumberAnimation { id: liftUp; target: pz; property: "lift"; to: 1; duration: 380; easing.type: Easing.OutBack }
-        NumberAnimation { id: dropIn; target: pz; property: "lift"; to: 0; duration: 700; easing.type: Easing.OutBounce }
+        // Motion follows Omarchy's plugin rules: Style.duration() so `omarchy toggle
+        // animations` turns it off, ease-out (no bounce, no overshoot, no ease-in), under
+        // 300 ms with exits shorter than entrances, linear only for the constant rocking.
+        NumberAnimation { id: liftUp; target: pz; property: "lift"; to: 1; duration: Style.duration(180); easing.type: Easing.Bezier; easing.bezierCurve: Style.easeOut }
+        NumberAnimation { id: dropIn; target: pz; property: "lift"; to: 0; duration: Style.duration(120); easing.type: Easing.OutCubic }
         SequentialAnimation {
-            running: pz.working
+            // A looping animation with every duration 0 would spin, so it stays off
+            // when motion is reduced, like Omarchy's own spinners.
+            running: pz.working && !Style.reduceMotion
             loops: Animation.Infinite
-            NumberAnimation { target: pz; property: "rock"; to: 10; duration: 260; easing.type: Easing.InOutSine }
-            NumberAnimation { target: pz; property: "rock"; to: -10; duration: 520; easing.type: Easing.InOutSine }
-            NumberAnimation { target: pz; property: "rock"; to: 0; duration: 260; easing.type: Easing.InOutSine }
+            alwaysRunToEnd: true
+            NumberAnimation { target: pz; property: "rock"; to: 10; duration: Style.duration(260) }
+            NumberAnimation { target: pz; property: "rock"; to: -10; duration: Style.duration(520) }
+            NumberAnimation { target: pz; property: "rock"; to: 0; duration: Style.duration(260) }
         }
-        NumberAnimation { id: settle; target: pz; property: "rock"; to: 0; duration: 200; easing.type: Easing.OutQuad }
+        NumberAnimation { id: settle; target: pz; property: "rock"; to: 0; duration: Style.duration(120); easing.type: Easing.OutCubic }
         SequentialAnimation {
             id: shake
-            NumberAnimation { target: pz; property: "rock"; to: 14; duration: 60 }
-            NumberAnimation { target: pz; property: "rock"; to: -14; duration: 110 }
-            NumberAnimation { target: pz; property: "rock"; to: 9; duration: 100 }
-            NumberAnimation { target: pz; property: "rock"; to: -6; duration: 90 }
-            NumberAnimation { target: pz; property: "rock"; to: 0; duration: 80 }
+            NumberAnimation { target: pz; property: "rock"; to: 12; duration: Style.duration(50); easing.type: Easing.OutCubic }
+            NumberAnimation { target: pz; property: "rock"; to: -12; duration: Style.duration(70); easing.type: Easing.OutCubic }
+            NumberAnimation { target: pz; property: "rock"; to: 7; duration: Style.duration(60); easing.type: Easing.OutCubic }
+            NumberAnimation { target: pz; property: "rock"; to: -4; duration: Style.duration(50); easing.type: Easing.OutCubic }
+            NumberAnimation { target: pz; property: "rock"; to: 0; duration: Style.duration(50); easing.type: Easing.OutCubic }
         }
         SequentialAnimation {
             id: popIn
-            NumberAnimation { target: pz; property: "pop"; to: 1.18; duration: 90; easing.type: Easing.OutQuad }
-            NumberAnimation { target: pz; property: "pop"; to: 1; duration: 320; easing.type: Easing.OutBack }
+            NumberAnimation { target: pz; property: "pop"; to: 1.12; duration: Style.duration(90); easing.type: Easing.OutCubic }
+            NumberAnimation { target: pz; property: "pop"; to: 1; duration: Style.duration(160); easing.type: Easing.OutCubic }
         }
 
         // The piece's outline in a 1x1 box: a tab on top and on the right, a blank (an
@@ -1076,6 +1083,7 @@ Panel {
         radius: 8
         color: Util.alpha(root.tileColor(tile.name), tile.dim ? 0.35 : 0.9)
         Text {
+            textFormat: Text.PlainText
             anchors.centerIn: parent
             text: Model.tileLetter(tile.name)
             color: Commons.Color.background
@@ -1117,7 +1125,7 @@ Panel {
         height: content.implicitHeight + 20
         radius: 8
         color: rowMouse.containsMouse ? Style.hoverFill : "transparent"
-        Behavior on color { ColorAnimation { duration: 80 } }
+        Behavior on color { ColorAnimation { duration: Style.duration(80) } }
 
         MouseArea { id: rowMouse; anchors.fill: parent; hoverEnabled: true; acceptedButtons: Qt.NoButton }
         Timer { id: confirmResetTimer; interval: 4000; onTriggered: row.confirming = "" }
@@ -1241,6 +1249,7 @@ Panel {
                         }
                         // The first thing to give way when the line is full: name and pills stay whole.
                         Text {
+                            textFormat: Text.PlainText
                             id: versionText
                             width: Math.max(0, Math.min(implicitWidth, parent.width - nameText.width - row.badgesWidth - 28))
                             visible: width > 24
@@ -1253,6 +1262,7 @@ Panel {
                             font.pixelSize: Style.font.caption
                         }
                         Text {
+                            textFormat: Text.PlainText
                             text: row.infoShown ? "▾" : "▸"
                             anchors.verticalCenter: nameText.verticalCenter
                             color: Util.alpha(root.ink, 0.45)
@@ -1469,6 +1479,7 @@ Panel {
                         text: "Press the keys that should open " + row.modelData.name + ", e.g. Super + Alt + P. Esc cancels."
                     }
                     Text {
+                        textFormat: Text.PlainText
                         width: parent.width
                         horizontalAlignment: Text.AlignHCenter
                         text: shortcutBox.held ? shortcutBox.held + " + …" : (row.modelData.shortcut || "No shortcut yet")
@@ -1661,6 +1672,7 @@ Panel {
                         spacing: 6
                         Heading { id: dName; text: drow.modelData.name; font.pixelSize: Style.font.body; elide: Text.ElideRight; width: Math.min(implicitWidth, parent.width - 16) }
                         Text {
+                            textFormat: Text.PlainText
                             text: drow.open ? "▾" : "▸"
                             anchors.verticalCenter: dName.verticalCenter
                             color: Util.alpha(root.ink, 0.45)
@@ -1900,11 +1912,13 @@ Panel {
                 font.pixelSize: 12
                 font.bold: true
                 textFormat: Text.PlainText
+                // Constant motion, so linear; off (and back at full opacity) when motion is reduced.
                 SequentialAnimation on opacity {
-                    running: barCount.visible
+                    running: barCount.visible && !Style.reduceMotion
                     loops: Animation.Infinite
-                    NumberAnimation { from: 1.0; to: 0.5; duration: 900; easing.type: Easing.InOutQuad }
-                    NumberAnimation { from: 0.5; to: 1.0; duration: 900; easing.type: Easing.InOutQuad }
+                    alwaysRunToEnd: true
+                    NumberAnimation { from: 1.0; to: 0.5; duration: Style.duration(900) }
+                    NumberAnimation { from: 0.5; to: 1.0; duration: Style.duration(900) }
                 }
             }
         }
@@ -2089,6 +2103,7 @@ Panel {
                                             anchors.verticalCenter: parent.verticalCenter
                                             spacing: 8
                                             Text {
+                                                textFormat: Text.PlainText
                                                 id: barRowName
                                                 width: Math.min(implicitWidth, parent.width - barRowTag.width - 8)
                                                 elide: Text.ElideRight
@@ -2099,6 +2114,7 @@ Panel {
                                             }
                                             // Third-party widgets say so: the ones this Dashboard looks after.
                                             Text {
+                                                textFormat: Text.PlainText
                                                 id: barRowTag
                                                 anchors.verticalCenter: barRowName.verticalCenter
                                                 visible: !(root.barNames[barRow.modelData.id] && root.barNames[barRow.modelData.id].own)
@@ -2129,6 +2145,7 @@ Panel {
                                                     border.color: arrow.can ? Style.normalBorderColor : "transparent"
                                                     opacity: arrow.can ? 1 : 0.25
                                                     Text {
+                                                        textFormat: Text.PlainText
                                                         anchors.centerIn: parent
                                                         text: arrow.modelData[1]
                                                         color: root.ink
@@ -2554,6 +2571,7 @@ Panel {
                 // compiled QML and restarts the shell. Two clicks, since the bar goes away
                 // for a moment; not while an update runs.
                 Text {
+                    textFormat: Text.PlainText
                     text: root.restartConfirm ? "Restart the shell?" : "Restart shell"
                     color: root.restartConfirm ? Commons.Color.urgent
                            : restartMouse.containsMouse && restartMouse.enabled ? Commons.Color.accent : Util.alpha(root.ink, 0.45)
@@ -2570,6 +2588,7 @@ Panel {
                     }
                 }
                 Text {
+                    textFormat: Text.PlainText
                     visible: scopeSwitch.visible
                     text: "·"
                     color: Util.alpha(root.ink, 0.3)
@@ -2578,6 +2597,7 @@ Panel {
                 }
                 // Update all's scope, as a quiet switch: click to flip.
                 Text {
+                    textFormat: Text.PlainText
                     id: scopeSwitch
                     visible: root.view === "installed" && root.grouped.plugins.length + root.grouped.disabled.length > 0
                     text: "Update all: " + (root.updateAllScope === "verified" ? "verified only" : "everything")

@@ -47,6 +47,7 @@ import argparse
 import contextlib
 import fcntl
 import hashlib
+import html
 import io
 import json
 import os
@@ -1422,8 +1423,10 @@ def notify_new_updates(items, old_behind_ids):
 def notify(title, body, urgency='normal', open_panel=False):
     """A notification in Omarchy's own style. The shell runs the click command itself, so
     nothing has to stay behind waiting for it."""
+    # The body is notification markup, and plugin names and command output come from
+    # outside: escape it so a name like "<b>x</b>" reads as typed instead of as markup.
     args = ['omarchy-notification-send', '--app-name', 'Plugin Dashboard', '-g', NOTIFY_GLYPH,
-            '-u', urgency, title, body]
+            '-u', urgency, title, html.escape(body, quote=False)]
     if open_panel:
         args += ['--exec', 'omarchy-shell', SELF_ID, 'open']
     run(args, timeout=5)

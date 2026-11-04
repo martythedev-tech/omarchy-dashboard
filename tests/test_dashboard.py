@@ -521,6 +521,23 @@ class CheckAllConcurrencyTests(unittest.TestCase):
         self.assertEqual([i['id'] for i in status['items']], ['p1', 'p2', 'p3'])
 
 
+class NotifyMarkupTests(unittest.TestCase):
+    """Notification bodies are markup; names and command output come from outside."""
+
+    def test_markup_shaped_names_are_escaped(self):
+        with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
+            dash.notify_new_updates([{'id': 'x', 'name': '<img src="https://example.invalid/t">X & Co',
+                                      'updateState': 'behind'}], set())
+        args = run_mock.call_args[0][0]
+        self.assertIn('&lt;img src="https://example.invalid/t"&gt;X &amp; Co', args)
+        self.assertNotIn('<img', ' '.join(args))
+
+    def test_plain_bodies_are_unchanged(self):
+        with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:
+            dash.notify('Shell not restarted', 'omarchy-restart-shell failed.')
+        self.assertIn('omarchy-restart-shell failed.', run_mock.call_args[0][0])
+
+
 class NotifyNewUpdatesTests(unittest.TestCase):
     def test_not_installed_counts_as_newly_updatable(self):
         with patch.object(dash, 'run', return_value=(0, '', '')) as run_mock:

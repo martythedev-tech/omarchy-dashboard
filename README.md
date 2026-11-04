@@ -28,8 +28,13 @@ theme's palette (`colors.toml`), and it moves with what it is telling you:
   that clash with an update, a half-finished git operation, or an action that failed in
   the last day that you haven't seen yet (opening the panel counts as seeing it).
 - **Rocking on its base** while a check or an action runs.
-- When the last update lands it **drops back into its slot** with a bounce, or gives a
-  small pop if it was already seated.
+- When the last update lands it **settles back into its slot**, or gives a small pop if it
+  was already seated.
+
+Motion follows Omarchy's plugin guidelines: short ease-out moves, no bounce, and with
+`omarchy toggle animations` off the icon simply changes state without moving (the rocking
+and the pulsing count stop too). All text the panel shows is plain text, so a plugin name
+or version that looks like markup is displayed as typed, never rendered.
 
 ## How it works
 
