@@ -2430,6 +2430,13 @@ def reopen_panel_after_reload():
     run(['omarchy-shell', SELF_ID, 'open'], timeout=10)
 
 
+def clear_action_log():
+    try:
+        (STATE / 'action.log').write_text('')
+    except OSError:
+        pass
+
+
 def execute_job(job):
     """Runs a claimed job in this process, item by item, keeping job.json current so a
     panel (re)created at any point shows where it is."""
@@ -2438,6 +2445,9 @@ def execute_job(job):
     app_ids = {a['id'] for a in load_apps()}
     try:
         for item_id in job['ids']:
+            # Only some updates stream into action.log (apps, installs); a plugin's git pull
+            # doesn't, so without this the panel shows the previous item's output meanwhile.
+            clear_action_log()
             job.update(current=item_id, itemTs=time.time())
             save_job(job)
             job['results'].append(dict(run_job_item(job['kind'], item_id, job.get('options')), id=item_id))
