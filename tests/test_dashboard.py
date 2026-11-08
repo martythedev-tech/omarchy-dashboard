@@ -2204,6 +2204,21 @@ class JobTests(JobFixture):
             dash.execute_job(dash.new_job('update', ['x', 'y']))
         self.assertEqual(seen, [('running', 'x', dash.os.getpid()), ('running', 'y', dash.os.getpid())])
 
+    def test_each_item_starts_with_an_empty_output_log(self):
+        # A plugin's git pull writes nothing to action.log; the panel must not show the
+        # previous update's output (once "Updated nixfred.pulse." under Radio Atlas).
+        log = dash.STATE / 'action.log'
+        log.parent.mkdir(parents=True, exist_ok=True)
+        log.write_text('Updated someone.else.\n')
+        seen = []
+        def peek(args):
+            seen.append(log.read_text())
+            log.write_text(f'output of {args.id}\n') if args.id == 'x' else None
+            print(json.dumps({'ok': True}))
+        with patch.object(dash, 'cmd_update', peek):
+            dash.execute_job(dash.new_job('update', ['x', 'y']))
+        self.assertEqual(seen, ['', ''])
+
     def test_a_second_job_is_refused_while_one_is_going(self):
         self.assertIsNotNone(dash.new_job('update', ['a']))
         self.assertIsNone(dash.new_job('update', ['b']))   # still 'starting', inside the grace
