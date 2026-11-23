@@ -936,6 +936,7 @@ Panel {
     // colour for the mood (Model.gaugeTone) and moves with it:
     //   calm       green, seated in its slot
     //   waiting    yellow, lifted out of its slot (tilted), the count beside it
+    //              (the slot outline shows in the panel only, not on the bar)
     //   attention  red, with one shake when it turns red
     //   working    rocks on its base while a check or an action runs
     // and drops back into its slot with a bounce when updates are done -- a small pop if
@@ -947,6 +948,9 @@ Panel {
         property string mood: "idle"
         property bool working: false
         property bool compact: false
+        // The empty slot outline. On the bar the piece lifts only a few pixels, so the
+        // outline just peeks out under it as a stray line; the bar icon turns it off.
+        property bool showSlot: true
         implicitWidth: compact ? 22 : 48
         implicitHeight: implicitWidth
 
@@ -1022,7 +1026,7 @@ Panel {
             id: slot
             anchors.fill: parent
             opacity: Math.min(1, pz.lift) * 0.9
-            visible: opacity > 0.01
+            visible: pz.showSlot && opacity > 0.01
             readonly property color track: pz.track
             onTrackChanged: requestPaint()
             onWidthChanged: requestPaint()
@@ -1895,6 +1899,7 @@ Panel {
                 id: barIcon
                 anchors.verticalCenter: parent.verticalCenter
                 compact: true
+                showSlot: false
                 implicitWidth: Style.bar.iconCanvas + 2
                 implicitHeight: Style.bar.iconCanvas + 2
                 tone: root.gaugeTone
