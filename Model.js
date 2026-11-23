@@ -395,6 +395,18 @@ function queueSummary(results, title, verb) {
     return parts.length ? (title || 'Update all') + ': ' + parts.join(', ') + '.' : ''
 }
 
+// An Update all's notes when every item went through: each one that said something,
+// under its name. '' when none did, so the panel shows no box at all.
+function queueNotes(results) {
+    results = results || []
+    var parts = []
+    for (var i = 0; i < results.length; i++) {
+        var text = String(results[i].message || '').trim()
+        if (results[i].ok && text) parts.push((results[i].name || results[i].id) + '\n' + text)
+    }
+    return parts.join('\n\n')
+}
+
 // The actions that run as a job (dashboard.py JOB_KINDS): each changes a plugin's
 // directory, and the shell answers that by rebuilding this widget mid-action.
 function isJobKind(kind) {

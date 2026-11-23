@@ -91,6 +91,7 @@ HISTORY_SHOWN = 8
 ROLLBACK_WINDOW_SECONDS = 7 * 24 * 3600
 # Commits listed per side in the "what's new" view.
 LOG_LIMIT = 50
+NOTES_LIMIT = 8   # commit titles an update result lists before "and N more"
 # The shell writes its log under the runtime dir, one directory per shell instance.
 SHELL_LOG_ROOT = Path(os.environ.get('XDG_RUNTIME_DIR') or f'/run/user/{os.getuid()}') / 'quickshell/by-id'
 # How long after the last reload trigger the shell is given to (re)load a plugin before
@@ -262,6 +263,40 @@ def in_update_all(item, scope):
 def repo_head(repo_dir):
     rc, out, _ = run(['git', '-C', str(repo_dir), 'rev-parse', 'HEAD'])
     return out.strip() if rc == 0 else ''
+
+
+def update_notes(repo_dir, before, after, from_version='', to_version=''):
+    """What an update brought, for its result: the version step and the titles of the
+    commits it pulled, newest first. '' when HEAD did not move. --cherry-pick drops local
+    commits the update re-applied on top: they show up again with new hashes but the same
+    change, and they are not news."""
+    if not before or not after or before == after:
+        return ''
+    rc, out, _ = run(['git', '-C', str(repo_dir), 'log', '--no-merges', '--cherry-pick', '--right-only',
+                      '--format=%s', f'{before}...{after}'], timeout=20)
+    subjects = [line.strip() for line in out.splitlines() if line.strip()] if rc == 0 else []
+    head = []
+    if from_version and to_version and from_version != to_version:
+        head.append(f'{from_version} \u2192 {to_version}')
+    if subjects:
+        head.append(f"{len(subjects)} change{'' if len(subjects) == 1 else 's'}")
+    lines = [' \u00b7 '.join(head)] if head else []
+    lines += ['\u2022 ' + (t if len(t) <= 120 else t[:119] + '\u2026') for t in subjects[:NOTES_LIMIT]]
+    if len(subjects) > NOTES_LIMIT:
+        lines.append(f'\u2026 and {len(subjects) - NOTES_LIMIT} more')
+    return '\n'.join(lines)
+
+
+def with_update_notes(message, notes, item_id):
+    """An update's result text: its notes first, then what the update said, minus the
+    "Updated <id>." the notes make redundant (a plugin update's whole message, often)."""
+    if not notes:
+        return message
+    said = message.strip()
+    for prefix in (f'Updated {item_id}.',):
+        if said.startswith(prefix):
+            said = said[len(prefix):].strip()
+    return notes + ('\n\n' + said if said else '')
 
 
 def git_log(repo_dir, rev_range):
@@ -1609,6 +1644,10 @@ def cmd_update(args):
         name for name in shipped_units(repo_dir)
         if name not in units_installed_before and (USER_UNIT_DIR / name).exists())
     after = repo_head(repo_dir)
+    to_version = item_version(args.id, app)
+    if rc == 0:
+        message = with_update_notes(message, update_notes(repo_dir, before, after, from_version, to_version),
+                                    args.id)
     # A plugin "update" that found nothing to pull changed nothing, and listing it under
     # Recent ("rebuilt, no version change") only buries the real ones. An app's no-op still
     # rebuilt and reinstalled, so it stays; so does any failure.
@@ -1620,7 +1659,7 @@ def cmd_update(args):
         'ts': time.time(), 'id': args.id, 'name': app.get('name', args.id) if app else args.id,
         'kind': 'app' if app else 'plugin', 'action': 'update', 'ok': rc == 0,
         'before': before, 'after': after,
-        'fromVersion': from_version, 'toVersion': item_version(args.id, app),
+        'fromVersion': from_version, 'toVersion': to_version,
         'unitsInstalled': units_added,
         'message': '' if rc == 0 else (message.strip().splitlines() or [''])[-1][:200],
     })

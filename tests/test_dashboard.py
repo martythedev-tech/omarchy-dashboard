@@ -1381,6 +1381,50 @@ class GitLogTests(RealRepoFixture):
         self.assertEqual([c['subject'] for c in r['local']], ['two'])
 
 
+class UpdateNotesTests(RealRepoFixture):
+    def test_lists_the_version_step_and_the_pulled_commits(self):
+        self.assertEqual(dash.update_notes(self.plugin, self.old, self.new, '1.0.0', '1.1.0'),
+                         '1.0.0 \u2192 1.1.0 \u00b7 1 change\n\u2022 two')
+
+    def test_nothing_when_head_did_not_move(self):
+        self.assertEqual(dash.update_notes(self.plugin, self.new, self.new, '1.1.0', '1.1.0'), '')
+        self.assertEqual(dash.update_notes(self.plugin, '', self.new), '')
+
+    def test_same_version_shows_only_the_count(self):
+        self.assertEqual(dash.update_notes(self.plugin, self.old, self.new, '1.0.0', '1.0.0'),
+                         '1 change\n\u2022 two')
+
+    def test_long_lists_end_with_how_many_more(self):
+        for i in range(dash.NOTES_LIMIT + 2):
+            git(self.plugin, 'commit', '-q', '--allow-empty', '-m', f'c{i}')
+        notes = dash.update_notes(self.plugin, self.old, git(self.plugin, 'rev-parse', 'HEAD'))
+        lines = notes.splitlines()
+        self.assertEqual(lines[0], f'{dash.NOTES_LIMIT + 3} changes')
+        self.assertEqual(lines[1], f'\u2022 c{dash.NOTES_LIMIT + 1}')   # newest first
+        self.assertEqual(lines[-1], '\u2026 and 3 more')
+        self.assertEqual(len(lines), dash.NOTES_LIMIT + 2)
+
+    def test_a_local_commit_carried_on_top_is_not_news(self):
+        # Local work on the old head, then the update: upstream's commit lands and the local
+        # one is re-applied with a new hash but the same change.
+        git(self.plugin, 'checkout', '-q', self.old)
+        (self.plugin / 'mine.txt').write_text('mine')
+        git(self.plugin, 'add', '.'); git(self.plugin, 'commit', '-qm', 'my local tweak')
+        before = git(self.plugin, 'rev-parse', 'HEAD')
+        git(self.plugin, 'checkout', '-q', self.new)
+        git(self.plugin, 'cherry-pick', before)
+        after = git(self.plugin, 'rev-parse', 'HEAD')
+        self.assertEqual(dash.update_notes(self.plugin, before, after), '1 change\n\u2022 two')
+
+    def test_notes_replace_the_bare_updated_line(self):
+        self.assertEqual(dash.with_update_notes('Updated x.plugin.', '1 change\n\u2022 two', 'x.plugin'),
+                         '1 change\n\u2022 two')
+        self.assertEqual(dash.with_update_notes('Updated x.plugin. Kept 1 locally edited file(s) on top.',
+                                                '1 change', 'x.plugin'),
+                         '1 change\n\nKept 1 locally edited file(s) on top.')
+        self.assertEqual(dash.with_update_notes('Updated x.plugin.', '', 'x.plugin'), 'Updated x.plugin.')
+
+
 LOG_LINE = '2026-10-01 13:24:52.349  {level} {text}'
 
 

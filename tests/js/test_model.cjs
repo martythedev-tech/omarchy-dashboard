@@ -233,6 +233,13 @@ assert.deepEqual(JSON.parse(JSON.stringify(ctx.infoRows({updateState: 'no-repo',
 assert.equal(ctx.infoRows(null).length, 0);
 assert.equal(ctx.shortUrl('https://aur.archlinux.org/packages/flea'), 'aur.archlinux.org/packages/flea');
 
+// queueNotes
+assert.equal(ctx.queueNotes([{id: 'a', name: 'A', ok: true, message: '2 changes\n\u2022 x'},
+                             {id: 'b', name: 'B', ok: true, message: ''},
+                             {id: 'c', name: 'C', ok: true, message: 'Updated c.'}]),
+             'A\n2 changes\n\u2022 x\n\nC\nUpdated c.');
+assert.equal(ctx.queueNotes([{id: 'a', name: 'A', ok: true, message: '  '}]), '', 'nothing to say: no box');
+assert.equal(ctx.queueNotes([]), '');
 // queueSummary
 assert.equal(ctx.queueSummary([{id: 'a', name: 'A', ok: true}, {id: 'b', name: 'B', ok: false}, {id: 'c', name: 'C', ok: true}]),
              'Update all: 2 updated, 1 failed (B).');

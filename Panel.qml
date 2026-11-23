@@ -50,6 +50,9 @@ Panel {
     property string detailMode: ""
     property string detailText: ""
     property bool detailOk: true
+    // The box's heading when it is not a failure: "Output" for what a command printed,
+    // "What changed" for an update's notes.
+    property string detailTitle: "Output"
     property bool addAppFormOpen: false
     property bool disabledOpen: false
     property bool recentOpen: false
@@ -149,9 +152,10 @@ Panel {
         root.actionStartSec = Date.now() / 1000
         actionStatus = actionVerb(kind) + id + "…"
         if (kind === "update" || kind === "install") {
-            root.detailOpenId = id
-            root.detailMode = "output"
+            // Opens once the command prints something (actionLog), never empty.
+            if (root.detailMode === "output") root.detailOpenId = ""
             root.detailOk = true
+            root.detailTitle = "Output"
             root.detailText = ""
         }
         if (Model.isJobKind(kind)) { startJob(kind, [id]); return }
@@ -243,9 +247,11 @@ Panel {
             root.actionStatus = actionVerb(v.kind) + (v.kind === "cleanup" ? (v.total > 1 ? (v.done + 1) + "/" + v.total + "…" : "…")
                                                                            : root.itemName(v.id) + "…")
             if (fresh && (v.kind === "update" || v.kind === "install")) {
-                root.detailOpenId = v.id
-                root.detailMode = "output"
+                // The previous item's box goes; this item's opens once it prints something
+                // (actionLog). A plugin's git pull prints nothing, and an empty box said so.
+                if (root.detailMode === "output") root.detailOpenId = ""
                 root.detailOk = true
+                root.detailTitle = "Output"
                 root.detailText = ""
                 actionLog.reload()
             }
@@ -296,10 +302,16 @@ Panel {
             // This is the actual answer to "did anything happen": the
             // command's real output, shown until closed or overwritten
             // by the next action -- not just a terse Done./Failed.
+            // Nothing to read: no box, the footer's Done. says it.
+            if (r.ok && !(r.message || "").trim()) {
+                if (root.detailMode === "output") root.detailOpenId = ""
+                return
+            }
             root.detailOpenId = targetId
             root.detailMode = "output"
             root.detailOk = !!r.ok
-            root.detailText = r.message || (r.ok ? "(no output)" : "(no error message)")
+            root.detailTitle = r.ok && kind === "update" ? "What changed" : "Output"
+            root.detailText = r.message || "(no error message)"
         }
     }
 
@@ -338,9 +350,9 @@ Panel {
         root.lastActionKind = "install"
         root.actionStartSec = Date.now() / 1000
         root.actionStatus = actionVerb("install") + root.itemName(id) + "…"
-        root.detailOpenId = id
-        root.detailMode = "output"
+        if (root.detailMode === "output") root.detailOpenId = ""
         root.detailOk = true
+        root.detailTitle = "Output"
         root.detailText = ""
         startJob("install", [id])
     }
@@ -360,10 +372,23 @@ Panel {
                 root.detailOpenId = results[i].id
                 root.detailMode = "output"
                 root.detailOk = false
+                root.detailTitle = "Output"
                 root.detailText = results[i].message || "(no error message)"
                 return
             }
         }
+        // All went through: each update's notes, under its name, in one box on the first
+        // row -- or no box when none of them had anything to say.
+        var notes = Model.queueNotes(results)
+        if (!notes) {
+            if (root.detailMode === "output") root.detailOpenId = ""
+            return
+        }
+        root.detailOpenId = results[0].id
+        root.detailMode = "output"
+        root.detailOk = true
+        root.detailTitle = "What changed"
+        root.detailText = notes
     }
 
     function showDiff(id) {
@@ -692,9 +717,11 @@ Panel {
         printErrors: false
         onFileChanged: reload()
         onLoaded: {
-            if ((root.lastActionKind === "update" || root.lastActionKind === "install") && root.busyId !== "") {
+            if ((root.lastActionKind === "update" || root.lastActionKind === "install") && root.busyId !== ""
+                    && text().trim() !== "") {
                 root.detailOpenId = root.busyId
                 root.detailMode = "output"
+                root.detailTitle = "Output"
                 root.detailText = text()
             }
         }
@@ -1519,14 +1546,33 @@ Panel {
             }
 
             Rectangle {
+                id: detailBox
                 visible: row.detailShown
                 width: parent.width
-                height: visible ? 220 : 0
+                // As tall as what it shows, up to 220: a two-line note gets a small box, a
+                // long build log or diff scrolls inside the full one.
+                height: visible ? detailCol.implicitHeight + 16 : 0
                 radius: 8
                 color: Style.normalFill
                 border.color: Style.normalBorderColor
                 clip: true
+                // Opened on a row below the fold (an update's notes on the last plugin, say):
+                // once laid out, scroll the list so all of it shows, like the shortcut box.
+                onVisibleChanged: if (visible) detailReveal.restart()
+                // Output streaming in grows it; keep its bottom in view too.
+                onHeightChanged: if (visible) detailReveal.restart()
+                Timer {
+                    id: detailReveal
+                    interval: 60
+                    onTriggered: {
+                        var y = detailBox.mapToItem(listScroll.contentItem, 0, 0).y
+                        var bottom = y + detailBox.height + 8 - listScroll.height
+                        if (bottom > listScroll.contentY)
+                            listScroll.contentY = Math.min(bottom, Math.max(0, listScroll.contentHeight - listScroll.height))
+                    }
+                }
                 Column {
+                    id: detailCol
                     width: parent.width - 16
                     x: 8; y: 8
                     spacing: 4
@@ -1539,7 +1585,7 @@ Panel {
                             anchors.verticalCenter: parent.verticalCenter
                             elide: Text.ElideRight
                             text: root.detailMode === "remove" ? "Remove it?"
-                                  : root.detailMode === "diff" ? "Changes vs upstream" : (root.detailOk ? "Output" : "Output — failed")
+                                  : root.detailMode === "diff" ? "Changes vs upstream" : (root.detailOk ? root.detailTitle : "Output — failed")
                             color: (root.detailMode === "output" && !root.detailOk) || root.detailMode === "remove" ? Commons.Color.urgent : Util.alpha(root.ink, 0.62)
                             font.pixelSize: Style.font.caption
                         }
@@ -1586,7 +1632,7 @@ Panel {
                     }
                     Flickable {
                         width: parent.width
-                        height: 188
+                        height: Math.min(188, Math.max(detailTextItem.implicitHeight, 20))
                         contentWidth: width
                         contentHeight: detailTextItem.implicitHeight
                         clip: true
@@ -1851,7 +1897,7 @@ Panel {
                     Label {
                         anchors.left: parent.left
                         anchors.verticalCenter: parent.verticalCenter
-                        text: root.detailOk ? "Output" : "Output — failed"
+                        text: root.detailOk ? root.detailTitle : "Output — failed"
                         color: root.detailOk ? Util.alpha(root.ink, 0.62) : Commons.Color.urgent
                         font.pixelSize: Style.font.caption
                     }
